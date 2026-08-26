@@ -25,6 +25,8 @@ impl DaemonRuntime {
                     "id": w.id,
                     "root": w.root.to_string_lossy(),
                     "label": w.label,
+                    "generation": w.generation,
+                    "activation_state": "device_local",
                 })
             })
             .collect();
@@ -37,7 +39,10 @@ impl DaemonRuntime {
         Ok(json!({
             "workspaces": workspaces,
             "count": workspaces.len(),
+            "workspace_root_enforcement": self.enforce_workspace,
             "enforce_workspace": self.enforce_workspace,
+            "workspace_root_enforcement_note":
+                "Independent of access_preset. When true, filesystem and command tools require a registered workspace. Full Access still allows an explicitly permitted absolute path only with workspace_id: null.",
         }))
     }
 
@@ -61,6 +66,8 @@ impl DaemonRuntime {
             "root": entry.root.to_string_lossy(),
             "label": entry.label,
             "exists": entry.root.exists(),
+            "generation": entry.generation,
+            "activation_state": "device_local",
         }))
     }
 
@@ -97,8 +104,12 @@ impl DaemonRuntime {
             id,
             root,
             label: p.label,
+            generation: String::new(),
         };
         let stored = self.upsert_workspace(entry)?;
+        // #146: publish the new registry generation incrementally so the
+        // control plane can activate the workspace without a reconnect.
+        self.notify_workspace_registry_changed();
         self.append_audit(
             "workspace.add",
             Some("workspace.add"),
@@ -115,6 +126,8 @@ impl DaemonRuntime {
             "root": stored.root.to_string_lossy(),
             "label": stored.label,
             "created": true,
+            "generation": stored.generation,
+            "activation_state": "device_local",
         }))
     }
 
@@ -165,13 +178,18 @@ impl DaemonRuntime {
                 code: app_error::INTERNAL,
                 message: e.to_string(),
             })?;
-            self.workspaces[idx].root = root;
+            if self.workspaces[idx].root != root {
+                self.workspaces[idx].root = root;
+                self.workspaces[idx].generation = super::new_workspace_generation();
+            }
         }
         if let Some(label) = p.label {
             let label = label.trim().to_owned();
             self.workspaces[idx].label = if label.is_empty() { None } else { Some(label) };
         }
         self.persist_workspaces()?;
+        // #146: a root change regenerates the generation — publish it.
+        self.notify_workspace_registry_changed();
         let stored = self.workspaces[idx].clone();
         self.append_audit(
             "workspace.update",
@@ -189,6 +207,8 @@ impl DaemonRuntime {
             "root": stored.root.to_string_lossy(),
             "label": stored.label,
             "updated": true,
+            "generation": stored.generation,
+            "activation_state": "device_local",
         }))
     }
 
@@ -218,6 +238,8 @@ impl DaemonRuntime {
             });
         }
         self.persist_workspaces()?;
+        // #146: removal must deactivate the workspace on the control plane.
+        self.notify_workspace_registry_changed();
         self.append_audit(
             "workspace.remove",
             Some("workspace.remove"),

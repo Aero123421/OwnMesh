@@ -14,6 +14,7 @@ use super::descriptor::{
 use super::descriptor::{render_systemd_user_unit, ServicePaths, SERVICE_UNIT_NAME};
 use super::security::reject_injection;
 use ownmesh_persist::write_atomically;
+use serde::Serialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,8 +60,11 @@ impl ProcessRunner for RealProcessRunner {
                 return Err("argument contains control characters".into());
             }
         }
-        let output = Command::new(program)
-            .args(args)
+        let mut command = Command::new(program);
+        command.args(args);
+        #[cfg(target_os = "linux")]
+        configure_linux_user_bus(&mut command, program, args);
+        let output = command
             .output()
             .map_err(|e| format!("spawn {program}: {e}"))?;
         Ok(CommandOutput {
@@ -71,6 +75,58 @@ impl ProcessRunner for RealProcessRunner {
     }
 }
 
+/// `systemctl --user` normally inherits these variables from a graphical or
+/// login session. A non-interactive SSH command often does not, even while the
+/// user's systemd manager and bus are healthy. Derive only the standard runtime
+/// paths for the current uid, and only when the corresponding directory/socket
+/// already exists. This never enables lingering or creates a user bus.
+#[cfg(target_os = "linux")]
+fn configure_linux_user_bus(command: &mut Command, program: &str, args: &[&str]) {
+    if program != "systemctl" || !args.contains(&"--user") {
+        return;
+    }
+    let inherited_runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let inherited_bus = env::var_os("DBUS_SESSION_BUS_ADDRESS");
+    let runtime_dir = inherited_runtime.clone().unwrap_or_else(|| {
+        PathBuf::from("/run/user").join(rustix::process::getuid().as_raw().to_string())
+    });
+    configure_linux_user_bus_from(command, inherited_runtime, inherited_bus, &runtime_dir);
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_user_bus_from(
+    command: &mut Command,
+    inherited_runtime: Option<PathBuf>,
+    inherited_bus: Option<std::ffi::OsString>,
+    runtime_dir: &Path,
+) {
+    use std::os::linux::fs::MetadataExt as _;
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let Ok(runtime_meta) = fs::symlink_metadata(runtime_dir) else {
+        return;
+    };
+    if !runtime_meta.file_type().is_dir()
+        || runtime_meta.st_uid() != rustix::process::getuid().as_raw()
+        || runtime_meta.st_mode() & 0o077 != 0
+    {
+        return;
+    }
+    let bus = runtime_dir.join("bus");
+    let trusted_bus = fs::symlink_metadata(&bus).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && metadata.st_uid() == rustix::process::getuid().as_raw()
+    });
+    if inherited_runtime.is_none() {
+        command.env("XDG_RUNTIME_DIR", runtime_dir);
+    }
+    if inherited_bus.is_none() && trusted_bus {
+        command.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus.display()),
+        );
+    }
+}
+
 /// Scripted runner for tests: installs descriptors under a temp root and tracks state.
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -78,6 +134,10 @@ pub struct ScriptedProcessRunner {
     root: Mutex<Option<PathBuf>>,
     installed: Mutex<bool>,
     running: Mutex<bool>,
+    /// Optional `systemctl --user show` effective-properties dump; `None`
+    /// makes `systemctl show` fail (unit not loaded), exercising the static
+    /// fallback.
+    show_output: Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -85,6 +145,10 @@ impl ScriptedProcessRunner {
     pub fn set_root(&self, root: PathBuf) {
         let _ = fs::create_dir_all(&root);
         *self.root.lock().expect("lock") = Some(root);
+    }
+
+    pub fn set_show_output(&self, output: String) {
+        *self.show_output.lock().expect("lock") = Some(output);
     }
 }
 
@@ -123,6 +187,22 @@ impl ProcessRunner for ScriptedProcessRunner {
                 status: code,
                 stdout,
                 stderr: String::new(),
+            });
+        }
+
+        // `systemctl --user show` effective-properties dump (P1-E effective
+        // hardening observation). `None` (default) reports a not-loaded unit
+        // so callers fall back to the section-validated static analysis.
+        if has("show") {
+            let show = self.show_output.lock().expect("lock");
+            return Ok(CommandOutput {
+                status: i32::from(!show.is_some()),
+                stdout: show.clone().unwrap_or_default(),
+                stderr: if show.is_some() {
+                    String::new()
+                } else {
+                    "Unit not loaded".into()
+                },
             });
         }
 
@@ -204,6 +284,108 @@ pub struct ServiceStatusSnapshot {
     pub running: Option<bool>,
     pub unit_path: Option<String>,
     pub message: Option<String>,
+    /// Effective service hardening disclosure (Linux systemd --user units):
+    /// `None` on platforms without a unit-file model.
+    pub hardening: Option<ServiceHardening>,
+    /// Linux only: `loginctl show-user` linger state (#143). `None` on other
+    /// platforms or when `loginctl` is unavailable — never a keychain read.
+    pub linger: Option<bool>,
+}
+
+/// Effective hardening of an installed systemd --user unit, read read-only
+/// from the unit file plus any drop-ins (P1-E). Local overrides that disable
+/// the meaningful privilege guards or re-introduce unexpected filesystem/
+/// visibility directives are disclosed here so doctor can warn instead of
+/// claiming an unmodified baseline.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // serializable DTO: one bool per directive
+pub struct ServiceHardening {
+    /// `NoNewPrivileges=true` present in the effective (merged) unit.
+    pub no_new_privileges: bool,
+    /// Per-user-safe directives from the shipped baseline unit (P1-E).
+    pub umask_set: bool,
+    pub restrict_suidsgid: bool,
+    pub restrict_realtime: bool,
+    pub lock_personality: bool,
+    /// `SystemCallArchitectures=native` present in the effective unit
+    /// (seccomp: blocks non-native architecture syscalls; available in user
+    /// services without a user namespace).
+    pub system_call_architectures: bool,
+    /// `RestrictNamespaces=yes` present in the effective unit (seccomp:
+    /// blocks namespace-creation syscalls; available in user services
+    /// without a user namespace).
+    pub restrict_namespaces: bool,
+    /// Any `CapabilityBoundingSet=` value in the effective unit. An
+    /// unprivileged --user manager cannot apply it: user-service startup
+    /// fails with exit status 218/CAPABILITIES on systemd v259 even under
+    /// `PrivateUsers=yes` (verified empirically; systemd.exec(5) documents
+    /// that an unset option leaves the bounding set unmodified).
+    pub capability_bounding_set: bool,
+    /// An unexpected filesystem/visibility directive beyond the shipped
+    /// baseline is present. The v1.2.13 baseline deliberately does **not**
+    /// force a user namespace: `PrivateUsers=yes` and the filesystem
+    /// namespacing directives (`ProtectSystem=`, `ProtectHome=`,
+    /// `ReadWritePaths=`, `ReadOnlyPaths=`, `InaccessiblePaths=`,
+    /// `PrivateTmp=`, `ProtectKernelTunables=`, `ProtectControlGroups=`,
+    /// `ProtectHostname=`, `PrivateDevices=`, `PrivateNetwork=`,
+    /// `DynamicUser=`, `ProcSubset=`, `BindPaths=`, `TemporaryFileSystem=`, …)
+    /// implicitly enable `PrivateUsers=` in a per-user service (systemd NEWS
+    /// v254; systemd.exec(5)), which maps every host uid outside the
+    /// namespace — host root and every other host user alike — to the
+    /// overflow uid 65534. OwnMesh custody validation cannot distinguish a
+    /// host-root-owned system directory from an attacker-owned one inside
+    /// that namespace, so accepting the overflow uid would let a
+    /// foreign-owned 0755/01777 ancestor pass and its owner could replace
+    /// the daemon's state directory (A5 cross-user boundary; v1.2.13
+    /// review, ADR 0011). Any such directive is therefore disclosed as
+    /// start-breaking (the daemon fails to start with `ancestor is owned by
+    /// untrusted uid 65534`), never silently accepted as hardening.
+    pub user_namespace_forcing: bool,
+    /// Directives that make the user's home / workspace hierarchy read-only
+    /// (`ProtectHome=` with a value other than `no`, or `ReadOnlyPaths=`),
+    /// which conflicts with the registered-workspace model.
+    pub read_only_hierarchy: bool,
+    /// `PrivateUsers=yes` present. In a per-user service this forces a user
+    /// namespace that hides real uids (see [`ServiceHardening::user_namespace_forcing`]);
+    /// it is disclosed as start-breaking, never counted as baseline (v1.2.13
+    /// review, ADR 0011).
+    pub private_users: bool,
+    /// `ProtectSystem=full|strict` present (forces the user namespace in a
+    /// per-user service; disclosed as start-breaking, never baseline).
+    pub protect_system_full: bool,
+    /// `PrivateTmp=yes` present (forces the user namespace in a per-user
+    /// service; disclosed as start-breaking, never baseline).
+    pub private_tmp: bool,
+    /// `ProtectProc=invisible` present (hidepid= on the unit's /proc
+    /// instance; shipped baseline, ADR 0011).
+    pub protect_proc: bool,
+    /// `ProtectKernelTunables=yes` present (forces the user namespace in a
+    /// per-user service; disclosed as start-breaking, never baseline).
+    pub protect_kernel_tunables: bool,
+    /// `ProtectControlGroups=yes|private|strict` present (forces the user
+    /// namespace in a per-user service; disclosed as start-breaking, never
+    /// baseline).
+    pub protect_control_groups: bool,
+    /// `ProtectHostname=yes` present (forces the user namespace in a
+    /// per-user service; disclosed as start-breaking, never baseline).
+    pub protect_hostname: bool,
+    /// `ReadWritePaths=` is present with a non-empty list. In a per-user
+    /// service this implies `ProtectSystem=` and forces the user namespace;
+    /// it is disclosed as start-breaking, never counted as baseline (v1.2.13
+    /// review, ADR 0011).
+    pub read_write_paths_set: bool,
+    /// `ProtectClock=` / `ProtectKernelLogs=` / `ProtectKernelModules=`
+    /// present: on systemd v259 these fail user-service startup with exit
+    /// status 218/CAPABILITIES even under `PrivateUsers=yes` (verified
+    /// empirically), so they are disclosed as start-breaking rather than
+    /// silently accepted.
+    pub start_breaking_directives: bool,
+    /// The unit file is masked (empty, or a symlink to /dev/null): systemd
+    /// cannot activate it (systemd.unit(5)) and the daemon is not running
+    /// under the shipped unit.
+    pub masked: bool,
+    /// Human-readable disclosure of what was found.
+    pub summary: String,
 }
 
 /// Planned install artifacts (for dry-run).
@@ -304,7 +486,8 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
     pub fn uninstall(&self) -> Result<(), String> {
         if let Some(root) = self.runner.fs_root() {
             let unit = root.join(SERVICE_UNIT_NAME);
-            let _ = fs::remove_file(unit);
+            remove_ownmesh_generated_dropins(&unit)?;
+            let _ = fs::remove_file(&unit);
             let _ = self
                 .runner
                 .run("testctl", &["disable", SERVICE_UNIT_NAME])?;
@@ -352,8 +535,32 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
         #[cfg(target_os = "macos")]
         {
+            // `stop` boots the job out so KeepAlive cannot relaunch it, so
+            // `start` must re-bootstrap rather than assume a loaded job.
+            // The sequence is idempotent: enable, bootstrap if unloaded, then
+            // kickstart to guarantee a live instance either way.
             let uid = user_id_string()?;
-            let target = format!("gui/{uid}/{SERVICE_LABEL}");
+            let domain = format!("gui/{uid}");
+            let target = format!("{domain}/{SERVICE_LABEL}");
+            let plist = launch_agent_path()?;
+            let plist_str = plist.display().to_string();
+
+            let enable = self.runner.run("launchctl", &["enable", &target])?;
+            if !enable.success() && !launchctl_absent(&enable) {
+                return Err(format!(
+                    "launchctl enable failed: {}{}",
+                    enable.stdout, enable.stderr
+                ));
+            }
+            let bootstrap = self
+                .runner
+                .run("launchctl", &["bootstrap", &domain, &plist_str])?;
+            if !bootstrap.success() && !launchctl_already_loaded(&bootstrap) {
+                return Err(format!(
+                    "launchctl bootstrap failed: {}{}",
+                    bootstrap.stdout, bootstrap.stderr
+                ));
+            }
             let out = self
                 .runner
                 .run("launchctl", &["kickstart", "-k", &target])?;
@@ -410,20 +617,31 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
         #[cfg(target_os = "macos")]
         {
+            // The shipped LaunchAgent sets KeepAlive=true, so signalling the
+            // process is not a stop: launchd relaunches it immediately. The
+            // job must be booted out of the user domain, which both stops the
+            // process and prevents the relaunch (#147). The descriptor stays on
+            // disk, so `start` can bootstrap it again.
             let uid = user_id_string()?;
-            let target = format!("gui/{uid}/{SERVICE_LABEL}");
-            let out = self
+            let domain = format!("gui/{uid}");
+            let target = format!("{domain}/{SERVICE_LABEL}");
+            let plist = launch_agent_path()?;
+            let plist_str = plist.display().to_string();
+
+            let out = self.runner.run("launchctl", &["bootout", &target])?;
+            if out.success() || launchctl_absent(&out) {
+                return Ok(());
+            }
+            // Older launchd builds require the domain + plist form.
+            let fallback = self
                 .runner
-                .run("launchctl", &["kill", "SIGTERM", &target])?;
-            if out.success()
-                || out.stderr.contains("No such process")
-                || out.stdout.contains("No such process")
-            {
+                .run("launchctl", &["bootout", &domain, &plist_str])?;
+            if fallback.success() || launchctl_absent(&fallback) {
                 return Ok(());
             }
             return Err(format!(
-                "launchctl kill failed: {}{}",
-                out.stdout, out.stderr
+                "launchctl bootout failed: {}{}{}{}",
+                out.stdout, out.stderr, fallback.stdout, fallback.stderr
             ));
         }
         #[cfg(target_os = "linux")]
@@ -446,9 +664,85 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
     }
 
-    pub fn restart(&self) -> Result<(), String> {
-        let _ = self.stop();
-        self.start()
+    /// Compare the descriptor actually registered with the OS against `plan`.
+    ///
+    /// Idempotent install means the OS registration is current, so every
+    /// platform inspects the *effective* descriptor rather than accepting a
+    /// matching file path or task name. An unreadable or malformed descriptor
+    /// is drift requiring repair, never success (#153).
+    pub fn descriptor_state(&self, plan: &InstallPlan) -> DescriptorState {
+        if self.runner.fs_root().is_some() {
+            let unit_path = PathBuf::from(&plan.unit_path);
+            return if systemd_unit_body_matches(&unit_path, &plan.descriptor_body) {
+                DescriptorState::Current
+            } else {
+                DescriptorState::Drift("unit body differs from the generated descriptor".into())
+            };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let unit_path = PathBuf::from(&plan.unit_path);
+            if !unit_path.is_file() {
+                return DescriptorState::Drift("unit file is missing".into());
+            }
+            return if systemd_unit_body_matches(&unit_path, &plan.descriptor_body) {
+                DescriptorState::Current
+            } else {
+                DescriptorState::Drift("unit body differs from the generated descriptor".into())
+            };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let plist_path = PathBuf::from(&plan.unit_path);
+            return launch_agent_descriptor_state(
+                fs::read_to_string(&plist_path).ok().as_deref(),
+                &plan.descriptor_body,
+            );
+        }
+        #[cfg(windows)]
+        {
+            let task = match windows_installed_task_name(self.runner) {
+                Ok(Some(task)) => task,
+                Ok(None) => return DescriptorState::Drift("no OwnMesh task is registered".into()),
+                Err(error) => return DescriptorState::Drift(format!("task query failed: {error}")),
+            };
+            if task != SERVICE_TASK_NAME {
+                return DescriptorState::Drift(format!(
+                    "task {task} predates the current descriptor name"
+                ));
+            }
+            let exported = match self
+                .runner
+                .run("schtasks", &["/Query", "/TN", task, "/XML"])
+            {
+                Ok(out) if out.success() => out.stdout,
+                Ok(out) => {
+                    return DescriptorState::Drift(format!(
+                        "schtasks /Query /XML failed (status {})",
+                        out.status
+                    ))
+                }
+                Err(error) => {
+                    return DescriptorState::Drift(format!("schtasks /Query /XML failed: {error}"))
+                }
+            };
+            let registered = windows_task_identity(&exported);
+            if registered == WindowsTaskIdentity::default() {
+                return DescriptorState::Drift("registered task XML is unreadable".into());
+            }
+            let expected = windows_task_identity(&plan.descriptor_body);
+            return if registered == expected {
+                DescriptorState::Current
+            } else {
+                DescriptorState::Drift(
+                    "registered task action/context differs from the generated descriptor".into(),
+                )
+            };
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            DescriptorState::Drift("descriptor comparison unsupported on this OS".into())
+        }
     }
 
     pub fn probe(&self) -> Result<ServiceStatusSnapshot, String> {
@@ -470,6 +764,8 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
                 running,
                 unit_path: Some(unit.display().to_string()),
                 message: None,
+                hardening: observe_unit_hardening_isolated(&unit),
+                linger: None,
             });
         }
         #[cfg(windows)]
@@ -493,8 +789,44 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
                 running: None,
                 unit_path: None,
                 message: Some("user-level service unsupported on this OS".into()),
+                hardening: None,
+                linger: None,
             })
         }
+    }
+
+    /// Names of drop-ins that still force a user namespace after remediating
+    /// OwnMesh-generated leftovers. Scripted `fs_root` installs only see the
+    /// fixture directory; production uses the systemd user search path.
+    #[must_use]
+    pub fn remaining_userns_forcing_dropins(&self, unit_path: &Path) -> Vec<String> {
+        let dirs = if let Some(root) = self.runner.fs_root() {
+            vec![root]
+        } else {
+            systemd_user_search_dirs()
+        };
+        remaining_userns_forcing_dropins_in_dirs(unit_path, &dirs)
+    }
+
+    /// Reload user units after drop-in changes so the next probe sees them.
+    pub fn reload_user_units(&self) -> Result<(), String> {
+        if self.runner.fs_root().is_some() {
+            let _ = self.runner.run("testctl", &["daemon-reload"])?;
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let out = self.runner.run("systemctl", &["--user", "daemon-reload"])?;
+            if !out.success() {
+                return Err(format!(
+                    "systemctl daemon-reload failed: {}{}",
+                    out.stdout, out.stderr
+                ));
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(())
     }
 }
 
@@ -503,8 +835,536 @@ pub fn write_descriptor_to_root(root: &Path, paths: &ServicePaths) -> Result<Pat
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let unit = root.join(SERVICE_UNIT_NAME);
     let body = render_systemd_user_unit(paths);
+    reconcile_ownmesh_generated_dropins(&unit)?;
     write_atomically(&unit, body.as_bytes()).map_err(|e| e.to_string())?;
     Ok(unit)
+}
+
+const OWNMESH_GENERATED_DROPIN_PREFIX: &str = "# Generated by OwnMesh";
+const LEGACY_WORKSPACE_DROPIN_NAME: &str = "10-ownmesh-workspaces.conf";
+
+/// systemd.exec(5) filesystem namespacing / PrivateUsers directives that force
+/// a user namespace in a per-user service (ADR 0011).
+const USERNS_FORCING_DIRECTIVES: &[&str] = &[
+    "PrivateUsers",
+    "ProtectSystem",
+    "ProtectHome",
+    "ReadWritePaths",
+    "ReadOnlyPaths",
+    "InaccessiblePaths",
+    "PrivateTmp",
+    "ProtectKernelTunables",
+    "ProtectControlGroups",
+    "ProtectHostname",
+    "DynamicUser",
+    "ProcSubset",
+    "PrivateDevices",
+    "PrivateNetwork",
+    "BindPaths",
+    "BindReadOnlyPaths",
+    "MountImages",
+    "TemporaryFileSystem",
+    "PrivateIPC",
+];
+
+/// Result of removing OwnMesh-generated leftovers next to a user unit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DropinReconcileReport {
+    pub removed: Vec<String>,
+}
+
+#[must_use]
+pub(super) fn is_systemd_unit_path(path: &str) -> bool {
+    path.ends_with(".service")
+}
+
+fn unit_adjacent_dropin_dir(unit_path: &Path) -> PathBuf {
+    let name = unit_path.file_name().unwrap_or_default();
+    let mut dir_name = name.to_os_string();
+    dir_name.push(".d");
+    unit_path.with_file_name(dir_name)
+}
+
+fn dropin_is_ownmesh_generated(file_name: &str, contents: &str) -> bool {
+    if file_name == LEGACY_WORKSPACE_DROPIN_NAME {
+        return true;
+    }
+    contents
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| {
+            line.trim_start()
+                .starts_with(OWNMESH_GENERATED_DROPIN_PREFIX)
+        })
+}
+
+fn dropin_forces_user_namespace(contents: &str) -> bool {
+    let text = if contents
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("[service]"))
+    {
+        contents.to_string()
+    } else {
+        format!("[Service]\n{contents}")
+    };
+    unit_directives(&text).into_iter().any(|(name, value)| {
+        let forcing = USERNS_FORCING_DIRECTIVES
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate));
+        if !forcing {
+            return false;
+        }
+        if name.eq_ignore_ascii_case("ProtectSystem") || name.eq_ignore_ascii_case("ProtectHome") {
+            return !value.eq_ignore_ascii_case("no");
+        }
+        if name.eq_ignore_ascii_case("PrivateUsers") || name.eq_ignore_ascii_case("PrivateTmp") {
+            return systemd_bool_true(&value);
+        }
+        true
+    })
+}
+
+fn should_remove_ownmesh_dropin(file_name: &str, contents: &str) -> bool {
+    if !dropin_is_ownmesh_generated(file_name, contents) {
+        return false;
+    }
+    file_name == LEGACY_WORKSPACE_DROPIN_NAME || dropin_forces_user_namespace(contents)
+}
+
+/// Remove OwnMesh-generated user-namespace drop-ins next to `unit_path`.
+///
+/// Only the unit-adjacent `{unit}.d/` directory is touched. Operator-written
+/// drop-ins (no OwnMesh header, not the historical workspace filename) are
+/// left in place.
+pub fn reconcile_ownmesh_generated_dropins(
+    unit_path: &Path,
+) -> Result<DropinReconcileReport, String> {
+    let dir = unit_adjacent_dropin_dir(unit_path);
+    let mut report = DropinReconcileReport::default();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(error) => {
+            return Err(format!("read drop-in dir {}: {error}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read drop-in entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read drop-in {}: {error}", path.display())),
+        };
+        if !should_remove_ownmesh_dropin(name, &contents) {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "remove OwnMesh-generated drop-in {}: {error}",
+                path.display()
+            )
+        })?;
+        report.removed.push(name.to_string());
+    }
+    report.removed.sort();
+    if report.removed.is_empty() {
+        return Ok(report);
+    }
+    if fs::read_dir(&dir)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_none()
+    {
+        let _ = fs::remove_dir(&dir);
+    }
+    Ok(report)
+}
+
+/// OwnMesh-generated drop-ins next to the unit, including leftovers that no
+/// longer force a user namespace. Used by uninstall so generated files do not
+/// survive the unit file.
+pub fn remove_ownmesh_generated_dropins(unit_path: &Path) -> Result<Vec<String>, String> {
+    let dir = unit_adjacent_dropin_dir(unit_path);
+    let mut removed = Vec::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+        Err(error) => {
+            return Err(format!("read drop-in dir {}: {error}", dir.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read drop-in entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read drop-in {}: {error}", path.display())),
+        };
+        if !dropin_is_ownmesh_generated(name, &contents) {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "remove OwnMesh-generated drop-in {}: {error}",
+                path.display()
+            )
+        })?;
+        removed.push(name.to_string());
+    }
+    removed.sort();
+    if fs::read_dir(&dir)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_none()
+    {
+        let _ = fs::remove_dir(&dir);
+    }
+    Ok(removed)
+}
+
+#[must_use]
+#[cfg(test)]
+pub fn remaining_userns_forcing_dropins(unit_path: &Path) -> Vec<String> {
+    remaining_userns_forcing_dropins_in_dirs(
+        unit_path,
+        unit_path
+            .parent()
+            .map(|parent| vec![parent.to_path_buf()])
+            .unwrap_or_default()
+            .as_slice(),
+    )
+}
+
+fn remaining_userns_forcing_dropins_in_dirs(
+    unit_path: &Path,
+    search_dirs: &[PathBuf],
+) -> Vec<String> {
+    let unit_name = unit_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| SERVICE_UNIT_NAME.to_string());
+    let mut names = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut consider = |path: PathBuf| {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+            return;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            return;
+        };
+        if !dropin_forces_user_namespace(&contents) {
+            return;
+        }
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("drop-in")
+            .to_string();
+        if seen.insert(label.clone()) {
+            names.push(label);
+        }
+    };
+    for dir in search_dirs {
+        for (_, drop_dir) in dropin_level_dirs(&unit_name, dir) {
+            if let Ok(entries) = fs::read_dir(drop_dir) {
+                for entry in entries.flatten() {
+                    consider(entry.path());
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(unit_adjacent_dropin_dir(unit_path)) {
+        for entry in entries.flatten() {
+            consider(entry.path());
+        }
+    }
+    names
+}
+
+#[must_use]
+pub(super) fn systemd_unit_body_matches(unit_path: &Path, expected: &str) -> bool {
+    let Ok(on_disk) = fs::read_to_string(unit_path) else {
+        return false;
+    };
+    on_disk.replace("\r\n", "\n") == expected.replace("\r\n", "\n")
+}
+
+/// Descriptor identity of the macOS LaunchAgent, from the plist alone.
+///
+/// Deliberately takes no runner: whether launchd currently has the job loaded
+/// is lifecycle state, not descriptor drift. `service stop` boots the agent out
+/// on purpose and leaves the plist installed, so treating "not loaded" as drift
+/// would make the next `service install` bootstrap a `RunAtLoad`/`KeepAlive`
+/// job and silently restart a service the operator deliberately stopped. The
+/// signature is the guarantee: loaded state cannot reach this decision.
+#[cfg(any(test, target_os = "macos"))]
+pub(super) fn launch_agent_descriptor_state(
+    on_disk: Option<&str>,
+    expected: &str,
+) -> DescriptorState {
+    let Some(on_disk) = on_disk else {
+        return DescriptorState::Drift("LaunchAgent plist is missing or unreadable".into());
+    };
+    if on_disk.replace("\r\n", "\n") == expected.replace("\r\n", "\n") {
+        DescriptorState::Current
+    } else {
+        DescriptorState::Drift("LaunchAgent plist differs from the generated descriptor".into())
+    }
+}
+
+/// What a `launchctl print` probe proved about a job after `bootout`.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnloadProof {
+    /// The job answered, so it is still loaded.
+    StillLoaded,
+    /// launchd explicitly reported the job as absent.
+    Unloaded,
+    /// The probe itself failed. Never proof of anything.
+    Unknown,
+}
+
+/// Classify the post-bootout `launchctl print` probe.
+///
+/// A permission, domain, or spawn failure says nothing about liveness, so it
+/// must not be read as absence: doing that deletes the descriptor (and later
+/// the install record) while the job may still be running — the partial-cleanup
+/// shape #147 exists to prevent.
+#[cfg(any(test, target_os = "macos"))]
+pub(super) fn classify_unload_probe(result: &Result<CommandOutput, String>) -> UnloadProof {
+    match result {
+        Ok(out) if out.success() => UnloadProof::StillLoaded,
+        Ok(out) if launchctl_absent(out) => UnloadProof::Unloaded,
+        Ok(_) | Err(_) => UnloadProof::Unknown,
+    }
+}
+
+/// Whether the descriptor actually registered with the OS still matches the
+/// descriptor OwnMesh would generate now (#153).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptorState {
+    /// The registered descriptor matches the current plan.
+    Current,
+    /// The registered descriptor differs, is missing, or cannot be read.
+    /// Install must rewrite it; this is never idempotent success.
+    Drift(String),
+}
+
+impl DescriptorState {
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+
+    /// Human-readable reason a descriptor needs repair.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Current => None,
+            Self::Drift(reason) => Some(reason.as_str()),
+        }
+    }
+}
+
+/// Semantic identity of a Windows Scheduled Task action.
+///
+/// Task Scheduler reformats imported XML, so a byte comparison would report
+/// permanent drift. These are the behaviorally relevant fields; comparing them
+/// detects a manual edit, an older descriptor version, or a task whose bound
+/// runtime context no longer matches the CLI's.
+#[cfg(any(test, windows))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowsTaskIdentity {
+    /// Number of `<Exec>` actions. Anything but exactly one is drift: a task
+    /// that keeps the expected first action and appends a second one runs
+    /// something OwnMesh never registered.
+    pub exec_action_count: usize,
+    /// Number of `<Trigger…>` children, so an added trigger is drift.
+    pub trigger_count: usize,
+    pub logon_trigger_count: usize,
+    pub logon_trigger_enabled: String,
+    pub command: String,
+    pub arguments: String,
+    pub working_directory: String,
+    pub logon_type: String,
+    pub run_level: String,
+    pub multiple_instances_policy: String,
+    pub disallow_start_if_on_batteries: String,
+    pub stop_if_going_on_batteries: String,
+    pub allow_hard_terminate: String,
+    pub start_when_available: String,
+    pub run_only_if_network_available: String,
+    pub allow_start_on_demand: String,
+    pub enabled: String,
+    pub hidden: String,
+    pub execution_time_limit: String,
+    pub priority: String,
+    pub restart_interval: String,
+    pub restart_count: String,
+}
+
+/// Extract the first `<tag>…</tag>` body, trimmed. Namespaced/attributed tags
+/// are matched on the opening name only, which is what Task Scheduler emits.
+#[cfg(any(test, windows))]
+fn xml_tag_value(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(start) = xml.find(&open) else {
+        return String::new();
+    };
+    let rest = &xml[start + open.len()..];
+    let Some(end) = rest.find(&close) else {
+        return String::new();
+    };
+    // Task Scheduler re-encodes entities; decode the ones OwnMesh emits so a
+    // round-tripped descriptor compares equal to the rendered one.
+    decode_xml_entities(rest[..end].trim())
+}
+
+#[cfg(any(test, windows))]
+fn decode_xml_entities(raw: &str) -> String {
+    raw.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Count `<tag>` / `<tag …>` / `<tag/>` occurrences, ignoring closing tags.
+#[cfg(any(test, windows))]
+fn xml_element_count(xml: &str, tag: &str) -> usize {
+    let needle = format!("<{tag}");
+    let mut count = 0;
+    let mut rest = xml;
+    while let Some(at) = rest.find(&needle) {
+        let after = &rest[at + needle.len()..];
+        // `<Exec>` and `<Exec …>` count; `<ExecAction>` must not.
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+        {
+            count += 1;
+        }
+        rest = after;
+    }
+    count
+}
+
+/// Number of *direct* child elements of a section, whatever their type.
+///
+/// Depth is tracked so a trigger's own children are not counted as triggers;
+/// only the section's top level is cardinality.
+#[cfg(any(test, windows))]
+fn xml_child_element_count(section: &str) -> usize {
+    let mut count = 0;
+    let mut depth = 0_usize;
+    let mut rest = section;
+    while let Some(at) = rest.find('<') {
+        let after = &rest[at + 1..];
+        let Some(gt) = after.find('>') else { break };
+        let tag = &after[..gt];
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else if tag.starts_with('?') || tag.starts_with('!') {
+            // XML declaration or comment: not an element.
+        } else if tag.ends_with('/') {
+            if depth == 0 {
+                count += 1;
+            }
+        } else {
+            if depth == 0 {
+                count += 1;
+            }
+            depth += 1;
+        }
+        rest = &after[gt + 1..];
+    }
+    count
+}
+
+/// Structural semantic identity of a registered Windows Scheduled Task.
+///
+/// Task Scheduler reformats imported XML, so a byte comparison would report
+/// permanent drift. Every behaviorally relevant rendered field is compared
+/// instead, together with the *cardinality* of actions and triggers: comparing
+/// only the first `<Command>`/`<Arguments>` would let a task keep the expected
+/// action, append a second one, and still be reported current.
+#[cfg(any(test, windows))]
+#[must_use]
+pub fn windows_task_identity(xml: &str) -> WindowsTaskIdentity {
+    let actions = xml_section(xml, "Actions").unwrap_or_default();
+    let exec = xml_section(&actions, "Exec").unwrap_or_default();
+    let triggers = xml_section(xml, "Triggers").unwrap_or_default();
+    let logon = xml_section(&triggers, "LogonTrigger").unwrap_or_default();
+    let principals = xml_section(xml, "Principals").unwrap_or_default();
+    let settings = xml_section(xml, "Settings").unwrap_or_default();
+    let restart = xml_section(&settings, "RestartOnFailure").unwrap_or_default();
+
+    WindowsTaskIdentity {
+        exec_action_count: xml_element_count(&actions, "Exec"),
+        trigger_count: xml_child_element_count(&triggers),
+        logon_trigger_count: xml_element_count(&triggers, "LogonTrigger"),
+        logon_trigger_enabled: xml_tag_value(&logon, "Enabled"),
+        // Scoped to the single `<Exec>`: a second action cannot masquerade as
+        // the expected one, and the counts above reject it outright.
+        command: xml_tag_value(&exec, "Command"),
+        arguments: xml_tag_value(&exec, "Arguments"),
+        working_directory: xml_tag_value(&exec, "WorkingDirectory"),
+        logon_type: xml_tag_value(&principals, "LogonType"),
+        run_level: xml_tag_value(&principals, "RunLevel"),
+        multiple_instances_policy: xml_tag_value(&settings, "MultipleInstancesPolicy"),
+        disallow_start_if_on_batteries: xml_tag_value(&settings, "DisallowStartIfOnBatteries"),
+        stop_if_going_on_batteries: xml_tag_value(&settings, "StopIfGoingOnBatteries"),
+        allow_hard_terminate: xml_tag_value(&settings, "AllowHardTerminate"),
+        start_when_available: xml_tag_value(&settings, "StartWhenAvailable"),
+        run_only_if_network_available: xml_tag_value(&settings, "RunOnlyIfNetworkAvailable"),
+        allow_start_on_demand: xml_tag_value(&settings, "AllowStartOnDemand"),
+        enabled: xml_tag_value(&settings, "Enabled"),
+        hidden: xml_tag_value(&settings, "Hidden"),
+        execution_time_limit: xml_tag_value(&settings, "ExecutionTimeLimit"),
+        priority: xml_tag_value(&settings, "Priority"),
+        restart_interval: xml_tag_value(&restart, "Interval"),
+        restart_count: xml_tag_value(&restart, "Count"),
+    }
+}
+
+/// Body of the first `<tag …>…</tag>` element, attributes allowed on the open tag.
+#[cfg(any(test, windows))]
+fn xml_section(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut from = 0;
+    // Skip prefix matches such as `<ExecutionTimeLimit>` when looking for `<Exec>`.
+    let start = loop {
+        let at = xml[from..].find(&open)? + from;
+        let after = &xml[at + open.len()..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+        {
+            break at;
+        }
+        from = at + open.len();
+    };
+    let body_start = start + xml[start..].find('>')? + 1;
+    let end = xml[body_start..].find(&close)? + body_start;
+    Some(xml[body_start..end].to_string())
 }
 
 /// Locate `ownmeshd` next to the CLI or on PATH.
@@ -593,7 +1453,8 @@ fn install_windows<R: ProcessRunner + ?Sized>(
     match out {
         Ok(o) if o.success() => Ok(()),
         Ok(o) => {
-            // Fallback: /TR form with quoted command.
+            // Fallback: /TR form with the identical quoted command line,
+            // including the install-time path binding (#148).
             let tr = windows_task_run_command(paths);
             let out2 = runner.run(
                 "schtasks",
@@ -672,6 +1533,8 @@ fn probe_windows<R: ProcessRunner + ?Sized>(runner: &R) -> Result<ServiceStatusS
         running: None,
         unit_path: Some(format!("task:{SERVICE_TASK_NAME}")),
         message: Some("scheduled task not found".into()),
+        hardening: None,
+        linger: None,
     })
 }
 
@@ -710,6 +1573,8 @@ fn probe_windows_named<R: ProcessRunner + ?Sized>(
         running: None,
         unit_path: Some(format!("task:{task}")),
         message: None,
+        hardening: None,
+        linger: None,
     })
 }
 
@@ -834,13 +1699,75 @@ fn install_macos(runner: &impl ProcessRunner, paths: &ServicePaths) -> Result<()
     ))
 }
 
+/// launchd reports an absent job/service in several wordings; all mean the
+/// requested state is already reached, which is idempotent success.
+#[cfg(any(test, target_os = "macos"))]
+fn launchctl_absent(out: &CommandOutput) -> bool {
+    let text = format!("{}{}", out.stdout, out.stderr).to_ascii_lowercase();
+    text.contains("no such process")
+        || text.contains("could not find specified service")
+        || text.contains("not find service")
+        || text.contains("no such file or directory")
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_already_loaded(out: &CommandOutput) -> bool {
+    let text = format!("{}{}", out.stdout, out.stderr).to_ascii_lowercase();
+    text.contains("already bootstrapped") || text.contains("service already loaded")
+}
+
 #[cfg(target_os = "macos")]
 fn uninstall_macos(runner: &impl ProcessRunner) -> Result<(), String> {
     let plist_path = launch_agent_path()?;
     let uid = user_id_string()?;
     let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{SERVICE_LABEL}");
     let plist_str = plist_path.display().to_string();
-    let _ = runner.run("launchctl", &["bootout", &domain, &plist_str]);
+
+    // The descriptor is removed only after launchd confirms the job is gone.
+    // Deleting the plist first would hide a failed bootout behind an
+    // "installed: false" probe while the process kept running (#147).
+    let out = runner.run("launchctl", &["bootout", &target])?;
+    if !out.success() && !launchctl_absent(&out) {
+        let fallback = runner.run("launchctl", &["bootout", &domain, &plist_str])?;
+        if !fallback.success() && !launchctl_absent(&fallback) {
+            return Err(format!(
+                "launchctl bootout failed; LaunchAgent left installed so uninstall can be retried: {}{}{}{}",
+                out.stdout, out.stderr, fallback.stdout, fallback.stderr
+            ));
+        }
+    }
+    // Only an explicitly reported absence proves the job is unloaded. A
+    // permission, domain, or spawn failure from `launchctl print` says nothing
+    // about liveness, and treating it as absence would delete the descriptor
+    // (and later the record) with the job possibly still running — the exact
+    // partial-cleanup shape #147 is about.
+    let probe = runner.run("launchctl", &["print", &target]);
+    match classify_unload_probe(&probe) {
+        UnloadProof::Unloaded => {}
+        UnloadProof::StillLoaded => {
+            return Err(
+                "LaunchAgent job is still loaded after bootout; LaunchAgent left installed so uninstall can be retried"
+                    .into(),
+            );
+        }
+        UnloadProof::Unknown => {
+            let detail = match &probe {
+                Ok(out) => format!(
+                    "status {}: {}{}",
+                    out.status,
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                ),
+                Err(error) => error.clone(),
+            };
+            return Err(format!(
+                "launchctl print could not confirm the job is unloaded ({detail}); \
+                 liveness is unknown, so the LaunchAgent is left installed and uninstall can be retried"
+            ));
+        }
+    }
+
     match fs::remove_file(&plist_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -876,6 +1803,8 @@ fn probe_macos(runner: &impl ProcessRunner) -> Result<ServiceStatusSnapshot, Str
         running,
         unit_path: Some(plist_path.display().to_string()),
         message: None,
+        hardening: None,
+        linger: None,
     })
 }
 
@@ -899,6 +1828,7 @@ fn install_linux(runner: &impl ProcessRunner, paths: &ServicePaths) -> Result<()
         fs::create_dir_all(parent).map_err(|e| format!("create systemd user dir: {e}"))?;
     }
     let body = render_systemd_user_unit(paths);
+    reconcile_ownmesh_generated_dropins(&unit_path)?;
     write_atomically(&unit_path, body.as_bytes()).map_err(|e| format!("write unit: {e}"))?;
 
     let out = runner.run("systemctl", &["--user", "daemon-reload"])?;
@@ -918,18 +1848,174 @@ fn install_linux(runner: &impl ProcessRunner, paths: &ServicePaths) -> Result<()
     Ok(())
 }
 
+/// systemd wordings that mean the requested end state already holds. These are
+/// idempotent success; every other failure is reported (#149).
+#[cfg(any(test, target_os = "linux"))]
+fn systemctl_already_absent(out: &CommandOutput) -> bool {
+    let text = format!("{}{}", out.stdout, out.stderr).to_ascii_lowercase();
+    // An unreachable user bus is not proof that the unit is gone — it is the
+    // second uninstall failure shape in #149 (stop, disable, daemon-reload and
+    // the probe all fail while the manager keeps running ownmeshd). Its message
+    // ends in "No such file or directory", so absence must be matched on unit
+    // wording only, never on a bare errno string.
+    if text.contains("failed to connect to bus") || text.contains("failed to connect to system") {
+        return false;
+    }
+    text.contains("not loaded")
+        || text.contains("could not be found")
+        || text.contains("does not exist")
+        || text.contains("no such unit")
+}
+
+/// Stop and disable the unit, then prove the manager considers it inactive.
+///
+/// Split out from [`uninstall_linux`] so the failure paths are testable without
+/// touching the filesystem, and so no descriptor is deleted until this returns
+/// `Ok` (#149).
+#[cfg(any(test, target_os = "linux"))]
+pub(super) fn stop_and_disable_user_unit<R: ProcessRunner + ?Sized>(
+    runner: &R,
+) -> Result<(), String> {
+    // Every systemctl result is checked. Discarding them and deleting the unit
+    // file would make a failed stop look like a completed uninstall while
+    // ownmeshd kept running and serving remote execution.
+    for verb in ["stop", "disable"] {
+        let out = runner.run("systemctl", &["--user", verb, SERVICE_UNIT_NAME])?;
+        if !out.success() && !systemctl_already_absent(&out) {
+            return Err(format!(
+                "systemctl --user {verb} failed ({}); unit left installed so uninstall can be retried: {}{}",
+                out.status,
+                out.stdout.trim(),
+                out.stderr.trim()
+            ));
+        }
+    }
+
+    // An unknown manager state is not proof of an inactive unit, so only an
+    // explicitly reported down state may pass. `is-active` exits non-zero for
+    // every state except `active`, so the exit status cannot be the signal:
+    // keying on it would let `Failed to connect to bus` (empty stdout) fall
+    // through as "not active" and delete the unit of a still-running manager.
+    let mut last_seen = String::new();
+    for attempt in 0..IS_ACTIVE_POLL_ATTEMPTS {
+        let probe = runner.run("systemctl", &["--user", "is-active", SERVICE_UNIT_NAME])?;
+        match classify_is_active(&probe) {
+            UnitLiveness::Down => return Ok(()),
+            // A unit can still be tearing down immediately after `stop`.
+            UnitLiveness::Up | UnitLiveness::Deactivating => {
+                last_seen = probe.stdout.trim().to_owned();
+                if attempt + 1 < IS_ACTIVE_POLL_ATTEMPTS {
+                    std::thread::sleep(IS_ACTIVE_POLL_INTERVAL);
+                }
+            }
+            UnitLiveness::Unknown => {
+                return Err(format!(
+                    "systemctl --user is-active could not be classified ({}): {}{}; \
+                     liveness is unknown, so the unit is left installed and uninstall can be retried",
+                    probe.status,
+                    probe.stdout.trim(),
+                    probe.stderr.trim()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "systemctl --user still reports ownmesh-ownmeshd.service as '{last_seen}' after stop; \
+         unit left installed so uninstall can be retried"
+    ))
+}
+
+/// Bounded wait for a unit to finish tearing down after `stop`.
+#[cfg(any(test, target_os = "linux"))]
+const IS_ACTIVE_POLL_ATTEMPTS: usize = 10;
+#[cfg(any(test, target_os = "linux"))]
+const IS_ACTIVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What `systemctl is-active` proved about the unit.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnitLiveness {
+    /// Explicitly reported as not running.
+    Down,
+    /// Explicitly reported as running or coming up.
+    Up,
+    /// Explicitly reported as still tearing down.
+    Deactivating,
+    /// The manager did not answer with a state OwnMesh recognizes. Never
+    /// treated as proof of anything.
+    Unknown,
+}
+
+/// Classify `systemctl is-active` output.
+///
+/// The exit status is deliberately ignored: `is-active` exits non-zero for
+/// every state other than `active`, so only the reported state word is
+/// evidence. Anything else — an empty answer from an unreachable bus, a
+/// localized message, an unrecognized state — is [`UnitLiveness::Unknown`].
+#[cfg(any(test, target_os = "linux"))]
+pub(super) fn classify_is_active(out: &CommandOutput) -> UnitLiveness {
+    match out.stdout.trim() {
+        // `unknown` is what systemd answers for a unit it has never loaded.
+        "inactive" | "failed" | "unknown" => UnitLiveness::Down,
+        "active" | "activating" | "reloading" | "refreshing" => UnitLiveness::Up,
+        "deactivating" => UnitLiveness::Deactivating,
+        _ => UnitLiveness::Unknown,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn uninstall_linux(runner: &impl ProcessRunner) -> Result<(), String> {
-    let _ = runner.run("systemctl", &["--user", "stop", SERVICE_UNIT_NAME]);
-    let _ = runner.run("systemctl", &["--user", "disable", SERVICE_UNIT_NAME]);
+    stop_and_disable_user_unit(runner)?;
+
     let unit_path = systemd_user_unit_path()?;
+    remove_ownmesh_generated_dropins(&unit_path)?;
     match fs::remove_file(&unit_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("remove unit: {e}")),
     }
-    let _ = runner.run("systemctl", &["--user", "daemon-reload"]);
+    let reload = runner.run("systemctl", &["--user", "daemon-reload"])?;
+    if !reload.success() {
+        return Err(format!(
+            "systemctl --user daemon-reload failed ({}) after removing the unit; run it manually to reconcile the manager: {}{}",
+            reload.status,
+            reload.stdout.trim(),
+            reload.stderr.trim()
+        ));
+    }
     Ok(())
+}
+
+/// Read-only linger observation for the current user (#143). `loginctl
+/// show-user <uid> -p Linger` answers `Linger=yes|no`; any failure
+/// (missing `loginctl`, container, non-systemd) yields `None` so doctor can
+/// omit the check instead of guessing. Metadata only: never reads the
+/// keychain and never enables lingering.
+#[cfg(target_os = "linux")]
+fn observe_linger(runner: &impl ProcessRunner) -> Option<bool> {
+    let uid = std::env::var("UID")
+        .ok()
+        .filter(|value| value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty())
+        .or_else(|| {
+            // Fallback when UID is unset (rare outside shells): derive from
+            // the numeric user id via `id -u`.
+            runner
+                .run("id", &["-u"])
+                .map(|out| out.stdout.trim().to_owned())
+                .ok()
+                .filter(|value| value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty())
+        })?;
+    let output = runner
+        .run("loginctl", &["show-user", &uid, "--property=Linger"])
+        .ok()?;
+    if !output.success() {
+        return None;
+    }
+    match output.stdout.trim() {
+        "Linger=yes" => Some(true),
+        "Linger=no" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -962,6 +2048,820 @@ fn probe_linux(runner: &impl ProcessRunner) -> Result<ServiceStatusSnapshot, Str
         running,
         unit_path: Some(unit_path.display().to_string()),
         message: None,
+        // Manager-effective hardening: `systemctl --user show` reflects the
+        // loaded unit (base + drop-ins + defaults), falling back to the
+        // section-validated static file analysis when systemd is unavailable.
+        hardening: observe_unit_hardening_effective(runner, &unit_path),
+        linger: observe_linger(runner),
+    })
+}
+
+/// Directive name/value pairs present in the `[Service]` section of a
+/// systemd unit text (comments and blank lines ignored; only real
+/// `Name=value` directive lines count). Directives placed in the wrong
+/// section are ignored by systemd (with a warning), so a `ProtectSystem=`
+/// in `[Unit]` must never be counted as effective hardening — this is what
+/// makes the static observation section-validated.
+fn unit_directives(raw: &str) -> Vec<(String, String)> {
+    let mut section = String::new();
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed.strip_prefix('[') {
+            if let Some(name) = header.strip_suffix(']') {
+                section = name.trim().to_string();
+            }
+            continue;
+        }
+        if section != "Service" {
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some((name, value)) = trimmed.split_once('=') {
+            out.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// systemd boolean acceptance (true/yes/on/1); empty is treated as unset.
+fn systemd_bool_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
+}
+
+/// The shipped baseline requires `UMask=0077` (descriptor.rs). systemd
+/// accepts any octal spelling (`0077`, `077`), so compare the parsed mode;
+/// a present-but-weak UMask (e.g. `0002`) is not the baseline. `systemctl
+/// show` reports the mode normalized to `%04o`, so the same comparison is
+/// valid for both the static unit-file observation and the manager-effective
+/// observation (P1-E review).
+fn umask_is_baseline(value: &str) -> bool {
+    u32::from_str_radix(value.trim(), 8).is_ok_and(|mode| mode == 0o77)
+}
+
+/// systemd --user unit search directories in precedence order, mirroring
+/// systemd.unit(5) "User Unit Search Path" (highest precedence first):
+/// `$XDG_CONFIG_HOME/systemd/user.control`, `$XDG_RUNTIME_DIR/systemd/user.control`,
+/// `$XDG_RUNTIME_DIR/systemd/transient`, `$XDG_RUNTIME_DIR/systemd/generator.early`,
+/// `~/.config/systemd/user`, `$XDG_CONFIG_DIRS/systemd/user`, `/etc/systemd/user`,
+/// `$XDG_RUNTIME_DIR/systemd/user`, `/run/systemd/user`, `$XDG_RUNTIME_DIR/systemd/generator`,
+/// `$XDG_DATA_HOME/systemd/user`, `$XDG_DATA_DIRS/systemd/user`,
+/// `/usr/local/lib/systemd/user`, `/usr/lib/systemd/user`,
+/// `$XDG_RUNTIME_DIR/systemd/generator.late`.
+///
+/// Unit files found in directories listed earlier override files with the
+/// same name in directories lower in the list; drop-ins are merged from every
+/// directory with higher-precedence directories winning for same-named files
+/// and different-named files applied in lexicographic order.
+///
+/// `SYSTEMD_UNIT_PATH` (systemd.unit(5)) is honored: when set it *replaces*
+/// the default search path, and a trailing `:` appends the default path after
+/// it. Empty components are skipped (systemd rejects `::`/leading `:`; a
+/// read-only observer skips them rather than failing the whole observation).
+/// The result is deduplicated by exact path, mirroring systemd's `strv_uniq`
+/// on the final search path.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn systemd_user_search_dirs() -> Vec<PathBuf> {
+    systemd_unit_path_dirs(env::var_os("SYSTEMD_UNIT_PATH").as_deref())
+}
+
+/// Pure core of the `SYSTEMD_UNIT_PATH` handling (systemd.unit(5)): when the
+/// variable is set it *replaces* the default search path, and a trailing `:`
+/// appends the default path after it. Empty components are skipped (systemd
+/// rejects `::`/leading `:`; a read-only observer skips them rather than
+/// failing the whole observation). The result is deduplicated by exact path,
+/// mirroring systemd's `strv_uniq` on the final search path. Parameters keep
+/// the behavior unit-testable without mutating the process environment.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn systemd_unit_path_dirs(raw: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let default = systemd_user_default_search_dirs();
+    let Some(raw) = raw.filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    let raw = raw.to_string_lossy();
+    let append_default = raw.ends_with(':');
+    let mut dirs: Vec<PathBuf> = env::split_paths(std::ffi::OsStr::new(raw.as_ref()))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
+    if append_default {
+        dirs.extend(default);
+    }
+    dedup_paths(dirs)
+}
+
+/// Deduplicate a path list by exact string, preserving order (systemd applies
+/// `strv_uniq` to the final search path).
+fn dedup_paths(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    dirs.into_iter()
+        .filter(|dir| seen.insert(dir.as_os_str().to_os_string()))
+        .collect()
+}
+
+/// Default systemd --user unit search path (systemd.unit(5) "User Unit Search
+/// Path"), highest precedence first, without `SYSTEMD_UNIT_PATH` handling.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn systemd_user_default_search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let xdg_config = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty());
+    let xdg_runtime = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty());
+    let xdg_data = env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty());
+    let home = env::var_os("HOME").filter(|v| !v.is_empty());
+    let config_home = xdg_config
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| PathBuf::from(h).join(".config")));
+    let runtime_home = xdg_runtime.map(PathBuf::from);
+    let data_home = xdg_data
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| PathBuf::from(h).join(".local/share")));
+    // Persistent/transient dbus-API configuration (highest precedence).
+    if let Some(base) = &config_home {
+        dirs.push(base.join("systemd/user.control"));
+    }
+    if let Some(base) = &runtime_home {
+        dirs.push(base.join("systemd/user.control"));
+        dirs.push(base.join("systemd/transient"));
+        dirs.push(base.join("systemd/generator.early"));
+    }
+    if let Some(base) = &config_home {
+        dirs.push(base.join("systemd/user"));
+    }
+    // $XDG_CONFIG_DIRS/systemd/user. systemd resolves the unset default to
+    // `/etc` (→ `/etc/systemd/user`, already listed above), NOT `/etc/xdg` —
+    // verified against `systemd-analyze --user unit-paths` on v259 and the
+    // `SD_PATH_SEARCH_CONFIGURATION` default in sd-path.c (P1-E review).
+    if let Some(value) = env::var_os("XDG_CONFIG_DIRS").filter(|v| !v.is_empty()) {
+        for dir in env::split_paths(&value) {
+            dirs.push(dir.join("systemd/user"));
+        }
+    }
+    dirs.push(PathBuf::from("/etc/systemd/user"));
+    if let Some(base) = &runtime_home {
+        dirs.push(base.join("systemd/user"));
+    }
+    dirs.push(PathBuf::from("/run/systemd/user"));
+    if let Some(base) = &runtime_home {
+        dirs.push(base.join("systemd/generator"));
+    }
+    if let Some(base) = &data_home {
+        dirs.push(base.join("systemd/user"));
+    }
+    // $XDG_DATA_DIRS/systemd/user (default /usr/local/share + /usr/share).
+    match env::var_os("XDG_DATA_DIRS").filter(|v| !v.is_empty()) {
+        Some(value) => {
+            for dir in env::split_paths(&value) {
+                dirs.push(dir.join("systemd/user"));
+            }
+        }
+        None => {
+            dirs.push(PathBuf::from("/usr/local/share/systemd/user"));
+            dirs.push(PathBuf::from("/usr/share/systemd/user"));
+        }
+    }
+    dirs.push(PathBuf::from("/usr/local/lib/systemd/user"));
+    dirs.push(PathBuf::from("/usr/lib/systemd/user"));
+    if let Some(base) = &runtime_home {
+        dirs.push(base.join("systemd/generator.late"));
+    }
+    dirs
+}
+
+/// Read-only disclosure of the *effective* hardening of an installed systemd
+/// --user unit: the base unit file (first file found in the user-manager
+/// search path, systemd.unit(5)) merged with every `{unit}.d/*.conf` drop-in
+/// across the whole search path (higher-precedence directories win for
+/// same-named files; different-named files apply in lexicographic order —
+/// mirroring systemd's merge semantics). Returns `None` when no unit file is
+/// found anywhere on the search path.
+#[allow(dead_code)] // host search-path observer; probes use isolated or effective
+pub fn observe_unit_hardening(unit_path: &Path) -> Option<ServiceHardening> {
+    observe_unit_hardening_in_dirs(unit_path, &systemd_user_search_dirs())
+}
+
+/// Observe only the unit file and drop-ins next to it. Scripted `fs_root`
+/// probes must use this so the host systemd search path cannot hide fixtures.
+fn observe_unit_hardening_isolated(unit_path: &Path) -> Option<ServiceHardening> {
+    let search = unit_path
+        .parent()
+        .map(|parent| vec![parent.to_path_buf()])
+        .unwrap_or_default();
+    observe_unit_hardening_in_dirs(unit_path, &search)
+}
+
+/// Pure core of [`observe_unit_hardening`] with an explicit search path so the
+/// full user-manager merge semantics are unit-testable without touching real
+/// systemd directories.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn observe_unit_hardening_in_dirs(
+    unit_path: &Path,
+    search_dirs: &[PathBuf],
+) -> Option<ServiceHardening> {
+    let unit_name = unit_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| SERVICE_UNIT_NAME.to_string());
+    // The probe-reported install path is only authoritative when systemd
+    // actually searches it. With `SYSTEMD_UNIT_PATH` set (replace semantics,
+    // systemd.unit(5)) the default dirs — including the install dir — may not
+    // be searched at all, so falling back to the installed file would
+    // misreport a unit systemd never loads (P1-E review). The fallback is
+    // therefore gated on the install dir being part of the effective search
+    // path; the hermetic test fixture passes the fixture's own directory.
+    let installed_on_search_path = unit_path
+        .parent()
+        .map(|parent| search_dirs.iter().any(|dir| dir == parent))
+        .unwrap_or(false);
+    // Base unit: the first file found in the search path (highest precedence
+    // wins). A mask (empty file or symlink to /dev/null) *terminates* the
+    // search — systemd.unit(5) says a masked unit is not loaded and cannot
+    // be activated, so a lower-precedence real unit must not be reported as
+    // the effective one. Fall back to the probe-reported path only when that
+    // path is on the effective search path (see above).
+    let base = search_dirs
+        .iter()
+        .map(|dir| dir.join(&unit_name))
+        .find(|path| path.is_file() || unit_is_masked(path))
+        .or_else(|| {
+            installed_on_search_path
+                .then(|| {
+                    (unit_path.is_file() || unit_is_masked(unit_path))
+                        .then(|| unit_path.to_path_buf())
+                })
+                .flatten()
+        })?;
+    if unit_is_masked(&base) {
+        return Some(ServiceHardening {
+            masked: true,
+            summary:
+                "the systemd unit is masked (empty file or symlink to /dev/null, systemd.unit(5)); \
+`ownmesh service install` cannot run the daemon under it until the mask is removed"
+                    .into(),
+            ..ServiceHardening::default()
+        });
+    }
+    let mut merged: Vec<(String, String)> = unit_directives(&fs::read_to_string(&base).ok()?);
+    // Drop-ins: collect every `.conf` from the name-specific `{unit}.d`
+    // directory, the dash-truncated prefix directories (systemd.unit(5): a
+    // unit `foo-bar-baz.service` also reads `foo-bar-.service.d` and
+    // `foo-.service.d`), and the type-level `service.d` directory, across
+    // the whole search path. Precedence for same-named files: name-specific
+    // > prefix > type-level, and within a level higher-precedence search
+    // directories win. Different-named files apply in lexicographic order
+    // regardless of directory (systemd.unit(5)).
+    let mut dropins: Vec<(usize, usize, PathBuf)> = Vec::new(); // (level, search index, path)
+    for (index, dir) in search_dirs.iter().enumerate() {
+        for (level, drop_dir) in dropin_level_dirs(&unit_name, dir) {
+            if let Ok(entries) = fs::read_dir(&drop_dir) {
+                for entry in entries.filter_map(std::result::Result::ok) {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "conf") {
+                        dropins.push((level, index, path));
+                    }
+                }
+            }
+        }
+    }
+    // The probe-reported path's adjacent drop-in directory is where
+    // `ownmesh service install` writes and where local overrides live; it is
+    // part of the effective unit only when the install dir is on the search
+    // path (see `installed_on_search_path`). With `SYSTEMD_UNIT_PATH` replace
+    // semantics the install dir may not be searched at all, so its adjacent
+    // drop-ins must not be merged into a unit systemd loads from elsewhere
+    // (P1-E review). Reading it again when it is also on the search path is
+    // harmless because same-named files are deduplicated below.
+    if installed_on_search_path {
+        let fallback_drop = unit_path.with_file_name(format!("{unit_name}.d"));
+        if let Ok(entries) = fs::read_dir(&fallback_drop) {
+            for entry in entries.filter_map(std::result::Result::ok) {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "conf") {
+                    dropins.push((0, search_dirs.len(), path));
+                }
+            }
+        }
+    }
+    // systemd.unit(5) / systemd issue #13198: for same-named drop-in files
+    // only the file at the highest precedence applies; lower-precedence
+    // same-named files are ignored *entirely* (never merged). A masked
+    // same-named file (symlink to /dev/null, or empty — reads as no
+    // directives) still occupies its name slot: systemd.unit(5) states a
+    // type-level file applies only when there are no drop-ins *or masks*
+    // with that name at higher precedence. Different-named files apply in
+    // lexicographic order regardless of directory. `dropins` is collected in
+    // (level, search-index) precedence order, so the first occurrence of a
+    // name has the highest precedence and wins; an unreadable (dangling
+    // symlink) candidate is skipped and the next-precedence same-named file
+    // applies (systemd skips a drop-in it cannot load).
+    let mut by_name: std::collections::BTreeMap<String, Vec<(usize, usize, PathBuf)>> =
+        std::collections::BTreeMap::new();
+    for (level, index, conf) in dropins {
+        let name = conf
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        by_name.entry(name).or_default().push((level, index, conf));
+    }
+    for candidates in by_name.values_mut() {
+        // Candidates are already in (level, search-index) precedence order;
+        // stable-sort to be explicit.
+        candidates.sort_by_key(|(level, index, _)| (*level, *index));
+        for (_, _, conf) in candidates {
+            if let Ok(raw) = fs::read_to_string(conf) {
+                merged.extend(unit_directives(&raw));
+                break;
+            }
+        }
+    }
+    let value = |name: &str| {
+        merged
+            .iter()
+            .rev()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+    };
+    let no_new_privileges = value("NoNewPrivileges").is_some_and(systemd_bool_true);
+    // The shipped baseline requires `UMask=0077` (descriptor.rs). systemd
+    // accepts any octal spelling (`0077`, `077`), so compare the parsed mode
+    // — a present-but-weak UMask (e.g. `0002`) must not count as the
+    // baseline being effective (P1-E review).
+    let umask_set = value("UMask").is_some_and(umask_is_baseline);
+    let restrict_suidsgid = value("RestrictSUIDSGID").is_some_and(systemd_bool_true);
+    let restrict_realtime = value("RestrictRealtime").is_some_and(systemd_bool_true);
+    let lock_personality = value("LockPersonality").is_some_and(systemd_bool_true);
+    // Seccomp guards verified available in --user services (with and without
+    // `PrivateUsers=yes`; see ADR 0011). `SystemCallArchitectures=native`
+    // blocks non-native architecture syscalls; `RestrictNamespaces=yes`
+    // blocks namespace-creation syscalls for the whole service including
+    // sessions.
+    let system_call_architectures =
+        value("SystemCallArchitectures").is_some_and(|v| v.eq_ignore_ascii_case("native"));
+    let restrict_namespaces = value("RestrictNamespaces").is_some_and(systemd_bool_true);
+    // v1.2.13 baseline (ADR 0011): the shipped unit does NOT force a user
+    // namespace. `PrivateUsers=yes` and the filesystem namespacing
+    // directives (`ProtectSystem=`, `ProtectHome=`, `ReadWritePaths=`,
+    // `PrivateTmp=`, `ProtectKernelTunables=`, `ProtectControlGroups=`,
+    // `ProtectHostname=`, …) implicitly enable `PrivateUsers=` in a per-user
+    // service (systemd NEWS v254; systemd.exec(5)), which maps every host
+    // uid outside the namespace — host root and every other host user alike
+    // — to the overflow uid 65534. OwnMesh custody validation cannot
+    // distinguish a host-root-owned system directory from an attacker-owned
+    // one inside that namespace, so accepting the overflow uid would let a
+    // foreign-owned 0755/01777 ancestor pass and its owner could replace the
+    // daemon's state directory (A5 cross-user boundary; v1.2.13 review).
+    // These directives are therefore disclosed as start-breaking (the daemon
+    // fails to start with `ancestor is owned by untrusted uid 65534`), never
+    // counted as baseline. The individual booleans are retained for the
+    // backward-compatible JSON contract.
+    let private_users = value("PrivateUsers").is_some_and(systemd_bool_true);
+    let protect_system_full = value("ProtectSystem")
+        .is_some_and(|v| v.eq_ignore_ascii_case("full") || v.eq_ignore_ascii_case("strict"));
+    let private_tmp = value("PrivateTmp").is_some_and(systemd_bool_true);
+    let protect_proc = value("ProtectProc").is_some_and(|v| v.eq_ignore_ascii_case("invisible"));
+    let protect_kernel_tunables = value("ProtectKernelTunables").is_some_and(systemd_bool_true);
+    let protect_control_groups = value("ProtectControlGroups").is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "yes" | "true" | "on" | "1" | "private" | "strict"
+        )
+    });
+    let protect_hostname = value("ProtectHostname").is_some_and(systemd_bool_true);
+    let read_write_paths_set = value("ReadWritePaths").is_some_and(|v| !v.is_empty());
+    // `CapabilityBoundingSet=` with an empty value is still a directive (and
+    // a start-breaking one in a --user service), so it must be detected even
+    // though `value()` filters empty values.
+    let directive_present = |name: &str| {
+        merged
+            .iter()
+            .rev()
+            .any(|(n, _)| n.eq_ignore_ascii_case(name))
+    };
+    // Start-breaking --user directives (verified empirically on systemd v259:
+    // user-service startup fails with exit status 218/CAPABILITIES even under
+    // `PrivateUsers=yes`, because applying them needs capabilities the --user
+    // manager does not have in the host namespace). systemd.exec(5) documents
+    // that an unset `CapabilityBoundingSet=` leaves the bounding set
+    // unmodified; the login session's set is inherited unchanged.
+    let start_breaking_directives = directive_present("CapabilityBoundingSet")
+        || directive_present("ProtectClock")
+        || directive_present("ProtectKernelLogs")
+        || directive_present("ProtectKernelModules");
+    let capability_bounding_set = directive_present("CapabilityBoundingSet");
+    // Any directive that forces a user namespace in a per-user service is
+    // disclosed as start-breaking (v1.2.13 review, ADR 0011): inside the
+    // namespace every host uid outside the mapping — host root and every
+    // other host user alike — appears as the overflow uid 65534, so custody
+    // validation cannot verify real ownership and the daemon fails to start.
+    // `ProtectClock=`/`ProtectKernelLogs=`/`ProtectKernelModules=` are
+    // start-breaking for a different reason and handled separately;
+    // `CapabilityBoundingSet=` does not change filesystem visibility.
+    let user_namespace_forcing = private_users
+        || protect_system_full
+        || private_tmp
+        || protect_kernel_tunables
+        || protect_control_groups
+        || protect_hostname
+        || read_write_paths_set
+        || value("ProtectSystem").is_some_and(|v| !v.eq_ignore_ascii_case("no"))
+        || value("ProtectHome").is_some_and(|v| !v.eq_ignore_ascii_case("no"))
+        || [
+            "ReadOnlyPaths",
+            "InaccessiblePaths",
+            "DynamicUser",
+            "ProcSubset",
+            "PrivateDevices",
+            "PrivateNetwork",
+            "BindPaths",
+            "BindReadOnlyPaths",
+            "MountImages",
+            "TemporaryFileSystem",
+            "PrivateIPC",
+        ]
+        .iter()
+        .any(|name| directive_present(name));
+    // `ProtectHome=` read-only or a `ReadOnlyPaths=` list makes the
+    // user/workspace hierarchy read-only, which conflicts with registered
+    // workspaces (and also forces the user namespace, disclosed above).
+    let read_only_hierarchy = value("ProtectHome").is_some_and(|v| !v.eq_ignore_ascii_case("no"))
+        || directive_present("ReadOnlyPaths");
+    // The v1.2.13 baseline: the process-level guards plus ProtectProc=invisible,
+    // with no user-namespace-forcing directive and no read-only hierarchy.
+    let baseline_intact = no_new_privileges
+        && umask_set
+        && restrict_suidsgid
+        && restrict_realtime
+        && lock_personality
+        && system_call_architectures
+        && restrict_namespaces
+        && protect_proc
+        && !user_namespace_forcing
+        && !read_only_hierarchy;
+    let summary = hardening_summary(
+        baseline_intact,
+        user_namespace_forcing,
+        read_only_hierarchy,
+        start_breaking_directives,
+    );
+    Some(ServiceHardening {
+        no_new_privileges,
+        umask_set,
+        restrict_suidsgid,
+        restrict_realtime,
+        lock_personality,
+        system_call_architectures,
+        restrict_namespaces,
+        capability_bounding_set,
+        user_namespace_forcing,
+        read_only_hierarchy,
+        private_users,
+        protect_system_full,
+        private_tmp,
+        protect_proc,
+        protect_kernel_tunables,
+        protect_control_groups,
+        protect_hostname,
+        read_write_paths_set,
+        start_breaking_directives,
+        masked: false,
+        summary,
+    })
+}
+
+/// Human-readable hardening disclosure shared by the static and the
+/// manager-effective observation paths.
+#[allow(clippy::fn_params_excessive_bools)] // DTO summarizer: one bool per disclosure class
+fn hardening_summary(
+    baseline_intact: bool,
+    user_namespace_forcing: bool,
+    read_only_hierarchy: bool,
+    start_breaking_directives: bool,
+) -> String {
+    if start_breaking_directives {
+        "the effective unit sets a directive an unprivileged --user service cannot apply — \
+CapabilityBoundingSet=/ProtectClock=/ProtectKernelLogs=/ProtectKernelModules= fail startup with \
+exit status 218/CAPABILITIES on systemd v259 even under PrivateUsers=yes (verified empirically; \
+systemd.exec(5) documents that an unset CapabilityBoundingSet= leaves the bounding set \
+unmodified); re-run `ownmesh service install` to restore the supported unit"
+            .to_string()
+    } else if user_namespace_forcing {
+        "the effective unit forces a user namespace (PrivateUsers=yes or the filesystem \
+namespacing directives ProtectSystem/ProtectHome/ReadWritePaths/PrivateTmp/\
+ProtectKernelTunables/ProtectControlGroups/ProtectHostname/...); inside it every host uid \
+outside the namespace — host root and every other host user alike — appears as the overflow \
+uid 65534, so OwnMesh custody validation cannot verify real ownership and the daemon fails to \
+start with `ancestor is owned by untrusted uid 65534`; re-run `ownmesh service install` to \
+remove OwnMesh-generated leftovers (operator drop-ins that still force a user namespace must \
+be deleted by hand)"
+            .to_string()
+    } else if !baseline_intact {
+        "a local override weakened the shipped hardening (NoNewPrivileges/UMask/RestrictSUIDSGID/\
+RestrictRealtime/LockPersonality/SystemCallArchitectures/RestrictNamespaces/\
+ProtectProc=invisible); re-run `ownmesh service install` to restore the supported unit"
+            .to_string()
+    } else if read_only_hierarchy {
+        "unit or a drop-in makes parts of the user/workspace hierarchy read-only (ProtectHome/\
+ReadOnlyPaths), which can conflict with registered workspaces"
+            .to_string()
+    } else {
+        "baseline: NoNewPrivileges/UMask/RestrictSUIDSGID/RestrictRealtime/LockPersonality/\
+SystemCallArchitectures/RestrictNamespaces enforced; ProtectProc=invisible (no user namespace — \
+custody validation stays byte-for-byte strict, see systemd.exec(5) and ADR 0011); the \
+capability bounding set is left unmodified (systemd.exec(5)) because an unprivileged --user \
+service cannot change it"
+            .to_string()
+    }
+}
+
+/// Parse `systemctl --user show -p X -p Y …` output into a name→value map.
+/// Lines are `Name=value`; empty values (e.g. an unset `ReadWritePaths=`)
+/// are kept as empty strings so callers can distinguish "unset" from
+/// "defaulted" manager properties.
+/// systemd.unit(5): a unit file that is empty (size 0) or symlinked to
+/// /dev/null is *masked* — its configuration is not loaded and it cannot be
+/// activated. A dangling symlink is treated as absent (not masked) so the
+/// search continues to lower-precedence directories, mirroring systemd.
+fn unit_is_masked(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        // Follow the link: a target that is a char device (/dev/null) or a
+        // zero-length file masks the unit.
+        match fs::metadata(path) {
+            Ok(target) => target.len() == 0 || !target.is_file(),
+            Err(_) => false, // dangling symlink: not found, not masked
+        }
+    } else {
+        meta.len() == 0
+    }
+}
+
+/// Drop-in directory names systemd searches for a unit, highest precedence
+/// first (systemd.unit(5)): the name-specific `{unit}.d`, the dash-truncated
+/// prefix directories (`foo-bar-baz.service` also reads `foo-bar-.service.d`
+/// and `foo-.service.d`), and the type-level `service.d` for all service
+/// units. Type-level files have lower precedence than name-specific and
+/// prefix files.
+fn dropin_level_dirs(unit_name: &str, base: &Path) -> Vec<(usize, PathBuf)> {
+    let mut dirs = Vec::new();
+    dirs.push((0, base.join(format!("{unit_name}.d"))));
+    for prefix in dash_prefixes(unit_name) {
+        dirs.push((1, base.join(format!("{prefix}.d"))));
+    }
+    dirs.push((2, base.join("service.d")));
+    dirs
+}
+
+/// The dash-truncated prefix names systemd.unit(5) documents for drop-ins:
+/// the unit type suffix is stripped, the base name is repeatedly truncated
+/// after the last dash that has characters after it, and the suffix is
+/// re-appended. `foo-bar-baz.service` yields `foo-bar-.service` and
+/// `foo-.service`; `ownmesh-ownmeshd.service` yields `ownmesh-.service`.
+fn dash_prefixes(unit_name: &str) -> Vec<String> {
+    let (base, suffix) = match unit_name.rsplit_once('.') {
+        Some((base, suffix)) => (base, format!(".{suffix}")),
+        None => (unit_name, String::new()),
+    };
+    let mut out = Vec::new();
+    let mut current = base.to_string();
+    loop {
+        let Some(pos) = current.rfind('-') else {
+            break;
+        };
+        // A trailing dash has nothing after it to truncate at.
+        if pos == current.len() - 1 {
+            break;
+        }
+        current.truncate(pos + 1);
+        out.push(format!("{current}{suffix}"));
+    }
+    out
+}
+
+fn parse_show_properties(stdout: &str) -> std::collections::BTreeMap<String, String> {
+    let mut props = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once('=') {
+            props.insert(name.trim().to_string(), value.trim().to_string());
+        }
+    }
+    props
+}
+
+/// Read-only observation of the *manager-effective* hardening of an installed
+/// systemd --user unit: `systemctl --user show` reflects the loaded unit
+/// (base file + drop-ins + manager defaults, post `daemon-reload`), which is
+/// what the running daemon actually executes with. Static file analysis
+/// ([`observe_unit_hardening`]) still runs first so a unit that exists but is
+/// not loaded (no systemd available, or never reloaded) falls back cleanly;
+/// when `systemctl show` succeeds its effective values drive the booleans and
+/// the summary, and static analysis is used for directive-presence facts the
+/// manager does not expose reliably (e.g. `CapabilityBoundingSet=` on a unit
+/// that fails to start).
+// The public wrapper is called only by the Linux systemd status path. Keep it
+// available to cross-platform tests without making macOS/Windows test builds
+// fail their workspace-wide `-D warnings` gate.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn observe_unit_hardening_effective<R: ProcessRunner + ?Sized>(
+    runner: &R,
+    unit_path: &Path,
+) -> Option<ServiceHardening> {
+    observe_unit_hardening_effective_in_dirs(runner, unit_path, &systemd_user_search_dirs())
+}
+
+/// Pure core of [`observe_unit_hardening_effective`] with an explicit search
+/// path so the full merge semantics are unit-testable without touching real
+/// systemd directories.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+fn observe_unit_hardening_effective_in_dirs<R: ProcessRunner + ?Sized>(
+    runner: &R,
+    unit_path: &Path,
+    search_dirs: &[PathBuf],
+) -> Option<ServiceHardening> {
+    let static_obs = observe_unit_hardening_in_dirs(unit_path, search_dirs)?;
+    let unit_name = unit_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| SERVICE_UNIT_NAME.to_string());
+    let out = runner.run(
+        "systemctl",
+        &[
+            "--user",
+            "show",
+            &unit_name,
+            "-p",
+            "NoNewPrivileges",
+            "-p",
+            "UMask",
+            "-p",
+            "RestrictSUIDSGID",
+            "-p",
+            "RestrictRealtime",
+            "-p",
+            "LockPersonality",
+            "-p",
+            "SystemCallArchitectures",
+            "-p",
+            "RestrictNamespaces",
+            "-p",
+            "ProtectSystem",
+            "-p",
+            "ProtectHome",
+            "-p",
+            "PrivateTmp",
+            "-p",
+            "PrivateUsers",
+            "-p",
+            "ProtectProc",
+            "-p",
+            "ProtectKernelTunables",
+            "-p",
+            "ProtectControlGroups",
+            "-p",
+            "ProtectHostname",
+            "-p",
+            "ProcSubset",
+            "-p",
+            "ReadWritePaths",
+            "-p",
+            "ReadOnlyPaths",
+            "-p",
+            "InaccessiblePaths",
+        ],
+    );
+    let Ok(out) = out else {
+        return Some(static_obs);
+    };
+    if !out.success() {
+        return Some(static_obs);
+    }
+    let props = parse_show_properties(&out.stdout);
+    let val = |name: &str| props.get(name).map(String::as_str);
+    // `systemctl show` reflects manager defaults: a user service without the
+    // directive reports NoNewPrivileges=yes, UMask=<login default>, and the
+    // namespacing defaults below, so "active" means non-default here — which
+    // is exactly the effective hardening the running daemon has.
+    let active = |name: &str, defaults: &[&str]| {
+        val(name)
+            .map(|value| {
+                !value.is_empty() && !defaults.iter().any(|d| value.eq_ignore_ascii_case(d))
+            })
+            .unwrap_or(false)
+    };
+    let no_new_privileges = val("NoNewPrivileges").is_some_and(systemd_bool_true);
+    // The shipped baseline requires `UMask=0077`; the manager default for a
+    // --user service is 0002, so only the exact shipped value counts as the
+    // baseline being effective. `systemctl show` normalizes the mode to
+    // `%04o`, so the octal comparison accepts `0077`/`077` spellings alike.
+    let umask_set = val("UMask").is_some_and(umask_is_baseline);
+    let restrict_suidsgid = val("RestrictSUIDSGID").is_some_and(systemd_bool_true);
+    let restrict_realtime = val("RestrictRealtime").is_some_and(systemd_bool_true);
+    let lock_personality = val("LockPersonality").is_some_and(systemd_bool_true);
+    // Seccomp guards: `systemctl show` reports the effective value (empty for
+    // the default `SystemCallArchitectures=`; `no` for the default
+    // `RestrictNamespaces=`), so only the shipped values count as effective.
+    let system_call_architectures =
+        val("SystemCallArchitectures").is_some_and(|value| value.eq_ignore_ascii_case("native"));
+    let restrict_namespaces = val("RestrictNamespaces").is_some_and(systemd_bool_true);
+    // v1.2.13 baseline (ADR 0011): the shipped unit does NOT force a user
+    // namespace. The manager defaults for the userns-forcing directives are
+    // `PrivateUsers=no`, `ProtectSystem=no`, `PrivateTmp=no`,
+    // `ProtectProc=default`, so only non-default values count as effective
+    // and are disclosed as start-breaking (see
+    // [`ServiceHardening::user_namespace_forcing`]).
+    let private_users = val("PrivateUsers").is_some_and(systemd_bool_true);
+    let protect_system_full = val("ProtectSystem").is_some_and(|value| {
+        value.eq_ignore_ascii_case("full") || value.eq_ignore_ascii_case("strict")
+    });
+    let private_tmp = val("PrivateTmp").is_some_and(systemd_bool_true);
+    let protect_proc =
+        val("ProtectProc").is_some_and(|value| value.eq_ignore_ascii_case("invisible"));
+    let protect_kernel_tunables = val("ProtectKernelTunables").is_some_and(systemd_bool_true);
+    let protect_control_groups = val("ProtectControlGroups").is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "yes" | "true" | "on" | "1" | "private" | "strict"
+        )
+    });
+    let protect_hostname = val("ProtectHostname").is_some_and(systemd_bool_true);
+    let read_write_paths_set = val("ReadWritePaths").is_some_and(|value| !value.is_empty());
+    let unexpected_visibility = active("ProtectHome", &["no"])
+        || active("ProcSubset", &["all"])
+        || val("ReadOnlyPaths").is_some_and(|v| !v.is_empty())
+        || val("InaccessiblePaths").is_some_and(|v| !v.is_empty());
+    // Any directive that forces a user namespace in a per-user service is
+    // disclosed as start-breaking (v1.2.13 review, ADR 0011): inside the
+    // namespace every host uid outside the mapping — host root and every
+    // other host user alike — appears as the overflow uid 65534, so custody
+    // validation cannot verify real ownership and the daemon fails to start.
+    let user_namespace_forcing = private_users
+        || protect_system_full
+        || private_tmp
+        || protect_kernel_tunables
+        || protect_control_groups
+        || protect_hostname
+        || read_write_paths_set
+        || unexpected_visibility
+        || static_obs.user_namespace_forcing;
+    let read_only_hierarchy =
+        active("ProtectHome", &["no"]) || val("ReadOnlyPaths").is_some_and(|v| !v.is_empty());
+    // The v1.2.13 baseline: the process-level guards plus ProtectProc=invisible,
+    // with no user-namespace-forcing directive and no read-only hierarchy.
+    let baseline_intact = no_new_privileges
+        && umask_set
+        && restrict_suidsgid
+        && restrict_realtime
+        && lock_personality
+        && system_call_architectures
+        && restrict_namespaces
+        && protect_proc
+        && !user_namespace_forcing
+        && !read_only_hierarchy;
+    // `CapabilityBoundingSet=` / `ProtectClock=` / `ProtectKernelLogs=` /
+    // `ProtectKernelModules=` make the unit fail to start in a --user service
+    // (verified 218/CAPABILITIES on v259 even under PrivateUsers=yes); the
+    // manager reports the values it would apply only for a unit that can
+    // apply them, so the static directive-presence facts are the reliable
+    // signal.
+    let capability_bounding_set = static_obs.capability_bounding_set;
+    let start_breaking_directives = capability_bounding_set || static_obs.start_breaking_directives;
+    let summary = hardening_summary(
+        baseline_intact,
+        user_namespace_forcing,
+        read_only_hierarchy,
+        start_breaking_directives,
+    );
+    Some(ServiceHardening {
+        no_new_privileges,
+        umask_set,
+        restrict_suidsgid,
+        restrict_realtime,
+        lock_personality,
+        system_call_architectures,
+        restrict_namespaces,
+        capability_bounding_set,
+        user_namespace_forcing,
+        read_only_hierarchy,
+        private_users,
+        protect_system_full,
+        private_tmp,
+        protect_proc,
+        protect_kernel_tunables,
+        protect_control_groups,
+        protect_hostname,
+        read_write_paths_set,
+        start_breaking_directives,
+        masked: static_obs.masked,
+        summary,
     })
 }
 
@@ -971,6 +2871,929 @@ mod tests {
     use crate::commands::service::security::{canonicalize_executable, validate_service_path};
     use ownmesh_config::OwnMeshPaths;
     use tempfile::tempdir;
+
+    /// Hermetic fixture observer: the fixture's own directory is the search
+    /// path, so the fallback rule (the probe-reported install path must be on
+    /// the effective search path, P1-E review) is satisfied and tests never
+    /// depend on the CI host's real systemd user state (a machine with an
+    /// installed unit would otherwise shadow the fixture).
+    fn observe_fixture(unit: &Path) -> Option<ServiceHardening> {
+        observe_unit_hardening_isolated(unit)
+    }
+
+    /// The v1.2.13 shipped --user baseline (ADR 0011): the process-level
+    /// seccomp guards plus `ProtectProc=invisible`, with **no** directive
+    /// that forces a user namespace (PrivateUsers=yes and the filesystem
+    /// namespacing directives are deliberately absent — inside the namespace
+    /// every host uid outside the mapping appears as the overflow uid 65534,
+    /// so custody validation cannot verify real ownership).
+    const BASELINE_UNIT: &str = "[Service]\nNoNewPrivileges=true\nUMask=0077\n\
+RestrictSUIDSGID=true\nRestrictRealtime=true\nLockPersonality=true\n\
+SystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectProc=invisible\nExecStart=/bin/true\n";
+
+    /// P1-E regression fixtures: the hardening observer must disclose the
+    /// *effective* unit (base + drop-ins) read-only, so doctor can warn about
+    /// local overrides instead of claiming an unmodified baseline. Each case
+    /// uses a fresh directory so drop-ins cannot leak between cases.
+    #[test]
+    fn unit_hardening_observer_discloses_effective_directives() {
+        // P1-E: the shipped baseline deliberately omits CapabilityBoundingSet=
+        // (systemd.exec(5): an unset option leaves the bounding set
+        // unmodified, and an unprivileged --user service cannot apply it).
+        let baseline = BASELINE_UNIT;
+
+        // 1. Baseline unit (as rendered by the fixed descriptor).
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        fs::write(&unit, baseline).unwrap();
+        let h = observe_fixture(&unit).expect("unit present");
+        assert!(h.no_new_privileges);
+        assert!(h.umask_set);
+        assert!(h.restrict_suidsgid);
+        assert!(h.restrict_realtime);
+        assert!(h.lock_personality);
+        assert!(h.system_call_architectures, "{h:?}");
+        assert!(h.restrict_namespaces, "{h:?}");
+        assert!(h.protect_proc, "{h:?}");
+        // The v1.2.13 baseline does NOT force a user namespace: any of these
+        // directives would hide real uids and make custody validation
+        // unsound (v1.2.13 review, ADR 0011).
+        assert!(!h.private_users, "{h:?}");
+        assert!(!h.protect_system_full, "{h:?}");
+        assert!(!h.private_tmp, "{h:?}");
+        assert!(!h.protect_kernel_tunables, "{h:?}");
+        assert!(!h.protect_control_groups, "{h:?}");
+        assert!(!h.protect_hostname, "{h:?}");
+        assert!(!h.read_write_paths_set, "{h:?}");
+        assert!(
+            !h.capability_bounding_set,
+            "CapabilityBoundingSet= is not part of the shipped baseline: {h:?}"
+        );
+        assert!(!h.start_breaking_directives, "{h:?}");
+        assert!(!h.user_namespace_forcing, "{h:?}");
+        assert!(!h.read_only_hierarchy);
+        assert!(!h.masked, "{h:?}");
+        assert!(h.summary.contains("baseline"), "{}", h.summary);
+
+        // 1a. A drop-in disabling one of the shipped process-level guards or
+        //     ProtectProc=invisible must be disclosed as weakened — never
+        //     reported as an intact baseline.
+        for (name, conf) in [
+            ("NoNewPrivileges", "[Service]\nNoNewPrivileges=no\n"),
+            ("UMask", "[Service]\nUMask=\n"),
+            ("RestrictSUIDSGID", "[Service]\nRestrictSUIDSGID=no\n"),
+            ("RestrictRealtime", "[Service]\nRestrictRealtime=no\n"),
+            ("LockPersonality", "[Service]\nLockPersonality=no\n"),
+            (
+                "SystemCallArchitectures",
+                "[Service]\nSystemCallArchitectures=\n",
+            ),
+            ("RestrictNamespaces", "[Service]\nRestrictNamespaces=no\n"),
+            ("ProtectProc", "[Service]\nProtectProc=default\n"),
+        ] {
+            let dir = tempdir().unwrap();
+            let unit = dir.path().join("ownmesh-ownmeshd.service");
+            let drop = dir.path().join("ownmesh-ownmeshd.service.d");
+            fs::create_dir_all(&drop).unwrap();
+            fs::write(&unit, baseline).unwrap();
+            fs::write(drop.join("local.conf"), conf).unwrap();
+            let h = observe_fixture(&unit).unwrap();
+            assert!(
+                h.summary.contains("weakened"),
+                "{name} drop-in must be disclosed: {h:?}"
+            );
+            assert!(
+                h.summary.contains("ownmesh service install"),
+                "actionable remediation: {h:?}"
+            );
+        }
+
+        // 1a2. A drop-in re-adding a user-namespace-forcing directive
+        //     (PrivateUsers=yes or any filesystem namespacing directive) must
+        //     be disclosed as start-breaking — the daemon fails to start with
+        //     `ancestor is owned by untrusted uid 65534` because custody
+        //     cannot verify real uids inside the namespace (v1.2.13 review,
+        //     ADR 0011) — never reported as an intact baseline.
+        for (name, conf) in [
+            ("PrivateUsers", "[Service]\nPrivateUsers=yes\n"),
+            ("ProtectSystem", "[Service]\nProtectSystem=full\n"),
+            ("PrivateTmp", "[Service]\nPrivateTmp=yes\n"),
+            (
+                "ProtectKernelTunables",
+                "[Service]\nProtectKernelTunables=yes\n",
+            ),
+            (
+                "ProtectControlGroups",
+                "[Service]\nProtectControlGroups=yes\n",
+            ),
+            ("ProtectHostname", "[Service]\nProtectHostname=yes\n"),
+            (
+                "ReadWritePaths",
+                "[Service]\nReadWritePaths=\"/tmp/state\"\n",
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            let unit = dir.path().join("ownmesh-ownmeshd.service");
+            let drop = dir.path().join("ownmesh-ownmeshd.service.d");
+            fs::create_dir_all(&drop).unwrap();
+            fs::write(&unit, baseline).unwrap();
+            fs::write(drop.join("local.conf"), conf).unwrap();
+            let h = observe_fixture(&unit).unwrap();
+            assert!(
+                h.user_namespace_forcing,
+                "{name} drop-in must be disclosed as user-namespace-forcing: {h:?}"
+            );
+            assert!(
+                h.summary.contains("user namespace"),
+                "{name} drop-in summary must explain the custody consequence: {}",
+                h.summary
+            );
+            assert!(
+                h.summary.contains("ownmesh service install"),
+                "actionable remediation: {h:?}"
+            );
+        }
+
+        // 1b. A unit that re-adds CapabilityBoundingSet= (any value) must be
+        //     disclosed as a start-breaking --user directive (an unprivileged
+        //     user manager cannot apply it — startup fails with status
+        //     218/CAPABILITIES even under PrivateUsers=yes on v259), not
+        //     silently accepted and not mislabeled as user-namespace-forcing.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let with_caps = "[Service]\nNoNewPrivileges=true\nUMask=0077\nRestrictSUIDSGID=true\n\
+RestrictRealtime=true\nLockPersonality=true\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectProc=invisible\nCapabilityBoundingSet=\nExecStart=/bin/true\n";
+        fs::write(&unit, with_caps).unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(h.capability_bounding_set, "{h:?}");
+        assert!(h.start_breaking_directives, "{h:?}");
+        assert!(
+            !h.user_namespace_forcing,
+            "CapabilityBoundingSet= does not force a user namespace (it fails startup instead): {h:?}"
+        );
+        assert!(
+            h.summary.contains("ownmesh service install"),
+            "{}",
+            h.summary
+        );
+
+        // 1c. A unit adding ProtectClock=/ProtectKernelLogs=/ProtectKernelModules=
+        //     (start-breaking on v259 even under PrivateUsers=yes) must be
+        //     disclosed, not silently accepted as hardening.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let with_clock = "[Service]\nNoNewPrivileges=true\nUMask=0077\nRestrictSUIDSGID=true\n\
+RestrictRealtime=true\nLockPersonality=true\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectProc=invisible\nProtectClock=yes\nExecStart=/bin/true\n";
+        fs::write(&unit, with_clock).unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(h.start_breaking_directives, "{h:?}");
+        assert!(
+            h.summary.contains("ownmesh service install"),
+            "{}",
+            h.summary
+        );
+
+        // 2. Legacy shipped unit (pre-fix namespacing directives) must be
+        //    disclosed (ProtectHome=read-only conflicts with workspaces) even
+        //    though the reconciled baseline directives are absent.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let legacy = "[Service]\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=read-only\nPrivateTmp=true\n";
+        fs::write(&unit, legacy).unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(h.user_namespace_forcing);
+        assert!(h.read_only_hierarchy);
+        assert!(
+            h.summary.contains("ownmesh service install"),
+            "{}",
+            h.summary
+        );
+
+        // 3. A local drop-in disabling a baseline guard must be disclosed.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let drop = dir.path().join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&drop).unwrap();
+        fs::write(
+            drop.join("local.conf"),
+            "[Service]\nNoNewPrivileges=false\n",
+        )
+        .unwrap();
+        fs::write(&unit, baseline).unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(!h.no_new_privileges, "drop-in override must win: {h:?}");
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // 3a. A drop-in disabling only SystemCallArchitectures or
+        //     RestrictNamespaces must also be disclosed (the seccomp guards
+        //     are part of the shipped baseline, not optional extras).
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let drop = dir.path().join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&drop).unwrap();
+        fs::write(&unit, baseline).unwrap();
+        fs::write(
+            drop.join("local.conf"),
+            "[Service]\nSystemCallArchitectures=\nRestrictNamespaces=no\n",
+        )
+        .unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(
+            !h.system_call_architectures,
+            "drop-in clearing SystemCallArchitectures must be disclosed: {h:?}"
+        );
+        assert!(
+            !h.restrict_namespaces,
+            "drop-in disabling RestrictNamespaces must be disclosed: {h:?}"
+        );
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // 3b. A drop-in disabling only RestrictSUIDSGID must also be disclosed
+        //     (not just the single privilege guard).
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let drop = dir.path().join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&drop).unwrap();
+        fs::write(&unit, baseline).unwrap();
+        fs::write(
+            drop.join("local.conf"),
+            "[Service]\nRestrictSUIDSGID=false\n",
+        )
+        .unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(h.no_new_privileges);
+        assert!(!h.restrict_suidsgid, "drop-in override must win: {h:?}");
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // 3c. A drop-in adding CapabilityBoundingSet= (any value) must be
+        //     disclosed as a start-breaking --user directive (status
+        //     218/CAPABILITIES; it does NOT force PrivateUsers=), not silently
+        //     accepted.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let drop = dir.path().join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&drop).unwrap();
+        fs::write(&unit, baseline).unwrap();
+        fs::write(
+            drop.join("local.conf"),
+            "[Service]\nCapabilityBoundingSet=CAP_SYS_ADMIN\n",
+        )
+        .unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(
+            h.capability_bounding_set,
+            "CapabilityBoundingSet= drop-in must be disclosed: {h:?}"
+        );
+        assert!(
+            !h.user_namespace_forcing,
+            "CapabilityBoundingSet= does not force a user namespace: {h:?}"
+        );
+        assert!(
+            h.summary.contains("ownmesh service install"),
+            "{}",
+            h.summary
+        );
+
+        // 4. Drop-in re-adding namespacing must be disclosed even when the
+        //    base unit is the fixed baseline.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let drop = dir.path().join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&drop).unwrap();
+        fs::write(&unit, baseline).unwrap();
+        fs::write(
+            drop.join("local.conf"),
+            "[Service]\nProtectHome=read-only\n",
+        )
+        .unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(h.no_new_privileges);
+        assert!(h.user_namespace_forcing, "drop-in added directive: {h:?}");
+
+        // 5. Missing unit → None (read-only, no fabrication).
+        assert!(observe_fixture(&tempdir().unwrap().path().join("absent.service")).is_none());
+
+        // Comments must never count as directives.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let commented = "# ProtectSystem=strict\n[Service]\nNoNewPrivileges=true\n";
+        fs::write(&unit, commented).unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(
+            !h.user_namespace_forcing,
+            "comments are not directives: {h:?}"
+        );
+
+        // 6. Directives placed in the WRONG section are ignored by systemd
+        //    (with a warning) and must never count as hardening — the static
+        //    observer is section-validated. A `ProtectSystem=strict` in
+        //    `[Unit]` and a `NoNewPrivileges=true` in `[Install]` are both
+        //    non-effective.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        let wrong_sections = "[Unit]\nProtectSystem=strict\n[Service]\nExecStart=/bin/true\n[Install]\nNoNewPrivileges=true\n";
+        fs::write(&unit, wrong_sections).unwrap();
+        let h = observe_fixture(&unit).unwrap();
+        assert!(
+            !h.user_namespace_forcing,
+            "ProtectSystem= in [Unit] is ignored by systemd and must not count: {h:?}"
+        );
+        assert!(
+            !h.no_new_privileges,
+            "NoNewPrivileges= in [Install] is ignored by systemd and must not count: {h:?}"
+        );
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+    }
+
+    /// P1-E: the observer reads *manager-effective* properties via
+    /// `systemctl --user show` when available (reflecting the loaded unit +
+    /// drop-ins + manager defaults), so a drop-in weakening a guard is
+    /// disclosed even if the static file analysis would miss it, and a unit
+    /// without an explicit `UMask=` is disclosed as degraded (the manager
+    /// default is not the shipped 0077). When `systemctl show` fails (unit
+    /// not loaded / no systemd), the section-validated static analysis is
+    /// the fallback. The hermetic `_in_dirs` core keeps the test independent
+    /// of the CI host's real systemd user state.
+    #[test]
+    fn unit_hardening_observer_reads_manager_effective_properties() {
+        let runner = ScriptedProcessRunner::default();
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        fs::write(&unit, BASELINE_UNIT).unwrap();
+        let observe = |runner: &ScriptedProcessRunner| {
+            // The fixture's own directory is the search path (same rule as
+            // `observe_fixture`): the probe-reported install path must be on
+            // the effective search path for the fallback to apply (P1-E
+            // review).
+            let search = vec![dir.path().to_path_buf()];
+            observe_unit_hardening_effective_in_dirs(runner, &unit, &search).expect("observed")
+        };
+
+        // Effective dump matching the shipped baseline (manager values for
+        // the namespacing options are the defaults — the v1.2.13 baseline
+        // deliberately does not force a user namespace): healthy.
+        runner.set_show_output(
+            "NoNewPrivileges=yes\nUMask=0077\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\n\
+LockPersonality=yes\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectSystem=no\nProtectHome=no\nPrivateTmp=no\nPrivateUsers=no\n\
+ProtectProc=invisible\nProtectKernelTunables=no\nProtectControlGroups=no\nProtectHostname=no\n\
+ProcSubset=all\nReadWritePaths=\n\
+ReadOnlyPaths=\nInaccessiblePaths=\n"
+                .into(),
+        );
+        let h = observe(&runner);
+        assert!(h.no_new_privileges, "{h:?}");
+        assert!(h.umask_set, "{h:?}");
+        assert!(h.restrict_suidsgid, "{h:?}");
+        assert!(h.restrict_realtime, "{h:?}");
+        assert!(h.lock_personality, "{h:?}");
+        assert!(h.system_call_architectures, "{h:?}");
+        assert!(h.restrict_namespaces, "{h:?}");
+        assert!(h.protect_proc, "{h:?}");
+        assert!(!h.private_users, "{h:?}");
+        assert!(!h.protect_system_full, "{h:?}");
+        assert!(!h.private_tmp, "{h:?}");
+        assert!(!h.protect_kernel_tunables, "{h:?}");
+        assert!(!h.protect_control_groups, "{h:?}");
+        assert!(!h.protect_hostname, "{h:?}");
+        assert!(!h.read_write_paths_set, "{h:?}");
+        assert!(!h.user_namespace_forcing, "{h:?}");
+        assert!(h.summary.contains("baseline"), "{}", h.summary);
+
+        // Effective dump showing a drop-in cleared ProtectProc=invisible
+        // while the static file still lists the baseline directive: the
+        // manager-effective value is `default`, so the baseline must be
+        // disclosed as weakened.
+        runner.set_show_output(
+            "NoNewPrivileges=yes\nUMask=0077\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\n\
+LockPersonality=yes\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectSystem=no\nProtectHome=no\nPrivateTmp=no\nPrivateUsers=no\n\
+ProtectProc=default\nProtectKernelTunables=no\nProtectControlGroups=no\nProtectHostname=no\n\
+ProcSubset=all\nReadWritePaths=\nReadOnlyPaths=\nInaccessiblePaths=\n"
+                .into(),
+        );
+        let h = observe(&runner);
+        assert!(!h.protect_proc, "effective ProtectProc=default: {h:?}");
+        assert!(h.no_new_privileges, "{h:?}");
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // Effective dump showing a drop-in cleared the shipped UMask (manager
+        // default 0002): disclosed as weakened, not silently accepted.
+        runner.set_show_output(
+            "NoNewPrivileges=yes\nUMask=0002\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\n\
+LockPersonality=yes\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectSystem=no\nProtectHome=no\nPrivateTmp=no\nPrivateUsers=no\n\
+ProtectProc=invisible\nProtectKernelTunables=no\nProtectControlGroups=no\nProtectHostname=no\n\
+ProcSubset=all\nReadWritePaths=\nReadOnlyPaths=\nInaccessiblePaths=\n"
+                .into(),
+        );
+        let h = observe(&runner);
+        assert!(
+            !h.umask_set,
+            "effective UMask is the manager default: {h:?}"
+        );
+        assert!(h.protect_proc, "{h:?}");
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // Effective dump showing a drop-in weakened NoNewPrivileges and the
+        // manager default UMask (no explicit UMask in the effective unit):
+        // the effective observation must disclose the degradation even though
+        // the static file still lists the baseline directives.
+        runner.set_show_output(
+            "NoNewPrivileges=no\nUMask=0002\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\n\
+LockPersonality=yes\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectSystem=no\nProtectHome=no\nPrivateTmp=no\nPrivateUsers=no\n\
+ProtectProc=default\nProcSubset=all\nReadWritePaths=\nReadOnlyPaths=\nInaccessiblePaths=\n"
+                .into(),
+        );
+        let h = observe(&runner);
+        assert!(!h.no_new_privileges, "effective NoNewPrivileges=no: {h:?}");
+        assert!(
+            !h.umask_set,
+            "effective UMask is the manager default: {h:?}"
+        );
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // Effective dump showing the seccomp guards cleared by a drop-in
+        // (manager defaults: empty SystemCallArchitectures, RestrictNamespaces
+        // no): disclosed as weakened even though the static file still lists
+        // the baseline directives.
+        runner.set_show_output(
+            "NoNewPrivileges=yes\nUMask=0077\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\n\
+LockPersonality=yes\nSystemCallArchitectures=\nRestrictNamespaces=no\n\
+ProtectSystem=no\nProtectHome=no\nPrivateTmp=no\nPrivateUsers=no\n\
+ProtectProc=default\nProcSubset=all\nReadWritePaths=\nReadOnlyPaths=\nInaccessiblePaths=\n"
+                .into(),
+        );
+        let h = observe(&runner);
+        assert!(
+            !h.system_call_architectures,
+            "effective SystemCallArchitectures cleared: {h:?}"
+        );
+        assert!(
+            !h.restrict_namespaces,
+            "effective RestrictNamespaces=no: {h:?}"
+        );
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // Effective dump showing a user-namespace-forcing directive the
+        // static files do not carry (applied via manager state): disclosed.
+        runner.set_show_output(
+            "NoNewPrivileges=yes\nUMask=0077\nRestrictSUIDSGID=yes\nRestrictRealtime=yes\n\
+LockPersonality=yes\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectSystem=no\nProtectHome=read-only\nPrivateTmp=no\nPrivateUsers=no\n\
+ProtectProc=default\nProcSubset=all\nReadWritePaths=\nReadOnlyPaths=\nInaccessiblePaths=\n"
+                .into(),
+        );
+        let h = observe(&runner);
+        assert!(
+            h.user_namespace_forcing,
+            "effective ProtectHome=read-only must be disclosed: {h:?}"
+        );
+        assert!(h.read_only_hierarchy, "{h:?}");
+        assert!(
+            h.summary.contains("ownmesh service install"),
+            "{}",
+            h.summary
+        );
+
+        // `systemctl show` failing (unit not loaded / no systemd): clean
+        // fallback to the section-validated static analysis.
+        let runner_fallback = ScriptedProcessRunner::default();
+        let h = observe(&runner_fallback);
+        assert!(h.no_new_privileges, "static fallback: {h:?}");
+        assert!(h.umask_set, "static fallback: {h:?}");
+        assert!(h.system_call_architectures, "static fallback: {h:?}");
+        assert!(h.restrict_namespaces, "static fallback: {h:?}");
+        assert!(h.summary.contains("baseline"), "{}", h.summary);
+    }
+
+    /// P1-E: the observer must merge the *full* user-manager search path, not
+    /// just the installed unit plus its adjacent drop-in directory. A drop-in
+    /// in a higher-precedence search directory (e.g. `/etc/systemd/user`)
+    /// must win over a same-named drop-in in a lower-precedence directory
+    /// (e.g. `/usr/lib/systemd/user`), and the base unit is the first file
+    /// found in precedence order.
+    #[test]
+    fn unit_hardening_observer_merges_full_user_search_path() {
+        let high = tempdir().unwrap(); // e.g. ~/.config/systemd/user
+        let low = tempdir().unwrap(); // e.g. /usr/lib/systemd/user
+        let unit_name = "ownmesh-ownmeshd.service";
+
+        // Base unit only in the low-precedence dir; the high-precedence dir
+        // carries only a drop-in. The low-precedence base disables a guard the
+        // high-precedence base re-enables, so precedence is observable.
+        fs::write(
+            low.path().join(unit_name),
+            "[Service]\nNoNewPrivileges=true\nUMask=0077\nRestrictSUIDSGID=false\n\
+RestrictRealtime=true\nLockPersonality=true\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+ProtectProc=invisible\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        let high_drop = high.path().join(format!("{unit_name}.d"));
+        fs::create_dir_all(&high_drop).unwrap();
+        fs::write(
+            high_drop.join("10-local.conf"),
+            "[Service]\nNoNewPrivileges=false\n",
+        )
+        .unwrap();
+        let low_drop = low.path().join(format!("{unit_name}.d"));
+        fs::create_dir_all(&low_drop).unwrap();
+        fs::write(
+            low_drop.join("10-local.conf"),
+            "[Service]\nNoNewPrivileges=true\n",
+        )
+        .unwrap();
+
+        let search = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+        let h = observe_unit_hardening_in_dirs(&low.path().join(unit_name), &search)
+            .expect("unit present");
+        assert!(
+            !h.no_new_privileges,
+            "higher-precedence drop-in must win over the lower-precedence same-named file: {h:?}"
+        );
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // A base unit in the high-precedence dir wins over the low-precedence
+        // one (systemd.unit(5): earlier directories override later ones). The
+        // high-precedence base differs from the low-precedence one on a
+        // directive the drop-ins do not touch.
+        let high_unit = high.path().join(unit_name);
+        fs::write(
+            &high_unit,
+            "[Service]\nNoNewPrivileges=true\nUMask=0077\nRestrictSUIDSGID=true\n\
+RestrictRealtime=true\nLockPersonality=true\nSystemCallArchitectures=native\nRestrictNamespaces=yes\n\
+PrivateUsers=yes\nProtectSystem=full\nReadWritePaths=\"/tmp/cfg\" \"/tmp/state\" \"/tmp/runtime\"\nPrivateTmp=yes\nProtectKernelTunables=yes\n\
+ProtectControlGroups=yes\nProtectHostname=yes\nProtectProc=invisible\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        let h = observe_unit_hardening_in_dirs(&low.path().join(unit_name), &search)
+            .expect("unit present");
+        assert!(
+            h.restrict_suidsgid,
+            "base unit from the higher-precedence dir must win: {h:?}"
+        );
+    }
+
+    /// P1-E / systemd issue #13198: a same-named drop-in in a higher-
+    /// precedence directory *replaces* the lower-precedence same-named file
+    /// entirely — the lower file's directives must not leak into the merged
+    /// unit. Otherwise a masking override (e.g. a lower-precedence
+    /// `ProtectHome=read-only` shadowed by a higher-precedence same-named file
+    /// that does not mention it) could make the effective unit appear hardened
+    /// when systemd would ignore the lower file completely.
+    #[test]
+    fn same_named_dropin_replaces_lower_precedence_file_entirely() {
+        let high = tempdir().unwrap(); // e.g. ~/.config/systemd/user
+        let low = tempdir().unwrap(); // e.g. /usr/lib/systemd/user
+        let unit_name = "ownmesh-ownmeshd.service";
+        fs::write(low.path().join(unit_name), BASELINE_UNIT).unwrap();
+
+        // Lower-precedence same-named drop-in sets a workspace-conflicting
+        // directive; the higher-precedence same-named file does not mention
+        // it. systemd ignores the lower file entirely, so the effective unit
+        // has NO ProtectHome — the observer must not report it as present.
+        let low_drop = low.path().join(format!("{unit_name}.d"));
+        fs::create_dir_all(&low_drop).unwrap();
+        fs::write(
+            low_drop.join("00-mask.conf"),
+            "[Service]\nProtectHome=read-only\n",
+        )
+        .unwrap();
+        let high_drop = high.path().join(format!("{unit_name}.d"));
+        fs::create_dir_all(&high_drop).unwrap();
+        fs::write(
+            high_drop.join("00-mask.conf"),
+            "[Service]\nNoNewPrivileges=false\n",
+        )
+        .unwrap();
+
+        let search = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+        let h = observe_unit_hardening_in_dirs(&low.path().join(unit_name), &search)
+            .expect("unit present");
+        assert!(
+            !h.user_namespace_forcing,
+            "lower-precedence same-named drop-in must be ignored entirely, not merged: {h:?}"
+        );
+        assert!(
+            !h.read_only_hierarchy,
+            "ProtectHome= from the ignored lower-precedence file must not leak: {h:?}"
+        );
+        assert!(
+            !h.no_new_privileges,
+            "higher-precedence same-named file still applies: {h:?}"
+        );
+
+        // Different-named drop-ins from both directories still merge
+        // (lexicographic order), so a distinct higher-precedence file that
+        // re-adds the directive is disclosed.
+        fs::write(
+            high_drop.join("10-other.conf"),
+            "[Service]\nProtectHome=read-only\n",
+        )
+        .unwrap();
+        let h = observe_unit_hardening_in_dirs(&low.path().join(unit_name), &search)
+            .expect("unit present");
+        assert!(
+            h.user_namespace_forcing && h.read_only_hierarchy,
+            "distinct higher-precedence drop-in must be disclosed: {h:?}"
+        );
+    }
+
+    /// systemd.unit(5): drop-ins also apply from the type-level `service.d`
+    /// directory (all service units) and from the dash-truncated prefix
+    /// directory of the unit name, with name-specific `{unit}.d` files
+    /// taking precedence. A masked (symlink to /dev/null) same-named file in
+    /// a higher-precedence level blocks the lower-level file entirely.
+    #[test]
+    fn type_level_and_prefix_dropins_are_observed_with_precedence() {
+        let dir = tempdir().unwrap();
+        let unit_name = "ownmesh-ownmeshd.service";
+        fs::write(dir.path().join(unit_name), BASELINE_UNIT).unwrap();
+        let search = vec![dir.path().to_path_buf()];
+        let observe = |dir: &tempfile::TempDir| {
+            observe_unit_hardening_in_dirs(&dir.path().join(unit_name), &search).unwrap()
+        };
+
+        // Type-level `service.d/10-x.conf` applies to the unit.
+        let service_d = dir.path().join("service.d");
+        fs::create_dir_all(&service_d).unwrap();
+        fs::write(
+            service_d.join("10-x.conf"),
+            "[Service]\nNoNewPrivileges=false\n",
+        )
+        .unwrap();
+        let h = observe(&dir);
+        assert!(
+            !h.no_new_privileges,
+            "type-level service.d drop-in must apply: {h:?}"
+        );
+
+        // Name-specific `{unit}.d` beats type-level for the same name.
+        let unit_d = dir.path().join(format!("{unit_name}.d"));
+        fs::create_dir_all(&unit_d).unwrap();
+        fs::write(
+            unit_d.join("10-x.conf"),
+            "[Service]\nNoNewPrivileges=true\n",
+        )
+        .unwrap();
+        let h = observe(&dir);
+        assert!(
+            h.no_new_privileges,
+            "name-specific {unit_name}.d must override type-level service.d: {h:?}"
+        );
+        fs::remove_dir_all(&unit_d).unwrap();
+
+        // Dash-truncated prefix directory (`ownmesh-.service.d`) applies too.
+        let prefix_d = dir.path().join("ownmesh-.service.d");
+        fs::create_dir_all(&prefix_d).unwrap();
+        fs::write(
+            prefix_d.join("20-y.conf"),
+            "[Service]\nRestrictSUIDSGID=false\n",
+        )
+        .unwrap();
+        let h = observe(&dir);
+        assert!(
+            !h.restrict_suidsgid,
+            "dash-prefix drop-in must apply: {h:?}"
+        );
+
+        // A /dev/null-masked same-named drop-in in the type-level dir is
+        // blocked by the masked name slot in the prefix dir (the mask
+        // occupies the name, systemd.unit(5)), so the type-level file must
+        // not apply once its name is masked.
+        fs::remove_file(prefix_d.join("20-y.conf")).unwrap();
+        fs::write(prefix_d.join("20-y.conf"), "").unwrap(); // empty file = mask slot
+        fs::write(
+            service_d.join("20-y.conf"),
+            "[Service]\nRestrictSUIDSGID=false\n",
+        )
+        .unwrap();
+        let h = observe(&dir);
+        assert!(
+            h.restrict_suidsgid,
+            "masked same-named drop-in at higher precedence blocks the type-level file: {h:?}"
+        );
+    }
+
+    /// systemd.unit(5): a masked base unit (empty file or symlink to
+    /// /dev/null) terminates the search — a lower-precedence real unit must
+    /// not be reported as the effective unit, and the mask itself must be
+    /// disclosed, not reported as an unmodified baseline.
+    #[test]
+    fn masked_base_unit_is_disclosed_not_skipped() {
+        let high = tempdir().unwrap();
+        let low = tempdir().unwrap();
+        let unit_name = "ownmesh-ownmeshd.service";
+        fs::write(high.path().join(unit_name), "").unwrap(); // empty = masked
+        fs::write(low.path().join(unit_name), BASELINE_UNIT).unwrap();
+        let search = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+        let h = observe_unit_hardening_in_dirs(&low.path().join(unit_name), &search)
+            .expect("masked unit present");
+        assert!(
+            h.masked,
+            "masked high-precedence unit must be disclosed: {h:?}"
+        );
+        assert!(h.summary.contains("masked"), "mask summary: {}", h.summary);
+        assert!(
+            !h.no_new_privileges,
+            "lower-precedence real unit must not be reported: {h:?}"
+        );
+
+        // Symlink to /dev/null is equally a mask. This form is Unix-only;
+        // Windows has neither /dev/null nor systemd symlink-mask semantics.
+        #[cfg(unix)]
+        {
+            let dir = tempdir().unwrap();
+            let unit = dir.path().join(unit_name);
+            std::os::unix::fs::symlink("/dev/null", &unit).unwrap();
+            let h = observe_fixture(&unit).expect("masked unit present");
+            assert!(
+                h.masked,
+                "symlinked /dev/null unit must be disclosed: {h:?}"
+            );
+        }
+    }
+
+    /// P1-E: `SYSTEMD_UNIT_PATH` is honored. When set without a trailing
+    /// colon it *replaces* the default search path (systemd.unit(5)); with a
+    /// trailing colon the default path is appended. The observer must see
+    /// units/drop-ins in the env-var directories and must not report
+    /// hardening from default directories systemd would not load.
+    #[cfg(unix)]
+    #[test]
+    fn systemd_unit_path_env_is_honored() {
+        // The pure path builder reads process env; run it with a controlled
+        // environment via a helper that takes the raw value.
+        let custom = tempdir().unwrap();
+        let unit_name = "ownmesh-ownmeshd.service";
+        fs::write(custom.path().join(unit_name), BASELINE_UNIT).unwrap();
+        let custom_drop = custom.path().join(format!("{unit_name}.d"));
+        fs::create_dir_all(&custom_drop).unwrap();
+        fs::write(
+            custom_drop.join("local.conf"),
+            "[Service]\nNoNewPrivileges=false\n",
+        )
+        .unwrap();
+
+        // Replace semantics: only the SYSTEMD_UNIT_PATH dirs are searched.
+        let dirs = systemd_unit_path_dirs(Some(custom.path().as_os_str()));
+        assert_eq!(dirs, vec![custom.path().to_path_buf()]);
+        let h = observe_unit_hardening_in_dirs(&custom.path().join(unit_name), &dirs)
+            .expect("unit present");
+        assert!(
+            !h.no_new_privileges,
+            "drop-in in the SYSTEMD_UNIT_PATH dir must apply: {h:?}"
+        );
+
+        // Append semantics: trailing ':' keeps the default path after it.
+        let mut raw = custom.path().as_os_str().to_os_string();
+        raw.push(":");
+        let dirs = systemd_unit_path_dirs(Some(&raw));
+        assert_eq!(dirs.first(), Some(&custom.path().to_path_buf()));
+        assert!(
+            dirs.len() > 1,
+            "trailing ':' must append the default search path"
+        );
+
+        // Unset → default path (no env override).
+        let dirs = systemd_unit_path_dirs(None);
+        assert!(!dirs.is_empty());
+        assert!(
+            dirs.iter().any(|d| d.ends_with("systemd/user")),
+            "default path must include the user unit dirs: {dirs:?}"
+        );
+
+        // Empty components are skipped (systemd rejects `::`/leading `:`; the
+        // observer skips them rather than failing the whole observation).
+        // No trailing colon, so replace semantics still apply.
+        let mut raw = std::ffi::OsString::from(":");
+        raw.push(custom.path().as_os_str());
+        let dirs = systemd_unit_path_dirs(Some(&raw));
+        assert_eq!(dirs, vec![custom.path().to_path_buf()]);
+    }
+
+    /// P1-E review: with `SYSTEMD_UNIT_PATH` set (replace semantics) the
+    /// default dirs — including the install dir — may not be searched at all
+    /// (systemd.unit(5)). When the override path contains no OwnMesh unit, the
+    /// observer must NOT fall back to the installed unit file or its adjacent
+    /// drop-ins: systemd would never load them, so reporting their hardening
+    /// as "effective" would misreport a unit that is not loaded. The existing
+    /// test only covered an override path that *does* contain the unit; this
+    /// regression covers the empty-override case.
+    #[test]
+    fn systemd_unit_path_replace_without_unit_does_not_fall_back_to_install_dir() {
+        let custom = tempdir().unwrap();
+        let install = tempdir().unwrap();
+        let unit_name = "ownmesh-ownmeshd.service";
+        // The installed unit (where `ownmesh service install` writes) plus a
+        // local override drop-in that weakens a guard.
+        fs::write(install.path().join(unit_name), BASELINE_UNIT).unwrap();
+        let install_drop = install.path().join(format!("{unit_name}.d"));
+        fs::create_dir_all(&install_drop).unwrap();
+        fs::write(
+            install_drop.join("local.conf"),
+            "[Service]\nNoNewPrivileges=false\n",
+        )
+        .unwrap();
+
+        // Replace semantics: only the SYSTEMD_UNIT_PATH dirs are searched, and
+        // the override dir does NOT contain the unit.
+        let dirs = systemd_unit_path_dirs(Some(custom.path().as_os_str()));
+        assert_eq!(dirs, vec![custom.path().to_path_buf()]);
+        let h = observe_unit_hardening_in_dirs(&install.path().join(unit_name), &dirs);
+        assert!(
+            h.is_none(),
+            "installed unit outside the effective search path must not be reported: {h:?}"
+        );
+
+        // The fallback still applies when the install dir IS on the effective
+        // search path (the default path, or an appended `SYSTEMD_UNIT_PATH`
+        // that includes it): the installed unit and its adjacent drop-ins are
+        // then the unit systemd actually loads.
+        let dirs = vec![install.path().to_path_buf()];
+        let h = observe_unit_hardening_in_dirs(&install.path().join(unit_name), &dirs)
+            .expect("installed unit on the search path");
+        assert!(
+            !h.no_new_privileges,
+            "adjacent drop-in must apply when the install dir is searched: {h:?}"
+        );
+    }
+
+    /// P1-E review: the modeled default search path must match what the
+    /// current systemd actually loads. systemd resolves the unset
+    /// `$XDG_CONFIG_DIRS` default to `/etc` (→ `/etc/systemd/user`, already
+    /// listed), NOT `/etc/xdg` — verified against `systemd-analyze --user
+    /// unit-paths` on v259 and the `SD_PATH_SEARCH_CONFIGURATION` default in
+    /// sd-path.c. A phantom `/etc/xdg/systemd/user` entry could make the
+    /// observer report hardening from a unit systemd would never load.
+    #[test]
+    fn default_search_path_matches_systemd_analyze_unit_paths() {
+        let dirs = systemd_user_default_search_dirs();
+        match env::var_os("XDG_CONFIG_DIRS").filter(|v| !v.is_empty()) {
+            Some(value) => {
+                for dir in env::split_paths(&value) {
+                    assert!(
+                        dirs.iter().any(|d| d == &dir.join("systemd/user")),
+                        "explicit $XDG_CONFIG_DIRS entry must be searched: {dir:?}"
+                    );
+                }
+            }
+            None => {
+                assert!(
+                    !dirs.iter().any(|d| d.ends_with("xdg/systemd/user")),
+                    "unset $XDG_CONFIG_DIRS must not add /etc/xdg/systemd/user: {dirs:?}"
+                );
+            }
+        }
+        // The default `/etc/systemd/user` entry is always present (it is the
+        // resolved default of the unset $XDG_CONFIG_DIRS case).
+        assert!(
+            dirs.iter()
+                .any(|d| d == &PathBuf::from("/etc/systemd/user")),
+            "default path must include /etc/systemd/user: {dirs:?}"
+        );
+    }
+
+    /// P1-E review: the static fallback observer must require the shipped
+    /// `UMask=0077` — a present-but-weak UMask (e.g. `0002`) must not count
+    /// as the baseline being effective. systemd accepts any octal spelling,
+    /// so `077` is the same mode as `0077`.
+    #[test]
+    fn static_fallback_requires_baseline_umask() {
+        // Weak UMask (0002) is not the baseline.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        fs::write(
+            &unit,
+            "[Service]\nNoNewPrivileges=true\nUMask=0002\nRestrictSUIDSGID=true\n\
+RestrictRealtime=true\nLockPersonality=true\nSystemCallArchitectures=native\n\
+RestrictNamespaces=yes\nProtectProc=invisible\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        let h = observe_fixture(&unit).expect("unit present");
+        assert!(
+            !h.umask_set,
+            "UMask=0002 must not count as the shipped baseline: {h:?}"
+        );
+        assert!(h.summary.contains("weakened"), "{}", h.summary);
+
+        // Octal spelling `077` is the same mode as `0077` and counts.
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        fs::write(
+            &unit,
+            "[Service]\nNoNewPrivileges=true\nUMask=077\nRestrictSUIDSGID=true\n\
+RestrictRealtime=true\nLockPersonality=true\nSystemCallArchitectures=native\n\
+RestrictNamespaces=yes\nProtectProc=invisible\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+        let h = observe_fixture(&unit).expect("unit present");
+        assert!(h.umask_set, "UMask=077 is the same mode as 0077: {h:?}");
+    }
 
     #[test]
     fn scripted_install_uninstall_cycle() {
@@ -1016,6 +3839,83 @@ mod tests {
     fn resolve_missing_exe_errors() {
         let err = resolve_ownmeshd_path(Some("/no/such/ownmeshd-xyz")).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn generated_workspace_dropin_is_removed_operator_dropin_is_kept() {
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        fs::write(&unit, "[Service]\nExecStart=/bin/true\n").unwrap();
+        let dropin_dir = dir.path().join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&dropin_dir).unwrap();
+        fs::write(
+            dropin_dir.join("10-ownmesh-workspaces.conf"),
+            "# Generated by OwnMesh. Do not edit by hand.\n[Service]\nReadWritePaths=/tmp/a /tmp/b\n",
+        )
+        .unwrap();
+        fs::write(
+            dropin_dir.join("20-operator.conf"),
+            "[Service]\nRestrictNamespaces=no\n",
+        )
+        .unwrap();
+
+        let report = reconcile_ownmesh_generated_dropins(&unit).unwrap();
+        assert_eq!(
+            report.removed,
+            vec!["10-ownmesh-workspaces.conf".to_string()]
+        );
+        assert!(!dropin_dir.join("10-ownmesh-workspaces.conf").exists());
+        assert!(dropin_dir.join("20-operator.conf").exists());
+        assert!(remaining_userns_forcing_dropins(&unit).is_empty());
+    }
+
+    #[test]
+    fn operator_privateusers_dropin_is_not_deleted() {
+        let dir = tempdir().unwrap();
+        let unit = dir.path().join("ownmesh-ownmeshd.service");
+        fs::write(&unit, "[Service]\nExecStart=/bin/true\n").unwrap();
+        let dropin_dir = dir.path().join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&dropin_dir).unwrap();
+        fs::write(
+            dropin_dir.join("30-private-users.conf"),
+            "[Service]\nPrivateUsers=yes\n",
+        )
+        .unwrap();
+        let report = reconcile_ownmesh_generated_dropins(&unit).unwrap();
+        assert!(report.removed.is_empty());
+        assert_eq!(
+            remaining_userns_forcing_dropins(&unit),
+            vec!["30-private-users.conf".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_systemd_user_bus_is_derived_only_from_an_existing_standard_runtime() {
+        let dir = tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let _bus = std::os::unix::net::UnixListener::bind(dir.path().join("bus")).unwrap();
+        let mut command = Command::new("systemctl");
+        configure_linux_user_bus_from(&mut command, None, None, dir.path());
+        let env = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("XDG_RUNTIME_DIR")),
+            Some(&dir.path().as_os_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
+                .map(|value| value.to_string_lossy().into_owned()),
+            Some(format!("unix:path={}", dir.path().join("bus").display()))
+        );
+
+        let missing = dir.path().join("missing");
+        let mut command = Command::new("systemctl");
+        configure_linux_user_bus_from(&mut command, None, None, &missing);
+        assert_eq!(command.get_envs().count(), 0);
     }
 
     #[cfg(windows)]
@@ -1114,5 +4014,345 @@ mod tests {
             *runner.tasks.lock().expect("lock"),
             WindowsTaskSet::default()
         );
+    }
+}
+
+/// Review #2 and #4: the macOS descriptor and unload decisions, exercised on
+/// every platform because they are pure functions of their inputs.
+#[cfg(test)]
+mod macos_decision_tests {
+    use super::{
+        classify_unload_probe, launch_agent_descriptor_state, CommandOutput, DescriptorState,
+        UnloadProof,
+    };
+
+    const PLIST: &str =
+        "<plist><dict><key>Label</key><string>dev.ownmesh.ownmeshd</string></dict></plist>\n";
+
+    /// The signature takes no runner, so loaded state cannot influence the
+    /// decision. That is the fix: `service stop` boots the agent out and leaves
+    /// the plist installed, and the next `service install` must not read that
+    /// as drift and bootstrap a KeepAlive job back to running.
+    #[test]
+    fn descriptor_identity_is_the_plist_alone() {
+        assert_eq!(
+            launch_agent_descriptor_state(Some(PLIST), PLIST),
+            DescriptorState::Current
+        );
+        // Line-ending normalization only; nothing else may differ.
+        let crlf = PLIST.replace('\n', "\r\n");
+        assert_eq!(
+            launch_agent_descriptor_state(Some(&crlf), PLIST),
+            DescriptorState::Current
+        );
+    }
+
+    #[test]
+    fn an_edited_or_missing_plist_is_drift() {
+        let edited = PLIST.replace("dev.ownmesh.ownmeshd", "dev.evil.agent");
+        assert!(matches!(
+            launch_agent_descriptor_state(Some(&edited), PLIST),
+            DescriptorState::Drift(_)
+        ));
+        assert!(matches!(
+            launch_agent_descriptor_state(None, PLIST),
+            DescriptorState::Drift(_)
+        ));
+    }
+
+    fn out(status: i32, stdout: &str, stderr: &str) -> Result<CommandOutput, String> {
+        Ok(CommandOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    #[test]
+    fn only_an_explicit_absence_proves_the_job_is_unloaded() {
+        assert_eq!(
+            classify_unload_probe(&out(0, "state = running\n", "")),
+            UnloadProof::StillLoaded
+        );
+        assert_eq!(
+            classify_unload_probe(&out(113, "", "Could not find specified service\n")),
+            UnloadProof::Unloaded
+        );
+        assert_eq!(
+            classify_unload_probe(&out(3, "", "No such process\n")),
+            UnloadProof::Unloaded
+        );
+    }
+
+    /// A probe that failed for its own reasons says nothing about liveness, so
+    /// it must never let the descriptor be deleted (#147 partial cleanup).
+    #[test]
+    fn a_failed_probe_is_never_read_as_absence() {
+        for probe in [
+            out(1, "", "Operation not permitted\n"),
+            out(125, "", "Bootstrap failed: 5: Input/output error\n"),
+            out(1, "", ""),
+            Err("spawn launchctl: No such file or directory".into()),
+        ] {
+            assert_eq!(
+                classify_unload_probe(&probe),
+                UnloadProof::Unknown,
+                "{probe:?} must not be read as proof of absence"
+            );
+        }
+    }
+}
+
+/// #149: `systemctl --user` failures during uninstall must be reported, and no
+/// descriptor may be deleted while the manager still reports the unit active.
+#[cfg(test)]
+mod uninstall_honesty_tests {
+    use super::{
+        classify_is_active, stop_and_disable_user_unit, CommandOutput, ProcessRunner, UnitLiveness,
+    };
+    use std::sync::Mutex;
+
+    /// Runner that fails one chosen systemctl verb and can keep reporting the
+    /// unit active, reproducing both shapes described in #149.
+    struct FailingSystemctl {
+        failing_verb: Option<&'static str>,
+        active_after_stop: bool,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FailingSystemctl {
+        fn new(failing_verb: Option<&'static str>, active_after_stop: bool) -> Self {
+            Self {
+                failing_verb,
+                active_after_stop,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("lock").clone()
+        }
+    }
+
+    impl ProcessRunner for FailingSystemctl {
+        fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(format!("{program} {}", args.join(" ")));
+            let verb = args.get(1).copied().unwrap_or_default();
+            if Some(verb) == self.failing_verb {
+                return Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Failed to connect to bus: No such file or directory\n".into(),
+                });
+            }
+            if verb == "is-active" {
+                return Ok(CommandOutput {
+                    status: i32::from(!self.active_after_stop),
+                    stdout: if self.active_after_stop {
+                        "active\n".into()
+                    } else {
+                        "inactive\n".into()
+                    },
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn stop_failure_is_reported_and_stops_the_sequence() {
+        let runner = FailingSystemctl::new(Some("stop"), false);
+        let error = stop_and_disable_user_unit(&runner).unwrap_err();
+        assert!(error.contains("stop failed"), "{error}");
+        assert!(error.contains("retried"), "{error}");
+        // Nothing after the failed stop ran, so no descriptor can be deleted.
+        assert_eq!(runner.calls().len(), 1, "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn disable_failure_is_reported() {
+        let runner = FailingSystemctl::new(Some("disable"), false);
+        let error = stop_and_disable_user_unit(&runner).unwrap_err();
+        assert!(error.contains("disable failed"), "{error}");
+    }
+
+    #[test]
+    fn a_still_active_unit_fails_even_when_every_command_succeeded() {
+        let runner = FailingSystemctl::new(None, true);
+        let error = stop_and_disable_user_unit(&runner).unwrap_err();
+        assert!(error.contains("still reports"), "{error}");
+        assert!(error.contains("'active'"), "{error}");
+        assert!(error.contains("retried"), "{error}");
+    }
+
+    #[test]
+    fn an_absent_unit_is_idempotent_success() {
+        // `systemctl --user stop` on a never-loaded unit is the documented
+        // idempotent case and must not be reported as a failure.
+        struct AbsentUnit;
+        impl ProcessRunner for AbsentUnit {
+            fn run(&self, _program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+                let verb = args.get(1).copied().unwrap_or_default();
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: if verb == "is-active" {
+                        "inactive\n".into()
+                    } else {
+                        String::new()
+                    },
+                    stderr: if verb == "is-active" {
+                        String::new()
+                    } else {
+                        "Unit ownmesh-ownmeshd.service not loaded.\n".into()
+                    },
+                })
+            }
+        }
+        stop_and_disable_user_unit(&AbsentUnit).unwrap();
+    }
+
+    #[test]
+    fn an_unavailable_user_bus_is_never_mistaken_for_an_absent_unit() {
+        // Every systemctl call fails with "Failed to connect to bus: No such
+        // file or directory". That errno string must not be read as unit
+        // absence, or a still-running manager would look uninstalled (#149).
+        struct NoBus;
+        impl ProcessRunner for NoBus {
+            fn run(&self, _program: &str, _args: &[&str]) -> Result<CommandOutput, String> {
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Failed to connect to bus: No such file or directory\n".into(),
+                })
+            }
+        }
+        let error = stop_and_disable_user_unit(&NoBus).unwrap_err();
+        assert!(error.contains("stop failed"), "{error}");
+    }
+
+    /// Review #5: the bus can fail specifically at `is-active`, after stop and
+    /// disable both succeeded. An unclassifiable answer is not proof of an
+    /// inactive unit, so the unit must be retained rather than removed.
+    #[test]
+    fn a_bus_failure_at_is_active_retains_the_unit() {
+        struct BusDiesAtIsActive;
+        impl ProcessRunner for BusDiesAtIsActive {
+            fn run(&self, _program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+                if args.get(1).copied() == Some("is-active") {
+                    return Ok(CommandOutput {
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: "Failed to connect to bus: No such file or directory\n".into(),
+                    });
+                }
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let error = stop_and_disable_user_unit(&BusDiesAtIsActive).unwrap_err();
+        assert!(error.contains("could not be classified"), "{error}");
+        assert!(error.contains("retried"), "{error}");
+    }
+
+    /// `is-active` exits non-zero for every state except `active`, so the exit
+    /// status can never be the signal. Only the reported state word is.
+    #[test]
+    fn is_active_is_classified_by_state_not_exit_status() {
+        let probe = |status: i32, stdout: &str, stderr: &str| CommandOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        for down in ["inactive", "failed", "unknown"] {
+            assert_eq!(
+                classify_is_active(&probe(3, down, "")),
+                UnitLiveness::Down,
+                "{down} must be down despite the non-zero status"
+            );
+        }
+        assert_eq!(
+            classify_is_active(&probe(0, "active", "")),
+            UnitLiveness::Up
+        );
+        assert_eq!(
+            classify_is_active(&probe(3, "activating", "")),
+            UnitLiveness::Up
+        );
+        assert_eq!(
+            classify_is_active(&probe(3, "deactivating", "")),
+            UnitLiveness::Deactivating
+        );
+        // An unreachable bus answers with nothing at all.
+        assert_eq!(
+            classify_is_active(&probe(
+                1,
+                "",
+                "Failed to connect to bus: No such file or directory"
+            )),
+            UnitLiveness::Unknown
+        );
+        // A localized or unexpected answer is never read as proof.
+        assert_eq!(
+            classify_is_active(&probe(3, "inaktiv", "")),
+            UnitLiveness::Unknown
+        );
+    }
+
+    /// A unit still tearing down is polled rather than failed immediately, and
+    /// passes once it reports inactive.
+    #[test]
+    fn a_deactivating_unit_is_polled_until_it_is_down() {
+        struct Deactivating {
+            calls: Mutex<usize>,
+        }
+        impl ProcessRunner for Deactivating {
+            fn run(&self, _program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+                if args.get(1).copied() != Some("is-active") {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                let mut calls = self.calls.lock().expect("lock");
+                *calls += 1;
+                let stdout = if *calls < 3 {
+                    "deactivating"
+                } else {
+                    "inactive"
+                };
+                Ok(CommandOutput {
+                    status: 3,
+                    stdout: format!("{stdout}\n"),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let runner = Deactivating {
+            calls: Mutex::new(0),
+        };
+        stop_and_disable_user_unit(&runner).unwrap();
+        assert!(*runner.calls.lock().expect("lock") >= 3);
+    }
+
+    #[test]
+    fn a_clean_sequence_succeeds() {
+        let runner = FailingSystemctl::new(None, false);
+        stop_and_disable_user_unit(&runner).unwrap();
+        let calls = runner.calls();
+        assert!(calls.iter().any(|c| c.contains("stop")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("disable")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("is-active")), "{calls:?}");
     }
 }

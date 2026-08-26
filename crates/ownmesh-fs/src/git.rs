@@ -546,6 +546,13 @@ fn resolve_repo_context(ws: &WorkspaceRoot, rel: &Path) -> FsResult<RepoContext>
         });
     }
     let checked = ws.resolve(&root)?;
+    // A relative Git request is workspace-relative even in Full Access mode.
+    // Do not let repository-local `core.worktree` configuration silently
+    // retarget that request to a different registered (or arbitrary) tree.
+    // Absolute Full Access requests retain their existing explicit escape hatch.
+    if !rel.is_absolute() && !checked.starts_with(ws.root()) {
+        return Err(FsError::GitWorktreeOutsideWorkspace);
+    }
     Ok(RepoContext {
         cwd: path,
         root: checked,
@@ -1035,6 +1042,39 @@ mod tests {
             git_head_oid(&ws, &requested).unwrap(),
             String::from_utf8(expected_head.stdout).unwrap().trim()
         );
+    }
+
+    #[test]
+    fn relative_git_request_rejects_configured_worktree_outside_workspace() {
+        let dir = tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let linked = dir.path().join("linked");
+        fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-b", "linked", linked.to_str().unwrap()])
+            .current_dir(&primary)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "core.worktree", linked.to_str().unwrap()])
+            .current_dir(&primary)
+            .status()
+            .unwrap()
+            .success());
+
+        let ws = WorkspaceRoot::new(&primary, false).unwrap();
+        let err = git_status(
+            &ws,
+            &GitStatusOpts {
+                path: PathBuf::new(),
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, FsError::GitWorktreeOutsideWorkspace));
     }
 
     #[test]

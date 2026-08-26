@@ -13,6 +13,16 @@ import {
   sha256Hex,
   generateUserCode,
 } from "./util.ts";
+import {
+  applyObservedGeneration,
+  classifyWorkspaceAvailability,
+  classifyWorkspaceVisibility,
+  parseWorkspaceGeneration,
+  parseWorkspaceId,
+  type WorkspaceOperableGate,
+} from "./workspace-activation.ts";
+
+export type { WorkspaceOperableGate } from "./workspace-activation.ts";
 
 /** Short-lived bearer used for API requests. */
 export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
@@ -54,6 +64,8 @@ export type DeviceRecord = {
   arch: string;
   agent_version: string;
   protocol_version: string;
+  /** Authenticated Agent policy observation. Undefined for pre-1.2.9 Agents. */
+  enforce_workspace?: boolean;
   public_key: string;
   revoked: boolean;
   created_at: string;
@@ -67,11 +79,18 @@ export type DeviceRecord = {
 
 function shouldRecordReadyConnection(
   device: DeviceRecord,
-  patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+  patch: {
+    agent_version?: string;
+    protocol_version: string;
+    last_seen_at: string;
+    enforce_workspace?: boolean;
+  },
 ): boolean {
   if (
     (patch.agent_version !== undefined && patch.agent_version !== device.agent_version) ||
-    patch.protocol_version !== device.protocol_version
+    patch.protocol_version !== device.protocol_version ||
+    (patch.enforce_workspace !== undefined &&
+      patch.enforce_workspace !== device.enforce_workspace)
   ) {
     return true;
   }
@@ -101,6 +120,12 @@ export type AuthCodeRecord = {
   used: boolean;
 };
 
+
+export type AuthCodeRedemption =
+  | { status: "redeemed"; record: AuthCodeRecord; token: TokenRecord }
+  | { status: "invalid_grant" };
+
+export type PutDeviceCodeResult = "created" | "user_code_collision";
 export type DeviceCodeRecord = {
   device_code: string;
   user_code: string;
@@ -180,13 +205,36 @@ export type AuditEvent = {
   meta?: Record<string, unknown>;
 };
 
+/**
+ * Bounded, non-secret causes that remove authority from a principal (#162).
+ * A routine refresh rotation is deliberately absent: reissuing a token is not
+ * a withdrawal of authority.
+ */
+export type PrincipalRevocationReason =
+  | "explicit_revocation"
+  | "refresh_reuse";
+
 export type PrincipalRecord = {
   id: string;
   tenant_id: string;
   kind: string;
   display_name: string;
-  /** Server-owned, positive, monotonic OAuth credential epoch. */
+  /**
+   * Server-owned, positive, monotonic OAuth credential *issuance* epoch. It
+   * advances on every credential rotation, including healthy refreshes, and
+   * is observability only — never an authorization boundary (#162).
+   */
   credential_generation: number;
+  /**
+   * Server-owned, positive, monotonic *revocation* epoch. It advances only
+   * when authority is intentionally removed (explicit revoke, refresh-family
+   * reuse detection, account/session invalidation). Device operations bind to
+   * this, so a routine refresh cannot invalidate already-authorized work while
+   * a real revocation still invalidates all of it.
+   */
+  revocation_epoch: number;
+  /** Bounded cause of the most recent revocation-epoch advance, if any. */
+  revocation_reason?: PrincipalRevocationReason | null;
   created_at: string;
 };
 
@@ -225,10 +273,57 @@ export type WorkspaceRecord = {
   device_id: string;
   owner_principal_id: string;
   version: number;
+  /** Opaque Agent mapping generation. Paths and labels never leave the device. */
+  local_generation?: string;
   active: boolean;
   created_at: string;
   updated_at: string;
 };
+
+function workspaceStoreKey(deviceId: string, workspaceId: string): string {
+  return `${deviceId}\0${workspaceId}`;
+}
+
+function workspaceMemberStoreKey(
+  deviceId: string,
+  workspaceId: string,
+  principalId: string,
+): string {
+  return `${deviceId}\0${workspaceId}\0${principalId}`;
+}
+
+export type AdvertisedWorkspaceRegistration = {
+  id: string;
+  generation: string;
+};
+
+function validateAdvertisedWorkspaces(
+  workspaces: AdvertisedWorkspaceRegistration[],
+): AdvertisedWorkspaceRegistration[] {
+  if (workspaces.length < 1 || workspaces.length > 64) {
+    throw new Error("invalid_workspace_registry");
+  }
+  const ids = new Set<string>();
+  const validated: AdvertisedWorkspaceRegistration[] = [];
+  for (const workspace of workspaces) {
+    const id = workspace?.id;
+    const generation = workspace?.generation;
+    if (
+      typeof id !== "string" ||
+      id.length > 128 ||
+      !/^ws_[A-Za-z0-9_-]*$/.test(id) ||
+      typeof generation !== "string" ||
+      !/^wsg_[a-f0-9]{32}$/.test(generation) ||
+      ids.has(id)
+    ) {
+      throw new Error("invalid_workspace_registry");
+    }
+    ids.add(id);
+    validated.push({ id, generation });
+  }
+  if (!ids.has("ws_default")) throw new Error("invalid_workspace_registry");
+  return validated.sort((a, b) => a.id.localeCompare(b.id));
+}
 
 /** Authoritative MCP operation row (D1 / Memory). Isolate Maps are cache only. */
 export type McpOperationRecord = {
@@ -287,7 +382,61 @@ export type McpApprovalTransaction = {
 export const MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS = 30_000;
 
 /** Per-tenant durable MCP operation budgets (D1 / Memory). */
-export const MCP_OPS_MAX_PER_TENANT = 2_000;
+/** Default Worker `vars.MCP_OPS_MAX_PER_TENANT` when the env var is absent or invalid. */
+export const MCP_OPS_MAX_PER_TENANT_DEFAULT = 20_000;
+/** Documented env-var name; value is the deploy default, not a hard-coded cap. */
+export const MCP_OPS_MAX_PER_TENANT = MCP_OPS_MAX_PER_TENANT_DEFAULT;
+/** Absolute ceiling so a typo cannot unbounded-grow `mcp_operations`. */
+export const MCP_OPS_MAX_PER_TENANT_HARD_CEILING = 1_000_000;
+/** Pending-approval inbox bound (one passkey-bound set cannot exceed this). */
+export const PENDING_APPROVAL_LIST_LIMIT = 32;
+/** Warn (and surface `mcp_ops_quota_pressure`) at this fraction of the cap. */
+export const MCP_OPS_QUOTA_PRESSURE_RATIO = 0.6;
+export const MCP_OPS_QUOTA_PRESSURE_WARNING = "mcp_ops_quota_pressure";
+
+export type McpOpsStoreOptions = {
+  mcpOpsMaxPerTenant?: number | string | null;
+};
+
+export type McpOperationQuotaStatus = "ok" | "warn" | "critical";
+
+export type McpOperationQuotaSnapshot = {
+  rows: number;
+  limit: number;
+  status: McpOperationQuotaStatus;
+};
+
+/**
+ * Parse `MCP_OPS_MAX_PER_TENANT` from Worker env / store options.
+ * Invalid, empty, or non-positive values fail closed to the documented default.
+ */
+export function parseMcpOpsMaxPerTenant(raw?: number | string | null): number {
+  if (raw === undefined || raw === null || raw === "") {
+    return MCP_OPS_MAX_PER_TENANT_DEFAULT;
+  }
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (!Number.isSafeInteger(n) || n < 1) {
+    return MCP_OPS_MAX_PER_TENANT_DEFAULT;
+  }
+  return Math.min(n, MCP_OPS_MAX_PER_TENANT_HARD_CEILING);
+}
+
+export function mcpOpsQuotaStatus(count: number, limit: number): McpOperationQuotaStatus {
+  if (!(limit > 0) || !(count >= 0)) return "ok";
+  if (count >= limit) return "critical";
+  if (count >= Math.ceil(limit * MCP_OPS_QUOTA_PRESSURE_RATIO)) return "warn";
+  return "ok";
+}
+
+export function snapshotMcpOperationQuota(count: number, limit: number): McpOperationQuotaSnapshot {
+  const rows = Math.max(0, Math.trunc(count));
+  const cap = Math.max(1, Math.trunc(limit));
+  return { rows, limit: cap, status: mcpOpsQuotaStatus(rows, cap) };
+}
+
+function hasMcpIdempotencyReceipt(op: { idempotency_key?: string | null }): boolean {
+  return typeof op.idempotency_key === "string" && op.idempotency_key.length > 0;
+}
 /** Hard cap on serialized client-visible operation data_json (results / metadata). */
 export const MCP_OPS_MAX_DATA_JSON_BYTES = 256_000;
 /**
@@ -321,6 +470,9 @@ const DURABLE_RESULT_PRESERVE_KEYS = [
   "duration_ms",
   "replayed",
   "cancelled",
+  "detached",
+  "pid",
+  "hint",
   "signal_delivered",
   "target_operation_id",
   "stdout_truncated",
@@ -563,9 +715,18 @@ export interface ControlPlaneStore {
   getPrincipal(id: string): Promise<PrincipalRecord | null>;
   /** Advance the server-owned OAuth credential epoch. Never caller supplied. */
   advancePrincipalCredentialGeneration(id: string): Promise<number | null>;
+  advancePrincipalRevocationEpoch(
+    id: string,
+    reason: PrincipalRevocationReason,
+  ): Promise<number | null>;
 
   putAuthCode(code: AuthCodeRecord): Promise<void>;
-  takeAuthCode(code: string): Promise<AuthCodeRecord | null>;
+  redeemAuthCode(input: {
+    code: string;
+    clientId: string;
+    redirectUri: string;
+    codeChallenge: string;
+  }): Promise<AuthCodeRedemption>;
 
   issueTokens(
     clientId: string,
@@ -588,7 +749,7 @@ export interface ControlPlaneStore {
    */
   lookupRevocableToken(token: string): Promise<RevocableTokenMeta | null>;
 
-  putDeviceCode(rec: DeviceCodeRecord): Promise<void>;
+  putDeviceCode(rec: DeviceCodeRecord): Promise<PutDeviceCodeResult>;
   getDeviceCode(deviceCode: string): Promise<DeviceCodeRecord | null>;
   getDeviceCodeByUserCode(userCode: string): Promise<DeviceCodeRecord | null>;
   approveDeviceCode(userCode: string, principalId: string): Promise<boolean>;
@@ -631,7 +792,12 @@ export interface ControlPlaneStore {
    */
   recordDeviceReadyConnection(
     id: string,
-    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+    patch: {
+      agent_version?: string;
+      protocol_version: string;
+      last_seen_at: string;
+      enforce_workspace?: boolean;
+    },
   ): Promise<DeviceRecord | null>;
   revokeDevice(id: string, principalId: string): Promise<boolean>;
   activateDeviceWithChallenge(deviceId: string, challengeId: string): Promise<boolean>;
@@ -651,6 +817,14 @@ export interface ControlPlaneStore {
   appendAudit(event: AuditEvent): Promise<void>;
   listAudit(tenantId: string, limit?: number): Promise<AuditEvent[]>;
 
+  /** Effective per-tenant `mcp_operations` row cap (Worker env or default). */
+  mcpOpsMaxPerTenant(): number;
+  /**
+   * Occupancy after TTL compaction. Unexpired keyed receipts are never evicted
+   * here; this is a read of current rows versus the configured cap.
+   */
+  getMcpOperationQuota(tenantId: string): Promise<McpOperationQuotaSnapshot>;
+
   /**
    * Create-only MCP operation insert (authoritative).
    * Must not overwrite: conflict on existing operation_id throws
@@ -664,6 +838,15 @@ export interface ControlPlaneStore {
     tenantId: string;
     principalId: string;
     tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]>;
+  /**
+   * Newest-first pending human approvals for one principal/tenant.
+   * Caller still authorizes each row; this is not an approval decision.
+   */
+  listPendingMcpApprovals(opts: {
+    tenantId: string;
+    principalId: string;
     limit?: number;
   }): Promise<McpOperationRecord[]>;
   /**
@@ -801,9 +984,20 @@ export interface ControlPlaneStore {
 
   /** Create or update cloud workspace custody.  Only admin paths call this. */
   putWorkspace(workspace: WorkspaceRecord): Promise<void>;
-  getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null>;
-  putWorkspaceMember(workspaceId: string, principalId: string): Promise<void>;
-  isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean>;
+  getWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null>;
+  putWorkspaceMember(deviceId: string, workspaceId: string, principalId: string): Promise<void>;
+  isWorkspaceMember(deviceId: string, workspaceId: string, principalId: string): Promise<boolean>;
+  /**
+   * Reconcile the bounded id plus opaque-generation registry advertised by an
+   * authenticated Agent. Roots never leave the device. Observed ids are scoped
+   * to this exact device; absence does not deactivate a pending cloud reservation
+   * that may not have reached the Agent yet. A changed generation increments the
+   * exact-action version.
+   */
+  syncDeviceWorkspaces(
+    deviceId: string,
+    workspaces: AdvertisedWorkspaceRegistration[],
+  ): Promise<WorkspaceRecord[]>;
   /**
    * Fail-closed workspace ACL/version gate.  Device owners and tenant
    * owners/admins administer workspaces; ordinary members require ownership
@@ -814,7 +1008,35 @@ export interface ControlPlaneStore {
     deviceId: string,
     principalId: string,
     tenantId: string,
-  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }>;
+  ): Promise<WorkspaceOperableGate>;
+  /**
+   * Visibility/admin gate for show/remove/retry. Pending reservations are
+   * visible to custodians so activation can be polled or abandoned.
+   */
+  assertWorkspaceVisibleForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<WorkspaceOperableGate>;
+  /**
+   * Apply one Agent-observed opaque generation. Unlike syncDeviceWorkspaces this
+   * does not require a complete registry snapshot (ws_default may be absent).
+   * Inactive rows keep the last generation as a tombstone: the same value does
+   * not reactivate; a later add must advertise a new generation.
+   */
+  observeWorkspaceGeneration(
+    deviceId: string,
+    workspaceId: string,
+    generation: string,
+  ): Promise<WorkspaceRecord | null>;
+  /** Mark a cloud custody row inactive after a successful or abandoned remove. */
+  deactivateWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null>;
+  /** Persist Agent-observed workspace-root enforcement independently of access_preset. */
+  recordObservedWorkspaceEnforcement(
+    deviceId: string,
+    enforceWorkspace: boolean,
+  ): Promise<DeviceRecord | null>;
 
   appliedMigrations(): Promise<string[]>;
   markMigration(id: string): Promise<void>;
@@ -826,7 +1048,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0015). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0017). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -849,11 +1071,18 @@ export type SchemaReadiness = {
     mcp_approval_outbox: boolean;
     /** 0012 server-owned principal OAuth credential generation */
     principals_credential_generation: boolean;
+    /** 0018 revocation epoch separated from routine refresh issuance (#162) */
+    principals_revocation_epoch: boolean;
     /** 0013 built-in owner passkeys + one-time WebAuthn challenges */
     owner_passkeys: boolean;
     owner_auth_challenges: boolean;
     /** 0014 independent rolling refresh-token inactivity deadline */
     oauth_tokens_refresh_lifetime: boolean;
+    /** 0017 authorization-code redemption receipt binding */
+    oauth_tokens_auth_code_redemption: boolean;
+    /** 0016 device-scoped workspace custody (workspace ids are device-local) */
+    device_workspaces: boolean;
+    device_workspace_members: boolean;
   };
 };
 
@@ -862,9 +1091,34 @@ const SCHEMA_READINESS_OBJECTS: Record<
   keyof SchemaReadiness["checks"],
   { table: string; columns: string[]; indexes?: string[] }
 > = {
+  device_workspaces: {
+    table: "device_workspaces",
+    columns: [
+      "workspace_id",
+      "tenant_id",
+      "device_id",
+      "owner_principal_id",
+      "version",
+      "local_generation",
+      "active",
+      "created_at",
+      "updated_at",
+    ],
+    indexes: ["idx_device_workspaces_tenant_device", "idx_device_workspaces_owner"],
+  },
+  device_workspace_members: {
+    table: "device_workspace_members",
+    columns: ["device_id", "workspace_id", "principal_id", "created_at"],
+    indexes: ["idx_device_workspace_members_principal"],
+  },
   oauth_tokens_refresh_lifetime: {
     table: "oauth_tokens",
     columns: ["refresh_expires_at"],
+  },
+  oauth_tokens_auth_code_redemption: {
+    table: "oauth_tokens",
+    columns: ["auth_code_hash"],
+    indexes: ["idx_oauth_tokens_auth_code_hash"],
   },
   oauth_auth_codes: {
     table: "oauth_auth_codes",
@@ -1053,6 +1307,10 @@ const SCHEMA_READINESS_OBJECTS: Record<
     table: "principals",
     columns: ["id", "credential_generation"],
   },
+  principals_revocation_epoch: {
+    table: "principals",
+    columns: ["id", "revocation_epoch", "revocation_reason"],
+  },
   owner_passkeys: {
     table: "owner_passkeys",
     columns: [
@@ -1092,6 +1350,7 @@ const DEFAULT_TENANT = "ten_default";
 
 export class MemoryStore implements ControlPlaneStore {
   readonly kind = "memory" as const;
+  private readonly mcpOpsLimit: number;
   clients = new Map<string, OAuthClientRecord>();
   ownerPasskeys = new Map<string, OwnerPasskeyRecord>();
   ownerAuthChallenges = new Map<string, OwnerAuthChallenge>();
@@ -1119,6 +1378,20 @@ export class MemoryStore implements ControlPlaneStore {
   audits: AuditEvent[] = [];
   migrations = new Set<string>();
 
+  constructor(opts?: McpOpsStoreOptions) {
+    this.mcpOpsLimit = parseMcpOpsMaxPerTenant(opts?.mcpOpsMaxPerTenant);
+  }
+
+  mcpOpsMaxPerTenant(): number {
+    return this.mcpOpsLimit;
+  }
+
+  async getMcpOperationQuota(tenantId: string): Promise<McpOperationQuotaSnapshot> {
+    this.compactMcpOperations(tenantId);
+    const rows = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId).length;
+    return snapshotMcpOperationQuota(rows, this.mcpOpsLimit);
+  }
+
   async ensureBootstrap(): Promise<void> {
     if (!this.principals.has("prin_dev")) {
       this.principals.set("prin_dev", {
@@ -1127,6 +1400,20 @@ export class MemoryStore implements ControlPlaneStore {
         kind: "human",
         display_name: "Dev User",
         credential_generation: 1,
+        revocation_epoch: 1,
+        revocation_reason: null,
+        created_at: nowIso(),
+      });
+    }
+    if (!this.clients.has("client_ownmesh_cli")) {
+      this.clients.set("client_ownmesh_cli", {
+        client_id: "client_ownmesh_cli",
+        tenant_id: DEFAULT_TENANT,
+        client_name: "OwnMesh CLI",
+        redirect_uris: [
+          "http://127.0.0.1:8750/callback",
+          "http://localhost:8750/callback",
+        ],
         created_at: nowIso(),
       });
     }
@@ -1233,6 +1520,8 @@ export class MemoryStore implements ControlPlaneStore {
       kind,
       display_name: displayName,
       credential_generation: 1,
+      revocation_epoch: 1,
+      revocation_reason: null,
       created_at: nowIso(),
     };
     this.principals.set(id, p);
@@ -1251,16 +1540,72 @@ export class MemoryStore implements ControlPlaneStore {
     return next;
   }
 
+  /**
+   * Remove authority from a principal (#162): advance the revocation epoch and
+   * record which bounded cause did it. Always advances the issuance generation
+   * too, so a revocation is never *less* invalidating than a refresh.
+   */
+  async advancePrincipalRevocationEpoch(
+    id: string,
+    reason: PrincipalRevocationReason,
+  ): Promise<number | null> {
+    const principal = this.principals.get(id);
+    if (!principal) return null;
+    const next = (principal.revocation_epoch ?? 1) + 1;
+    if (!Number.isSafeInteger(next) || next < 1) throw new Error("principal revocation epoch overflow");
+    principal.revocation_epoch = next;
+    principal.revocation_reason = reason;
+    principal.credential_generation += 1;
+    this.principals.set(id, principal);
+    return next;
+  }
+
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
     this.authCodes.set(code.code, { ...code });
   }
-  async takeAuthCode(code: string): Promise<AuthCodeRecord | null> {
-    const rec = this.authCodes.get(code);
-    if (!rec || rec.used) return null;
-    if (Date.now() > rec.expires_at) return null;
+  async redeemAuthCode(input: {
+    code: string; clientId: string; redirectUri: string; codeChallenge: string;
+  }): Promise<AuthCodeRedemption> {
+    // This method intentionally contains no await before its commit point. In
+    // the in-memory conformance store, validation, single-use consumption, and
+    // token publication therefore happen in one JavaScript turn.
+    const rec = this.authCodes.get(input.code);
+    if (!rec || rec.used || Date.now() > rec.expires_at) return { status: "invalid_grant" };
+    if (
+      rec.client_id !== input.clientId ||
+      rec.redirect_uri !== input.redirectUri ||
+      rec.code_challenge !== input.codeChallenge ||
+      rec.code_challenge_method !== "S256"
+    ) {
+      return { status: "invalid_grant" };
+    }
+    const principalRecord = this.principals.get(rec.principal_id);
+    const client = this.clients.get(rec.client_id);
+    if (!principalRecord || !client || client.tenant_id !== principalRecord.tenant_id) {
+      throw new Error("authorization code client/principal binding is unavailable");
+    }
+
+    const access = randomToken("atk_");
+    const refresh = randomToken("rtk_");
+    const token: TokenRecord = {
+      access_token: access,
+      refresh_token: refresh,
+      client_id: rec.client_id,
+      scope: rec.scope,
+      principal: rec.principal_id,
+      expires_at: Date.now() + ACCESS_TOKEN_TTL_MS,
+      refresh_expires_at: Date.now() + REFRESH_TOKEN_IDLE_TTL_MS,
+      revoked: false,
+      refresh_family: randomToken("fam_"),
+      refresh_used: false,
+      tenant_id: principalRecord.tenant_id,
+    };
+
     rec.used = true;
-    this.authCodes.set(code, rec);
-    return { ...rec };
+    this.authCodes.set(input.code, rec);
+    this.tokensByAccess.set(access, token);
+    this.accessByRefresh.set(refresh, access);
+    return { status: "redeemed", record: { ...rec }, token: { ...token } };
   }
 
   async issueTokens(
@@ -1330,7 +1675,8 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
-      await this.advancePrincipalCredentialGeneration(prior.principal);
+      // Reuse is compromise, not continuation: remove authority (#162).
+      await this.advancePrincipalRevocationEpoch(prior.principal, "refresh_reuse");
       return {
         ok: false,
         error: "reuse",
@@ -1351,7 +1697,7 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
-      await this.advancePrincipalCredentialGeneration(old.principal);
+      await this.advancePrincipalRevocationEpoch(old.principal, "refresh_reuse");
       return {
         ok: false,
         error: "reuse",
@@ -1363,6 +1709,10 @@ export class MemoryStore implements ControlPlaneStore {
     this.tokensByAccess.set(access, old);
     this.accessByRefresh.delete(refreshToken);
     this.usedRefresh.set(refreshToken, old.refresh_family);
+    // #162: a healthy rotation advances the issuance generation for
+    // observability only. It deliberately does NOT advance the revocation
+    // epoch, so operations already authorized by this same healthy refresh
+    // family stay deliverable across the 15-minute access-token boundary.
     await this.advancePrincipalCredentialGeneration(old.principal);
     const next = await this.issueTokens(
       old.client_id,
@@ -1381,7 +1731,7 @@ export class MemoryStore implements ControlPlaneStore {
         if (rec && !rec.revoked) {
           rec.revoked = true;
           this.tokensByAccess.set(access, rec);
-          await this.advancePrincipalCredentialGeneration(rec.principal);
+          await this.advancePrincipalRevocationEpoch(rec.principal, "explicit_revocation");
         }
         this.accessByRefresh.delete(token);
       }
@@ -1392,7 +1742,7 @@ export class MemoryStore implements ControlPlaneStore {
       rec.revoked = true;
       this.tokensByAccess.set(token, rec);
       this.accessByRefresh.delete(rec.refresh_token);
-      await this.advancePrincipalCredentialGeneration(rec.principal);
+      await this.advancePrincipalRevocationEpoch(rec.principal, "explicit_revocation");
     }
   }
 
@@ -1421,9 +1771,13 @@ export class MemoryStore implements ControlPlaneStore {
     };
   }
 
-  async putDeviceCode(rec: DeviceCodeRecord): Promise<void> {
-    this.deviceCodes.set(rec.device_code, { ...rec });
-    this.deviceByUserCode.set(rec.user_code.toUpperCase(), rec.device_code);
+  async putDeviceCode(rec: DeviceCodeRecord): Promise<PutDeviceCodeResult> {
+    const normalized = rec.user_code.toUpperCase();
+    if (this.deviceByUserCode.has(normalized)) return "user_code_collision";
+    if (this.deviceCodes.has(rec.device_code)) throw new Error("device_code collision");
+    this.deviceCodes.set(rec.device_code, { ...rec, user_code: normalized });
+    this.deviceByUserCode.set(normalized, rec.device_code);
+    return "created";
   }
   async getDeviceCode(deviceCode: string): Promise<DeviceCodeRecord | null> {
     const rec = this.deviceCodes.get(deviceCode);
@@ -1531,7 +1885,12 @@ export class MemoryStore implements ControlPlaneStore {
   }
   async recordDeviceReadyConnection(
     id: string,
-    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+    patch: {
+      agent_version?: string;
+      protocol_version: string;
+      last_seen_at: string;
+      enforce_workspace?: boolean;
+    },
   ): Promise<DeviceRecord | null> {
     const device = this.devices.get(id);
     if (!device || device.revoked || device.status !== "active") return null;
@@ -1541,6 +1900,9 @@ export class MemoryStore implements ControlPlaneStore {
       ...device,
       ...(isNewer && patch.agent_version ? { agent_version: patch.agent_version } : {}),
       ...(isNewer ? { protocol_version: patch.protocol_version } : {}),
+      ...(patch.enforce_workspace !== undefined
+        ? { enforce_workspace: patch.enforce_workspace }
+        : {}),
       // The timestamp is server-generated. Keep it monotonic if two accepted
       // connections finish out of order.
       last_seen_at:
@@ -1642,18 +2004,32 @@ export class MemoryStore implements ControlPlaneStore {
       .reverse();
   }
 
-  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
-  private enforceMcpOperationQuota(tenantId: string): void {
+  /**
+   * Compact expired terminal rows. Keyed receipts become 30-day tombstones;
+   * keyless rows (and leftover keyless tombstones) are hard-deleted at result TTL
+   * because they protect no idempotency binding.
+   */
+  private compactMcpOperations(tenantId: string): void {
     const now = Date.now();
     const tenantOps = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
     for (const op of tenantOps) {
       const age = mcpOpAgeMs(op, now);
-      // Only hard-delete tombstones past the full idempotency window (30d).
+      const keyed = hasMcpIdempotencyReceipt(op);
+      // Keyless tombstones protect nothing; drop them immediately.
+      if (op.status === "tombstone" && !keyed) {
+        this.mcpOperations.delete(op.operation_id);
+        continue;
+      }
+      // Only hard-delete keyed tombstones past the full idempotency window (30d).
       if (op.status === "tombstone" && age > MCP_OPS_TOMBSTONE_TTL_MS) {
         this.mcpOperations.delete(op.operation_id);
         continue;
       }
       if (isTerminalMcpStatus(op.status) && op.status !== "tombstone" && age > MCP_OPS_RESULT_TTL_MS) {
+        if (!keyed) {
+          this.mcpOperations.delete(op.operation_id);
+          continue;
+        }
         this.mcpOperations.set(op.operation_id, {
           ...op,
           status: "tombstone",
@@ -1671,16 +2047,42 @@ export class MemoryStore implements ControlPlaneStore {
         });
       }
     }
+  }
+
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private enforceMcpOperationQuota(tenantId: string): void {
+    this.compactMcpOperations(tenantId);
     const remaining = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
-    if (remaining.length < MCP_OPS_MAX_PER_TENANT) return;
+    if (remaining.length < this.mcpOpsLimit) return;
     // E3: never evict unexpired idempotency receipts under quota pressure.
     // Only hard-expired tombstones (already removed above) free capacity; otherwise
     // reject new distinct operations fail-closed.
-    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${this.mcpOpsLimit}`);
   }
 
   /** Create-only: refuses to overwrite an existing operation_id or idempotency binding. */
+  /**
+   * Hard-delete tombstones whose 30-day idempotency window has closed, so an
+   * expired key becomes reusable as a fresh operation instead of blocking on a
+   * stale tombstone forever. Runs before any existing-row lookup on the claim
+   * and put paths; `enforceMcpOperationQuota` also prunes them at capacity.
+   */
+  private expireExpiredMcpTombstones(tenantId: string): void {
+    const now = Date.now();
+    for (const op of [...this.mcpOperations.values()]) {
+      if (op.tenant_id !== tenantId || op.status !== "tombstone") continue;
+      const keyed = hasMcpIdempotencyReceipt(op);
+      if (!keyed || mcpOpAgeMs(op, now) > MCP_OPS_TOMBSTONE_TTL_MS) {
+        this.mcpOperations.delete(op.operation_id);
+      }
+    }
+  }
+
   async putMcpOperation(op: McpOperationRecord): Promise<void> {
+    // P0-B review: expire closed-window tombstones before the existing-row
+    // lookup so a key whose 30-day window ended can be minted fresh instead of
+    // throwing mcp_operation_idempotency_exists forever.
+    this.expireExpiredMcpTombstones(op.tenant_id);
     if (this.mcpOperations.has(op.operation_id)) {
       throw new Error(`mcp_operation_exists:${op.operation_id}`);
     }
@@ -1717,10 +2119,36 @@ export class MemoryStore implements ControlPlaneStore {
     tool: string;
     limit?: number;
   }): Promise<McpOperationRecord[]> {
-    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    const limit = Math.max(1, Math.min(this.mcpOpsLimit, Math.trunc(opts.limit ?? this.mcpOpsLimit)));
     return [...this.mcpOperations.values()]
       .filter((op) => op.tenant_id === opts.tenantId && op.principal_id === opts.principalId && op.tool === opts.tool)
       .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id))
+      .slice(0, limit)
+      .map((op) => ({
+        ...op,
+        data: { ...op.data },
+        warnings: [...op.warnings],
+        action: op.action ? { ...op.action } : op.action,
+      }));
+  }
+  async listPendingMcpApprovals(opts: {
+    tenantId: string;
+    principalId: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(PENDING_APPROVAL_LIST_LIMIT, Math.trunc(opts.limit ?? PENDING_APPROVAL_LIST_LIMIT)));
+    return [...this.mcpOperations.values()]
+      .filter(
+        (op) =>
+          op.tenant_id === opts.tenantId &&
+          op.principal_id === opts.principalId &&
+          op.status === "approval_required" &&
+          op.approval_required,
+      )
+      .sort(
+        (left, right) =>
+          right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id),
+      )
       .slice(0, limit)
       .map((op) => ({
         ...op,
@@ -1761,6 +2189,11 @@ export class MemoryStore implements ControlPlaneStore {
     | { outcome: "created"; op: McpOperationRecord }
     | { outcome: "existing"; op: McpOperationRecord }
   > {
+    // P0-B review: expire closed-window tombstones before the existing-row
+    // lookup. A tombstone older than MCP_OPS_TOMBSTONE_TTL_MS must not be
+    // returned as `existing` indefinitely — the documented lifecycle hard-
+    // deletes it and dispatches a retry as a new operation.
+    this.expireExpiredMcpTombstones(op.tenant_id);
     // Synchronous check+insert window (no await) so concurrent MemoryStore
     // callers cannot both observe absence and both insert.
     if (op.idempotency_key) {
@@ -2079,20 +2512,89 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
-    this.workspaces.set(workspace.workspace_id, { ...workspace });
+    const key = workspaceStoreKey(workspace.device_id, workspace.workspace_id);
+    const existing = this.workspaces.get(key);
+    this.workspaces.set(key, {
+      ...workspace,
+      ...(workspace.local_generation || existing?.local_generation
+        ? { local_generation: workspace.local_generation || existing?.local_generation }
+        : {}),
+    });
   }
 
-  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
-    const row = this.workspaces.get(workspaceId);
+  async getWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null> {
+    const row = this.workspaces.get(workspaceStoreKey(deviceId, workspaceId));
     return row ? { ...row } : null;
   }
 
-  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
-    this.workspaceMembers.add(`${workspaceId}\0${principalId}`);
+  async putWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<void> {
+    this.workspaceMembers.add(workspaceMemberStoreKey(deviceId, workspaceId, principalId));
   }
 
-  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
-    return this.workspaceMembers.has(`${workspaceId}\0${principalId}`);
+  async isWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<boolean> {
+    return this.workspaceMembers.has(workspaceMemberStoreKey(deviceId, workspaceId, principalId));
+  }
+
+  async syncDeviceWorkspaces(
+    deviceId: string,
+    workspaces: AdvertisedWorkspaceRegistration[],
+  ): Promise<WorkspaceRecord[]> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") {
+      throw new Error("device_not_active");
+    }
+    const registrations = validateAdvertisedWorkspaces(workspaces);
+    const observedAt = nowIso();
+    for (const registration of registrations) {
+      const workspaceId = registration.id;
+      const key = workspaceStoreKey(deviceId, workspaceId);
+      const existing = this.workspaces.get(key);
+      if (!existing) {
+        this.workspaces.set(key, {
+          workspace_id: workspaceId,
+          tenant_id: device.tenant_id,
+          device_id: deviceId,
+          owner_principal_id: device.principal_id,
+          version: 1,
+          local_generation: registration.generation,
+          active: true,
+          created_at: observedAt,
+          updated_at: observedAt,
+        });
+      } else if (
+        !existing.active ||
+        (existing.local_generation !== undefined &&
+          existing.local_generation !== registration.generation)
+      ) {
+        this.workspaces.set(key, {
+          ...existing,
+          active: true,
+          version: existing.version + 1,
+          local_generation: registration.generation,
+          updated_at: observedAt,
+        });
+      } else if (existing.local_generation === undefined) {
+        this.workspaces.set(key, {
+          ...existing,
+          active: true,
+          version: existing.version + 1,
+          local_generation: registration.generation,
+          updated_at: observedAt,
+        });
+      }
+    }
+    return [...this.workspaces.values()]
+      .filter((workspace) => workspace.device_id === deviceId && workspace.active)
+      .map((workspace) => ({ ...workspace }))
+      .sort((a, b) => a.workspace_id.localeCompare(b.workspace_id));
   }
 
   async assertWorkspaceOperableForMcp(
@@ -2100,25 +2602,109 @@ export class MemoryStore implements ControlPlaneStore {
     deviceId: string,
     principalId: string,
     tenantId: string,
-  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
-    const workspace = await this.getWorkspace(workspaceId);
-    if (
-      !workspace ||
-      !workspace.active ||
-      workspace.tenant_id !== tenantId ||
-      workspace.device_id !== deviceId
-    ) {
-      return { ok: false, error: "workspace_not_available" };
-    }
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, true);
+  }
+
+  async assertWorkspaceVisibleForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, false);
+  }
+
+  private async workspaceGate(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+    requireActiveGeneration: boolean,
+  ): Promise<WorkspaceOperableGate> {
+    const workspace = await this.getWorkspace(deviceId, workspaceId);
+    const classified = requireActiveGeneration
+      ? classifyWorkspaceAvailability(workspace, deviceId, tenantId)
+      : classifyWorkspaceVisibility(workspace, deviceId, tenantId);
+    if (!classified.ok) return classified;
+    const allowed = await this.workspacePrincipalAllowed(
+      classified.workspace,
+      deviceId,
+      principalId,
+      tenantId,
+    );
+    return allowed
+      ? classified
+      : {
+          ok: false,
+          error: "workspace_not_available",
+          cause: "not_authorized",
+          next_action: "select_active_workspace",
+        };
+  }
+
+  private async workspacePrincipalAllowed(
+    workspace: WorkspaceRecord,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean> {
     const device = await this.getDevice(deviceId);
     const role = await this.getTenantMemberRole(tenantId, principalId);
-    const allowed =
+    return (
       workspace.owner_principal_id === principalId ||
       device?.principal_id === principalId ||
       role === "owner" ||
       role === "admin" ||
-      (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
-    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
+      (role === "member" &&
+        (await this.isWorkspaceMember(deviceId, workspace.workspace_id, principalId)))
+    );
+  }
+
+  async observeWorkspaceGeneration(
+    deviceId: string,
+    workspaceId: string,
+    generation: string,
+  ): Promise<WorkspaceRecord | null> {
+    if (!parseWorkspaceId(workspaceId) || !parseWorkspaceGeneration(generation)) return null;
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    const next = applyObservedGeneration(existing, {
+      workspaceId,
+      deviceId,
+      tenantId: device.tenant_id,
+      ownerPrincipalId: existing?.owner_principal_id || device.principal_id,
+      generation,
+      observedAt: nowIso(),
+    });
+    await this.putWorkspace(next);
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async deactivateWorkspace(
+    deviceId: string,
+    workspaceId: string,
+  ): Promise<WorkspaceRecord | null> {
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    if (!existing) return null;
+    await this.putWorkspace({
+      ...existing,
+      active: false,
+      updated_at: nowIso(),
+    });
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async recordObservedWorkspaceEnforcement(
+    deviceId: string,
+    enforceWorkspace: boolean,
+  ): Promise<DeviceRecord | null> {
+    const device = this.devices.get(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    device.enforce_workspace = enforceWorkspace;
+    this.devices.set(deviceId, device);
+    return hydrateDevice(device);
   }
 
   async canOperateDevice(
@@ -2167,7 +2753,7 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async schemaReadiness(): Promise<SchemaReadiness> {
-    // In-memory store always carries the full logical 0002–0008 schema.
+    // In-memory store always carries the full logical 0002–0017 schema.
     const checks = Object.fromEntries(
       Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, true]),
     ) as SchemaReadiness["checks"];
@@ -2200,12 +2786,27 @@ export interface SqlStatement {
 export class SqlStore implements ControlPlaneStore {
   readonly kind: "d1" | "sqlite";
   private db: SqlDatabase;
+  private readonly mcpOpsLimit: number;
   /** plaintext access/refresh kept only for the lifetime of this isolate when issued here.
    * Lookups always go through hash in SQL. For getAccess we need the plaintext from the
    * Authorization header — we hash it and look up. */
-  constructor(db: SqlDatabase, kind: "d1" | "sqlite" = "d1") {
+  constructor(db: SqlDatabase, kind: "d1" | "sqlite" = "d1", opts?: McpOpsStoreOptions) {
     this.db = db;
     this.kind = kind;
+    this.mcpOpsLimit = parseMcpOpsMaxPerTenant(opts?.mcpOpsMaxPerTenant);
+  }
+
+  mcpOpsMaxPerTenant(): number {
+    return this.mcpOpsLimit;
+  }
+
+  async getMcpOperationQuota(tenantId: string): Promise<McpOperationQuotaSnapshot> {
+    await this.compactMcpOperations(tenantId);
+    const countRow = await this.db
+      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
+      .bind(tenantId)
+      .first<{ c: number }>();
+    return snapshotMcpOperationQuota(Number(countRow?.c ?? 0), this.mcpOpsLimit);
   }
 
   async ensureBootstrap(): Promise<void> {
@@ -2304,7 +2905,7 @@ export class SqlStore implements ControlPlaneStore {
   ): Promise<PrincipalRecord> {
     const existing = await this.db
       .prepare(
-        `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
+        `SELECT id, tenant_id, kind, display_name, credential_generation, revocation_epoch, revocation_reason, created_at FROM principals WHERE id = ?`,
       )
       .bind(id)
       .first<PrincipalRecord>();
@@ -2325,13 +2926,15 @@ export class SqlStore implements ControlPlaneStore {
       kind,
       display_name: displayName,
       credential_generation: 1,
+      revocation_epoch: 1,
+      revocation_reason: null,
       created_at: created,
     };
   }
 
   async getPrincipal(id: string): Promise<PrincipalRecord | null> {
     return this.db.prepare(
-      `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
+      `SELECT id, tenant_id, kind, display_name, credential_generation, revocation_epoch, revocation_reason, created_at FROM principals WHERE id = ?`,
     ).bind(id).first<PrincipalRecord>();
   }
 
@@ -2517,6 +3120,30 @@ export class SqlStore implements ControlPlaneStore {
     return Number.isSafeInteger(generation) && generation >= 1 ? generation : null;
   }
 
+  /**
+   * Remove authority from a principal (#162): advance the revocation epoch and
+   * record the bounded cause. The issuance generation advances too, so a
+   * revocation is never less invalidating than a routine refresh.
+   */
+  async advancePrincipalRevocationEpoch(
+    id: string,
+    reason: PrincipalRevocationReason,
+  ): Promise<number | null> {
+    const updated = await this.db
+      .prepare(
+        `UPDATE principals
+         SET revocation_epoch = revocation_epoch + 1,
+             revocation_reason = ?,
+             credential_generation = credential_generation + 1
+         WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1
+         RETURNING revocation_epoch`,
+      )
+      .bind(reason, id)
+      .first<{ revocation_epoch: number }>();
+    const epoch = Number(updated?.revocation_epoch);
+    return Number.isSafeInteger(epoch) && epoch >= 1 ? epoch : null;
+  }
+
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
     const hash = await sha256Hex(code.code);
     await this.db
@@ -2539,23 +3166,117 @@ export class SqlStore implements ControlPlaneStore {
       .run();
   }
 
-  async takeAuthCode(code: string): Promise<AuthCodeRecord | null> {
-    const hash = await sha256Hex(code);
+  async redeemAuthCode(input: {
+    code: string; clientId: string; redirectUri: string; codeChallenge: string;
+  }): Promise<AuthCodeRedemption> {
+    if (!this.db.batch) {
+      throw new Error("SqlStore.redeemAuthCode requires db.batch");
+    }
+    const codeHash = await sha256Hex(input.code);
+    const checkedAt = nowIso();
     const row = await this.db.prepare(
-      `UPDATE oauth_auth_codes SET used = 1
-       WHERE code_hash = ? AND used = 0 AND expires_at > ?
-       RETURNING client_id, principal_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at`,
-    ).bind(hash, nowIso()).first<{
+      `SELECT ac.client_id, ac.principal_id, ac.redirect_uri, ac.scope,
+              ac.code_challenge, ac.code_challenge_method, ac.expires_at,
+              p.tenant_id
+       FROM oauth_auth_codes ac
+       JOIN principals p ON p.id = ac.principal_id
+       JOIN oauth_clients c ON c.client_id = ac.client_id AND c.tenant_id = p.tenant_id
+       WHERE ac.code_hash = ? AND ac.used = 0 AND ac.expires_at > ?
+         AND ac.client_id = ? AND ac.redirect_uri = ?
+         AND ac.code_challenge = ? AND ac.code_challenge_method = 'S256'`,
+    ).bind(codeHash, checkedAt, input.clientId, input.redirectUri, input.codeChallenge).first<{
       client_id: string; principal_id: string; redirect_uri: string; scope: string;
       code_challenge: string; code_challenge_method: string; expires_at: string;
+      tenant_id: string;
     }>();
-    if (!row) return null;
-    return {
-      code, client_id: row.client_id, principal_id: row.principal_id,
-      redirect_uri: row.redirect_uri, scope: row.scope,
-      code_challenge: row.code_challenge, code_challenge_method: row.code_challenge_method,
-      expires_at: Date.parse(row.expires_at), used: true,
+    if (!row) return { status: "invalid_grant" };
+
+    const access = randomToken("atk_");
+    const refresh = randomToken("rtk_");
+    const family = randomToken("fam_");
+    const expiresAt = Date.now() + ACCESS_TOKEN_TTL_MS;
+    const refreshExpiresAt = Date.now() + REFRESH_TOKEN_IDLE_TTL_MS;
+    const accessHash = await sha256Hex(access);
+    const refreshHash = await sha256Hex(refresh);
+    const createdAt = nowIso();
+    type BatchResult = { meta?: { changes?: number }; success?: boolean };
+
+    // The unique auth_code_hash binds exactly one token family to the code.
+    // D1 batch is transactional: if token persistence fails, the subsequent
+    // code-consumption update and the token insert both roll back.
+    let results: BatchResult[];
+    try {
+      results = await this.db.batch<BatchResult>([
+        this.db.prepare(
+          `INSERT INTO oauth_tokens
+           (access_token_hash, refresh_token_hash, client_id, principal_id, scope,
+            refresh_family, refresh_used, revoked, expires_at, refresh_expires_at,
+            created_at, auth_code_hash)
+           SELECT ?, ?, ac.client_id, ac.principal_id, ac.scope, ?, 0, 0, ?, ?, ?, ac.code_hash
+           FROM oauth_auth_codes ac
+           JOIN principals p ON p.id = ac.principal_id
+           JOIN oauth_clients c ON c.client_id = ac.client_id AND c.tenant_id = p.tenant_id
+           WHERE ac.code_hash = ? AND ac.used = 0 AND ac.expires_at > ?
+             AND ac.client_id = ? AND ac.redirect_uri = ?
+             AND ac.code_challenge = ? AND ac.code_challenge_method = 'S256'`,
+        ).bind(
+          accessHash, refreshHash, family, nowIso(expiresAt), nowIso(refreshExpiresAt), createdAt,
+          codeHash, checkedAt, input.clientId, input.redirectUri, input.codeChallenge,
+        ),
+        this.db.prepare(
+          `UPDATE oauth_auth_codes SET used = 1
+           WHERE code_hash = ? AND used = 0 AND expires_at > ?
+             AND client_id = ? AND redirect_uri = ?
+             AND code_challenge = ? AND code_challenge_method = 'S256'
+             AND EXISTS (
+               SELECT 1 FROM oauth_tokens
+               WHERE auth_code_hash = ? AND access_token_hash = ?
+             )`,
+        ).bind(
+          codeHash, checkedAt, input.clientId, input.redirectUri, input.codeChallenge,
+          codeHash, accessHash,
+        ),
+      ]);
+    } catch (error) {
+      // A concurrent winner may surface as a unique-index conflict on some D1
+      // adapters. Distinguish that from an actual storage failure without ever
+      // exposing the authorization code or verifier.
+      const winner = await this.db.prepare(
+        `SELECT 1 AS redeemed FROM oauth_tokens WHERE auth_code_hash = ?`,
+      ).bind(codeHash).first("redeemed");
+      if (winner) return { status: "invalid_grant" };
+      throw error;
+    }
+
+    const tokenInserted = Number(results[0]?.meta?.changes ?? 0) === 1;
+    const codeConsumed = Number(results[1]?.meta?.changes ?? 0) === 1;
+    if (!tokenInserted || !codeConsumed) return { status: "invalid_grant" };
+
+    const record: AuthCodeRecord = {
+      code: input.code,
+      client_id: row.client_id,
+      principal_id: row.principal_id,
+      redirect_uri: row.redirect_uri,
+      scope: row.scope,
+      code_challenge: row.code_challenge,
+      code_challenge_method: row.code_challenge_method,
+      expires_at: Date.parse(row.expires_at),
+      used: true,
     };
+    const token: TokenRecord = {
+      access_token: access,
+      refresh_token: refresh,
+      client_id: row.client_id,
+      scope: row.scope,
+      principal: row.principal_id,
+      expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAt,
+      revoked: false,
+      refresh_family: family,
+      refresh_used: false,
+      tenant_id: row.tenant_id,
+    };
+    return { status: "redeemed", record, token };
   }
 
   async issueTokens(
@@ -2710,9 +3431,14 @@ export class SqlStore implements ControlPlaneStore {
         this.db.prepare(
           `UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`,
         ).bind(fam),
+        // #162: reuse is compromise. Advance the revocation epoch so every
+        // operation authorized by this credential family is invalidated.
         this.db.prepare(
-          `UPDATE principals SET credential_generation = credential_generation + 1
-           WHERE id = ? AND credential_generation >= 1`,
+          `UPDATE principals
+           SET revocation_epoch = revocation_epoch + 1,
+               revocation_reason = 'refresh_reuse',
+               credential_generation = credential_generation + 1
+           WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
         ).bind(row.principal_id),
       ]);
       if (!used) {
@@ -2786,6 +3512,9 @@ export class SqlStore implements ControlPlaneStore {
                AND cur.revoked = 0
            )`,
       ).bind(accessHash, newRefreshHash, expiresAtIso, refreshExpiresAtIso, ts, refreshHash),
+      // #162: a healthy rotation advances the *issuance* generation only.
+      // The revocation epoch is untouched, so an operation queued under the
+      // previous access token stays authorized across the refresh boundary.
       this.db.prepare(
         `UPDATE principals SET credential_generation = credential_generation + 1
          WHERE id = ? AND credential_generation >= 1
@@ -2809,8 +3538,11 @@ export class SqlStore implements ControlPlaneStore {
           this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
             .bind(raced.refresh_family),
           this.db.prepare(
-            `UPDATE principals SET credential_generation = credential_generation + 1
-             WHERE id = ? AND credential_generation >= 1`,
+            `UPDATE principals
+             SET revocation_epoch = revocation_epoch + 1,
+                 revocation_reason = 'refresh_reuse',
+                 credential_generation = credential_generation + 1
+             WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
           ).bind(row.principal_id),
         ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
@@ -2826,8 +3558,11 @@ export class SqlStore implements ControlPlaneStore {
           this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
             .bind(ledger.refresh_family),
           this.db.prepare(
-            `UPDATE principals SET credential_generation = credential_generation + 1
-             WHERE id = ? AND credential_generation >= 1`,
+            `UPDATE principals
+             SET revocation_epoch = revocation_epoch + 1,
+                 revocation_reason = 'refresh_reuse',
+                 credential_generation = credential_generation + 1
+             WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
           ).bind(row.principal_id),
         ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
@@ -2849,9 +3584,14 @@ export class SqlStore implements ControlPlaneStore {
         ).bind(fam, nowIso()),
         this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
           .bind(fam),
+        // #162: reuse is compromise. Advance the revocation epoch so every
+        // operation authorized by this credential family is invalidated.
         this.db.prepare(
-          `UPDATE principals SET credential_generation = credential_generation + 1
-           WHERE id = ? AND credential_generation >= 1`,
+          `UPDATE principals
+           SET revocation_epoch = revocation_epoch + 1,
+               revocation_reason = 'refresh_reuse',
+               credential_generation = credential_generation + 1
+           WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
         ).bind(row.principal_id),
       ]);
       return { ok: false, error: "reuse", description: "refresh token reuse detected" };
@@ -2885,9 +3625,14 @@ export class SqlStore implements ControlPlaneStore {
     if (!row || row.revoked) return;
     if (!this.db.batch) throw new Error("SqlStore.revokeToken requires db.batch");
     await this.db.batch([
+      // #162: an explicit revoke removes authority, so it advances the
+      // revocation epoch and terminally invalidates bound operations.
       this.db.prepare(
-        `UPDATE principals SET credential_generation = credential_generation + 1
-         WHERE id = ? AND credential_generation >= 1
+        `UPDATE principals
+         SET revocation_epoch = revocation_epoch + 1,
+             revocation_reason = 'explicit_revocation',
+             credential_generation = credential_generation + 1
+         WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1
            AND EXISTS (SELECT 1 FROM oauth_tokens WHERE ${column} = ? AND revoked = 0)`,
       ).bind(row.principal_id, hash),
       this.db.prepare(
@@ -2917,13 +3662,14 @@ export class SqlStore implements ControlPlaneStore {
     };
   }
 
-  async putDeviceCode(rec: DeviceCodeRecord): Promise<void> {
+  async putDeviceCode(rec: DeviceCodeRecord): Promise<PutDeviceCodeResult> {
     const hash = await sha256Hex(rec.device_code);
-    await this.db
+    const result = await this.db
       .prepare(
         `INSERT INTO device_codes
          (device_code_hash, user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_code) DO NOTHING`,
       )
       .bind(
         hash,
@@ -2939,6 +3685,12 @@ export class SqlStore implements ControlPlaneStore {
         nowIso(),
       )
       .run();
+    const changes = Number(
+      (result as { meta?: { changes?: number }; changes?: number }).meta?.changes
+        ?? (result as { changes?: number }).changes
+        ?? 0,
+    );
+    return changes >= 1 ? "created" : "user_code_collision";
   }
 
   async getDeviceCode(deviceCode: string): Promise<DeviceCodeRecord | null> {
@@ -3252,6 +4004,7 @@ export class SqlStore implements ControlPlaneStore {
       arch: meta.arch || "unknown",
       agent_version: meta.agent_version || "0",
       protocol_version: meta.protocol_version || "ownmesh.device/1.0",
+      enforce_workspace: meta.enforce_workspace,
       public_key: meta.public_key || row.public_key,
       revoked: Boolean(row.revoked),
       created_at: row.created_at,
@@ -3293,6 +4046,7 @@ export class SqlStore implements ControlPlaneStore {
         arch: meta.arch || "unknown",
         agent_version: meta.agent_version || "0",
         protocol_version: meta.protocol_version || "ownmesh.device/1.0",
+        enforce_workspace: meta.enforce_workspace,
         public_key: meta.public_key || row.public_key,
         revoked: Boolean(row.revoked),
         created_at: row.created_at,
@@ -3340,7 +4094,12 @@ export class SqlStore implements ControlPlaneStore {
 
   async recordDeviceReadyConnection(
     id: string,
-    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+    patch: {
+      agent_version?: string;
+      protocol_version: string;
+      last_seen_at: string;
+      enforce_workspace?: boolean;
+    },
   ): Promise<DeviceRecord | null> {
     const device = await this.getDevice(id);
     if (!device || device.revoked || device.status !== "active") return null;
@@ -3351,6 +4110,7 @@ export class SqlStore implements ControlPlaneStore {
       arch: device.arch,
       agent_version: patch.agent_version || device.agent_version,
       protocol_version: patch.protocol_version,
+      enforce_workspace: patch.enforce_workspace ?? device.enforce_workspace,
     });
     const updated = await this.db
       .prepare(
@@ -3586,22 +4346,38 @@ export class SqlStore implements ControlPlaneStore {
     return res.results || [];
   }
 
-  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
-  private async enforceMcpOperationQuota(tenantId: string): Promise<void> {
+  /**
+   * Compact expired terminal rows. Keyed receipts become 30-day tombstones;
+   * keyless rows (and leftover keyless tombstones) are hard-deleted.
+   */
+  private async compactMcpOperations(tenantId: string): Promise<void> {
     const now = Date.now();
     const resultCutoff = new Date(now - MCP_OPS_RESULT_TTL_MS).toISOString();
     const tombstoneCutoff = new Date(now - MCP_OPS_TOMBSTONE_TTL_MS).toISOString();
 
-    // Hard-delete ancient tombstones first (idempotency window closed).
+    // Drop keyless tombstones (no binding) and keyed tombstones past the 30d window.
     await this.db
       .prepare(
         `DELETE FROM mcp_operations
-         WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?`,
+         WHERE tenant_id = ? AND status = 'tombstone'
+           AND (idempotency_key IS NULL OR idempotency_key = '' OR updated_at < ?)`,
       )
       .bind(tenantId, tombstoneCutoff)
       .run();
 
-    // Compact terminal results past TTL into idempotency tombstones.
+    // Hard-delete keyless terminal results past TTL — they occupy quota for no replay benefit.
+    await this.db
+      .prepare(
+        `DELETE FROM mcp_operations
+         WHERE tenant_id = ?
+           AND status IN ('completed','failed','denied','cancelled','device_offline')
+           AND updated_at < ?
+           AND (idempotency_key IS NULL OR idempotency_key = '')`,
+      )
+      .bind(tenantId, resultCutoff)
+      .run();
+
+    // Compact keyed terminal results past TTL into idempotency tombstones.
     // Keep payload_hash/idempotency_key columns; clear large result bodies only.
     await this.db
       .prepare(
@@ -3614,22 +4390,29 @@ export class SqlStore implements ControlPlaneStore {
              updated_at = ?
          WHERE tenant_id = ?
            AND status IN ('completed','failed','denied','cancelled','device_offline')
-           AND updated_at < ?`,
+           AND updated_at < ?
+           AND idempotency_key IS NOT NULL
+           AND idempotency_key != ''`,
       )
       .bind(new Date(now).toISOString(), tenantId, resultCutoff)
       .run();
+  }
+
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private async enforceMcpOperationQuota(tenantId: string): Promise<void> {
+    await this.compactMcpOperations(tenantId);
 
     const countRow = await this.db
       .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
       .bind(tenantId)
       .first<{ c: number }>();
     const count = Number(countRow?.c ?? 0);
-    if (count < MCP_OPS_MAX_PER_TENANT) return;
+    if (count < this.mcpOpsLimit) return;
 
     // E3: never evict unexpired idempotency receipts (including <30d tombstones)
     // under quota pressure. Ancient tombstones were already hard-deleted above;
     // remaining overflow must fail closed rather than enable side-effect replay.
-    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${this.mcpOpsLimit}`);
   }
 
   /** Create-only INSERT. Conflict (existing operation_id) fails — never REPLACE. */
@@ -3707,7 +4490,7 @@ export class SqlStore implements ControlPlaneStore {
     tool: string;
     limit?: number;
   }): Promise<McpOperationRecord[]> {
-    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    const limit = Math.max(1, Math.min(this.mcpOpsLimit, Math.trunc(opts.limit ?? this.mcpOpsLimit)));
     const rows = await this.db
       .prepare(
         `SELECT * FROM mcp_operations
@@ -3717,6 +4500,25 @@ export class SqlStore implements ControlPlaneStore {
       .bind(opts.tenantId, opts.principalId, opts.tool, limit)
       .all<Record<string, unknown>>();
     return (rows.results || []).map(rowToMcpOperation);
+  }
+
+  async listPendingMcpApprovals(opts: {
+    tenantId: string;
+    principalId: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(PENDING_APPROVAL_LIST_LIMIT, Math.trunc(opts.limit ?? PENDING_APPROVAL_LIST_LIMIT)));
+    const rows = await this.db
+      .prepare(
+        `SELECT * FROM mcp_operations
+         WHERE tenant_id = ? AND principal_id = ? AND status = 'approval_required'
+         ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
+      )
+      .bind(opts.tenantId, opts.principalId, limit)
+      .all<Record<string, unknown>>();
+    return (rows.results || [])
+      .map(rowToMcpOperation)
+      .filter((op) => op.approval_required);
   }
 
   async getMcpOperationByIdempotency(opts: {
@@ -3737,12 +4539,37 @@ export class SqlStore implements ControlPlaneStore {
     return row ? rowToMcpOperation(row) : null;
   }
 
+  /**
+   * Hard-delete tombstones whose 30-day idempotency window has closed, so an
+   * expired key becomes reusable as a fresh operation instead of blocking on a
+   * stale tombstone forever. Runs before any existing-row lookup on the claim
+   * path; `enforceMcpOperationQuota` also prunes them at capacity.
+   */
+  private async expireExpiredMcpTombstones(tenantId: string): Promise<void> {
+    const tombstoneCutoff = new Date(
+      Date.now() - MCP_OPS_TOMBSTONE_TTL_MS,
+    ).toISOString();
+    await this.db
+      .prepare(
+        `DELETE FROM mcp_operations
+         WHERE tenant_id = ? AND status = 'tombstone'
+           AND (idempotency_key IS NULL OR idempotency_key = '' OR updated_at < ?)`,
+      )
+      .bind(tenantId, tombstoneCutoff)
+      .run();
+  }
+
   async claimMcpOperationByIdempotency(
     op: McpOperationRecord,
   ): Promise<
     | { outcome: "created"; op: McpOperationRecord }
     | { outcome: "existing"; op: McpOperationRecord }
   > {
+    // P0-B review: expire closed-window tombstones before the existing-row
+    // lookup. A tombstone older than MCP_OPS_TOMBSTONE_TTL_MS must not be
+    // returned as `existing` indefinitely — the documented lifecycle hard-
+    // deletes it and dispatches a retry as a new operation.
+    await this.expireExpiredMcpTombstones(op.tenant_id);
     // Idempotent reuse must not be blocked by quota pressure on other keys.
     if (op.idempotency_key) {
       const existing = await this.getMcpOperationByIdempotency({
@@ -4395,54 +5222,71 @@ export class SqlStore implements ControlPlaneStore {
   async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
     await this.db
       .prepare(
-        `INSERT INTO workspaces
-           (workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(workspace_id) DO UPDATE SET
-           tenant_id = excluded.tenant_id, device_id = excluded.device_id,
+        `INSERT INTO device_workspaces
+           (workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(device_id, workspace_id) DO UPDATE SET
+           tenant_id = excluded.tenant_id,
            owner_principal_id = excluded.owner_principal_id, version = excluded.version,
+           local_generation = COALESCE(excluded.local_generation, device_workspaces.local_generation),
            active = excluded.active, updated_at = excluded.updated_at`,
       )
       .bind(workspace.workspace_id, workspace.tenant_id, workspace.device_id,
-        workspace.owner_principal_id, workspace.version, workspace.active ? 1 : 0,
+        workspace.owner_principal_id, workspace.version, workspace.local_generation ?? null,
+        workspace.active ? 1 : 0,
         workspace.created_at, workspace.updated_at)
       .run();
   }
 
-  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
+  async getWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null> {
     try {
       const row = await this.db
-        .prepare(`SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at FROM workspaces WHERE workspace_id = ? LIMIT 1`)
-        .bind(workspaceId)
+        .prepare(`SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active, created_at, updated_at FROM device_workspaces WHERE device_id = ? AND workspace_id = ? LIMIT 1`)
+        .bind(deviceId, workspaceId)
         .first<{
           workspace_id: string;
           tenant_id: string;
           device_id: string;
           owner_principal_id: string;
           version: number;
+          local_generation: string | null;
           active: number;
           created_at: string;
           updated_at: string;
         }>();
       if (!row) return null;
-      return { ...row, version: Number(row.version), active: Boolean(row.active) };
+      const { local_generation, ...base } = row;
+      return {
+        ...base,
+        version: Number(row.version),
+        active: Boolean(row.active),
+        ...(local_generation ? { local_generation } : {}),
+      };
     } catch {
       return null;
     }
   }
 
-  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
+  async putWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<void> {
     await this.db
-      .prepare(`INSERT OR IGNORE INTO workspace_members (workspace_id, principal_id, created_at) VALUES (?, ?, ?)`)
-      .bind(workspaceId, principalId, nowIso())
+      .prepare(`INSERT OR IGNORE INTO device_workspace_members (device_id, workspace_id, principal_id, created_at) VALUES (?, ?, ?, ?)`)
+      .bind(deviceId, workspaceId, principalId, nowIso())
       .run();
   }
 
-  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
+  async isWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<boolean> {
     try {
       const row = await this.db
-        .prepare(`SELECT 1 AS ok FROM workspace_members WHERE workspace_id = ? AND principal_id = ? LIMIT 1`)
-        .bind(workspaceId, principalId)
+        .prepare(`SELECT 1 AS ok FROM device_workspace_members WHERE device_id = ? AND workspace_id = ? AND principal_id = ? LIMIT 1`)
+        .bind(deviceId, workspaceId, principalId)
         .first<{ ok: number }>();
       return !!row;
     } catch {
@@ -4450,17 +5294,216 @@ export class SqlStore implements ControlPlaneStore {
     }
   }
 
-  async assertWorkspaceOperableForMcp(
-    workspaceId: string, deviceId: string, principalId: string, tenantId: string,
-  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
-    const workspace = await this.getWorkspace(workspaceId);
-    if (!workspace || !workspace.active || workspace.tenant_id !== tenantId || workspace.device_id !== deviceId) {
-      return { ok: false, error: "workspace_not_available" };
+  async syncDeviceWorkspaces(
+    deviceId: string,
+    workspaces: AdvertisedWorkspaceRegistration[],
+  ): Promise<WorkspaceRecord[]> {
+    if (!this.db.batch) {
+      throw new Error("SqlStore.syncDeviceWorkspaces requires db.batch");
     }
     const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") {
+      throw new Error("device_not_active");
+    }
+    const current = await this.db
+      .prepare(
+        `SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active,
+                created_at, updated_at
+         FROM device_workspaces WHERE device_id = ?`,
+      )
+      .bind(deviceId)
+      .all<{
+        workspace_id: string;
+        tenant_id: string;
+        device_id: string;
+        owner_principal_id: string;
+        version: number;
+        local_generation: string | null;
+        active: number;
+        created_at: string;
+        updated_at: string;
+      }>();
+    const byId = new Map((current.results || []).map((row) => [row.workspace_id, row]));
+    const observedAt = nowIso();
+    const wanted = validateAdvertisedWorkspaces(workspaces);
+    const statements: SqlStatement[] = [];
+    for (const registration of wanted) {
+      const workspaceId = registration.id;
+      const row = byId.get(workspaceId);
+      if (!row) {
+        statements.push(
+          this.db
+            .prepare(
+              `INSERT INTO device_workspaces
+                 (workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active,
+                  created_at, updated_at)
+               VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?)`,
+            )
+            .bind(
+              workspaceId,
+              device.tenant_id,
+              deviceId,
+              device.principal_id,
+              registration.generation,
+              observedAt,
+              observedAt,
+            ),
+        );
+      } else if (
+        !Boolean(row.active) ||
+        (row.local_generation !== null && row.local_generation !== registration.generation)
+      ) {
+        statements.push(
+          this.db
+            .prepare(
+              `UPDATE device_workspaces
+               SET active = 1, version = version + 1, local_generation = ?, updated_at = ?
+               WHERE device_id = ? AND workspace_id = ?`,
+            )
+            .bind(registration.generation, observedAt, deviceId, workspaceId),
+        );
+      } else if (row.local_generation === null) {
+        statements.push(
+          this.db
+            .prepare(
+              `UPDATE device_workspaces
+               SET active = 1, version = version + 1, local_generation = ?, updated_at = ?
+               WHERE device_id = ? AND workspace_id = ? AND local_generation IS NULL`,
+            )
+            .bind(registration.generation, observedAt, deviceId, workspaceId),
+        );
+      }
+    }
+    if (statements.length > 0) await this.db.batch(statements);
+    const rows = await this.db
+      .prepare(
+        `SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active,
+                created_at, updated_at
+         FROM device_workspaces WHERE device_id = ? AND active = 1 ORDER BY workspace_id`,
+      )
+      .bind(deviceId)
+      .all<{
+        workspace_id: string;
+        tenant_id: string;
+        device_id: string;
+        owner_principal_id: string;
+        version: number;
+        local_generation: string | null;
+        active: number;
+        created_at: string;
+        updated_at: string;
+      }>();
+    return (rows.results || []).map((row) => {
+      const { local_generation, ...base } = row;
+      return {
+        ...base,
+        version: Number(row.version),
+        active: Boolean(row.active),
+        ...(local_generation ? { local_generation } : {}),
+      };
+    });
+  }
+
+  async assertWorkspaceOperableForMcp(
+    workspaceId: string, deviceId: string, principalId: string, tenantId: string,
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, true);
+  }
+
+  async assertWorkspaceVisibleForMcp(
+    workspaceId: string, deviceId: string, principalId: string, tenantId: string,
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, false);
+  }
+
+  private async workspaceGate(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+    requireActiveGeneration: boolean,
+  ): Promise<WorkspaceOperableGate> {
+    const workspace = await this.getWorkspace(deviceId, workspaceId);
+    const classified = requireActiveGeneration
+      ? classifyWorkspaceAvailability(workspace, deviceId, tenantId)
+      : classifyWorkspaceVisibility(workspace, deviceId, tenantId);
+    if (!classified.ok) return classified;
+    const device = await this.getDevice(deviceId);
     const role = await this.getTenantMemberRole(tenantId, principalId);
-    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin" || (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
-    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
+    const allowed =
+      classified.workspace.owner_principal_id === principalId ||
+      device?.principal_id === principalId ||
+      role === "owner" ||
+      role === "admin" ||
+      (role === "member" &&
+        (await this.isWorkspaceMember(deviceId, classified.workspace.workspace_id, principalId)));
+    return allowed
+      ? classified
+      : {
+          ok: false,
+          error: "workspace_not_available",
+          cause: "not_authorized",
+          next_action: "select_active_workspace",
+        };
+  }
+
+  async observeWorkspaceGeneration(
+    deviceId: string,
+    workspaceId: string,
+    generation: string,
+  ): Promise<WorkspaceRecord | null> {
+    if (!parseWorkspaceId(workspaceId) || !parseWorkspaceGeneration(generation)) return null;
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    const next = applyObservedGeneration(existing, {
+      workspaceId,
+      deviceId,
+      tenantId: device.tenant_id,
+      ownerPrincipalId: existing?.owner_principal_id || device.principal_id,
+      generation,
+      observedAt: nowIso(),
+    });
+    await this.putWorkspace(next);
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async deactivateWorkspace(
+    deviceId: string,
+    workspaceId: string,
+  ): Promise<WorkspaceRecord | null> {
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    if (!existing) return null;
+    await this.putWorkspace({
+      ...existing,
+      active: false,
+      updated_at: nowIso(),
+    });
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async recordObservedWorkspaceEnforcement(
+    deviceId: string,
+    enforceWorkspace: boolean,
+  ): Promise<DeviceRecord | null> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    const publicKey = encodeDevicePublicKey(device.public_key, {
+      hostname: device.hostname,
+      os: device.os,
+      arch: device.arch,
+      agent_version: device.agent_version,
+      protocol_version: device.protocol_version,
+      enforce_workspace: enforceWorkspace,
+    });
+    const updated = await this.db
+      .prepare(
+        `UPDATE devices SET public_key = ? WHERE id = ? AND revoked = 0 AND status = 'active'`,
+      )
+      .bind(publicKey, deviceId)
+      .run();
+    if (sqlChanges(updated) !== 1) return null;
+    return this.getDevice(deviceId);
   }
 
   async canOperateDevice(
@@ -4535,7 +5578,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Probe 0002–0008 tables, required columns (SELECT projections), and indexes
+   * Probe 0002–0017 tables, required columns (SELECT projections), and indexes
    * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {
@@ -4700,6 +5743,7 @@ export function encodeDevicePublicKey(
     arch?: string;
     agent_version?: string;
     protocol_version?: string;
+    enforce_workspace?: boolean;
   },
 ): string {
   return JSON.stringify({
@@ -4709,6 +5753,7 @@ export function encodeDevicePublicKey(
     arch: meta.arch,
     agent_version: meta.agent_version,
     protocol_version: meta.protocol_version,
+    enforce_workspace: meta.enforce_workspace,
   });
 }
 
@@ -4719,6 +5764,7 @@ function parseDeviceMeta(raw: string): {
   arch?: string;
   agent_version?: string;
   protocol_version?: string;
+  enforce_workspace?: boolean;
 } {
   if (raw.startsWith("{")) {
     try {
@@ -4729,6 +5775,7 @@ function parseDeviceMeta(raw: string): {
         arch?: string;
         agent_version?: string;
         protocol_version?: string;
+        enforce_workspace?: boolean;
       };
     } catch {
       return { public_key: raw };
@@ -4759,6 +5806,7 @@ function hydrateDevice(d: DeviceRecord): DeviceRecord {
     agent_version: d.agent_version || meta.agent_version || "0",
     protocol_version:
       d.protocol_version || meta.protocol_version || "ownmesh.device/1.0",
+    enforce_workspace: d.enforce_workspace ?? meta.enforce_workspace,
     public_key: meta.public_key || d.public_key,
   };
 }
@@ -4771,8 +5819,15 @@ export class MissingD1Error extends Error {
   }
 }
 
-export function createStore(env: { DB?: D1Database }): ControlPlaneStore {
-  if (env.DB) return new SqlStore(env.DB as unknown as SqlDatabase, "d1");
+export function createStore(env: {
+  DB?: D1Database;
+  MCP_OPS_MAX_PER_TENANT?: string;
+}): ControlPlaneStore {
+  if (env.DB) {
+    return new SqlStore(env.DB as unknown as SqlDatabase, "d1", {
+      mcpOpsMaxPerTenant: env.MCP_OPS_MAX_PER_TENANT,
+    });
+  }
   throw new MissingD1Error();
 }
 

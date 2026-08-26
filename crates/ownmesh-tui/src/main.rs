@@ -22,6 +22,7 @@
 )]
 
 mod app;
+mod control_plane;
 mod i18n;
 mod palette;
 mod terminal;
@@ -32,7 +33,9 @@ mod wizard;
 
 use app::{App, ApprovalDecision, Overlay, PendingApproval, Screen};
 use clap::Parser;
+use control_plane::{fetch_device_inventory, redacted_error, DeviceInventory};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::tty::IsTty;
 use i18n::Lang;
 use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
@@ -156,6 +159,15 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
             }
         }
     } else {
+        // Refuse non-interactive runs before touching config/state paths so a
+        // piped invocation creates nothing and fails closed (#137).
+        if !std::io::stdin().is_tty() || !std::io::stdout().is_tty() {
+            eprintln!(
+                "ownmesh-tui requires an interactive terminal; stdin/stdout are not TTYs. \
+                 Use `ownmesh --status` for non-interactive output."
+            );
+            return Err(ExitCode::UsageConfig);
+        }
         let paths = OwnMeshPaths::discover().map_err(|err| {
             eprintln!("paths: {err}");
             ExitCode::UsageConfig
@@ -235,18 +247,30 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
         ExitCode::Internal
     })?;
 
-    let result = (|| -> Result<(), ExitCode> {
+    // Terminal input errors are a controlled exit, never an idle frame:
+    // poll/read failures mean the TTY is gone (EOF, detached, broken pipe).
+    let mut input_error: Option<std::io::Error> = None;
+    let result = (|| {
         let mut terminal = create_ratatui().map_err(|_| ExitCode::Internal)?;
         while !app.should_quit {
             terminal
                 .draw(|frame| ui::draw(frame, &app))
                 .map_err(|_| ExitCode::Internal)?;
 
-            if !event::poll(Duration::from_millis(200)).unwrap_or(false) {
-                continue;
+            match event::poll(Duration::from_millis(200)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(err) => {
+                    input_error = Some(err);
+                    break;
+                }
             }
-            let Ok(ev) = event::read() else {
-                continue;
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(err) => {
+                    input_error = Some(err);
+                    break;
+                }
             };
             match ev {
                 Event::Key(key)
@@ -254,24 +278,7 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                 {
                     handle_key(&mut app, key, rt);
                 }
-                Event::Mouse(me) => {
-                    // Optional mouse: click left nav regions is best-effort via scroll.
-                    use crossterm::event::{MouseButton, MouseEventKind};
-                    if matches!(
-                        me.kind,
-                        MouseEventKind::Down(MouseButton::Left)
-                            | MouseEventKind::ScrollDown
-                            | MouseEventKind::ScrollUp
-                    ) {
-                        // Ignore coordinate mapping; scroll cycles list cursor.
-                        if matches!(me.kind, MouseEventKind::ScrollDown) {
-                            app.list_cursor = app.list_cursor.saturating_add(1);
-                        } else if matches!(me.kind, MouseEventKind::ScrollUp) {
-                            app.list_cursor = app.list_cursor.saturating_sub(1);
-                        }
-                    }
-                }
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) | Event::Mouse(_) => {}
                 Event::Paste(text) if app.overlay == Overlay::Wizard => {
                     append_wizard_server_text(&mut app, &text);
                 }
@@ -283,7 +290,10 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                     .draw(|frame| ui::draw(frame, &app))
                     .map_err(|_| ExitCode::Internal)?;
                 drop(terminal);
-                guard.restore().map_err(|_| ExitCode::Internal)?;
+                guard.restore().map_err(|err| {
+                    eprintln!("terminal restore failed: {err}");
+                    ExitCode::Internal
+                })?;
                 let outcome = run_setup_cli(&request);
 
                 guard = TerminalGuard::enter().map_err(|err| {
@@ -326,7 +336,10 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                     .draw(|frame| ui::draw(frame, &app))
                     .map_err(|_| ExitCode::Internal)?;
                 drop(terminal);
-                guard.restore().map_err(|_| ExitCode::Internal)?;
+                guard.restore().map_err(|err| {
+                    eprintln!("terminal restore failed: {err}");
+                    ExitCode::Internal
+                })?;
                 let authenticated = run_reauthentication_cli();
 
                 guard = TerminalGuard::enter().map_err(|err| {
@@ -353,7 +366,10 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                 .draw(|frame| ui::draw(frame, &app))
                 .map_err(|_| ExitCode::Internal)?;
             drop(terminal);
-            guard.restore().map_err(|_| ExitCode::Internal)?;
+            guard.restore().map_err(|err| {
+                eprintln!("terminal restore failed: {err}");
+                ExitCode::Internal
+            })?;
             let outcome = run_approval_cli(&pending, APPROVAL_CLI_TIMEOUT);
 
             guard = TerminalGuard::enter().map_err(|err| {
@@ -382,11 +398,27 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
         Ok(())
     })();
 
-    let _ = guard.restore();
+    // Restoration failures must be observable, never a silent false success.
+    if let Err(err) = guard.restore() {
+        eprintln!("warning: terminal restore incomplete: {err}");
+    }
+    if let Some(err) = input_error {
+        // Printed only after the alternate screen was left, so it is visible.
+        eprintln!("terminal input unavailable ({err}); exiting OwnMesh TUI");
+    }
     result
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
+    // Global emergency exit. Raw mode delivers Ctrl+C as a regular key event,
+    // so the terminal driver never raises SIGINT for us; it must work from
+    // every screen, palette, wizard step, and overlay (issue #136).
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        app.should_quit = true;
+        return;
+    }
+
     // Global: Ctrl+K palette
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
         app.open_palette();
@@ -424,10 +456,7 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         KeyCode::Char('q' | 'Q') => app.should_quit = true,
         KeyCode::F(1) | KeyCode::Char('?') => app.overlay = Overlay::Help,
         KeyCode::Char('/' | ':') => app.open_palette(),
-        KeyCode::Esc if app.screen != Screen::Dashboard => {
-            app.screen = Screen::Dashboard;
-            app.list_cursor = 0;
-        }
+        KeyCode::Esc if app.screen != Screen::Dashboard => app.goto_screen(Screen::Dashboard),
         KeyCode::Tab if app.screen == Screen::Dashboard => app.move_overview_action(1),
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l')
             if !key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -440,16 +469,16 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
             }
         }
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.prev_screen(),
-        KeyCode::Char('1') => app.screen = Screen::Dashboard,
-        KeyCode::Char('2') => app.screen = Screen::Devices,
-        KeyCode::Char('3') => app.screen = Screen::Workspaces,
-        KeyCode::Char('4') => app.screen = Screen::Sessions,
-        KeyCode::Char('5') => app.screen = Screen::Profiles,
-        KeyCode::Char('6') => app.screen = Screen::Approvals,
-        KeyCode::Char('7') => app.screen = Screen::Transfers,
-        KeyCode::Char('8') => app.screen = Screen::Activity,
-        KeyCode::Char('9') => app.screen = Screen::Diagnostics,
-        KeyCode::Char('0') => app.screen = Screen::Settings,
+        KeyCode::Char('1') => app.goto_screen(Screen::Dashboard),
+        KeyCode::Char('2') => app.goto_screen(Screen::Devices),
+        KeyCode::Char('3') => app.goto_screen(Screen::Workspaces),
+        KeyCode::Char('4') => app.goto_screen(Screen::Sessions),
+        KeyCode::Char('5') => app.goto_screen(Screen::Profiles),
+        KeyCode::Char('6') => app.goto_screen(Screen::Approvals),
+        KeyCode::Char('7') => app.goto_screen(Screen::Transfers),
+        KeyCode::Char('8') => app.goto_screen(Screen::Activity),
+        KeyCode::Char('9') => app.goto_screen(Screen::Diagnostics),
+        KeyCode::Char('0') => app.goto_screen(Screen::Settings),
         KeyCode::Char('w') => {
             app.open_setup_wizard();
         }
@@ -459,7 +488,7 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
             } else if app.screen == Screen::Dashboard {
                 app.move_overview_action(-1);
             } else {
-                app.list_cursor = app.list_cursor.saturating_sub(1);
+                app.move_list_cursor(-1);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -470,7 +499,7 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
             } else if app.screen == Screen::Dashboard {
                 app.move_overview_action(1);
             } else {
-                app.list_cursor = app.list_cursor.saturating_add(1);
+                app.move_list_cursor(1);
             }
         }
         KeyCode::Enter if app.screen == Screen::Dashboard => app.run_overview_action(),
@@ -482,6 +511,9 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         }
         KeyCode::Char('r') if app.screen == Screen::Approvals => {
             refresh_approvals(app, rt);
+        }
+        KeyCode::Char('r') if app.screen == Screen::Devices => {
+            refresh_devices(app, rt);
         }
         KeyCode::Char('p') if app.screen == Screen::Settings => {
             app.cycle_settings_preset();
@@ -609,6 +641,45 @@ fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
         }
         Err(e) => {
             app.status_line = actionable_ipc_error(&e);
+            false
+        }
+    }
+}
+
+fn refresh_devices(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
+    if app.readiness.server_url.is_none() {
+        app.replace_device_inventory(DeviceInventory::NotConfigured);
+        app.status_line = "devices: control plane is not configured".into();
+        return false;
+    }
+    if !app.readiness.account_present {
+        app.replace_device_inventory(DeviceInventory::AuthRequired);
+        app.status_line = "devices: authentication required".into();
+        return false;
+    }
+    match rt.block_on(fetch_device_inventory(&app.paths)) {
+        Ok(inventory) => {
+            let count = match &inventory {
+                DeviceInventory::Loaded { devices, .. } => devices.len(),
+                DeviceInventory::Empty => 0,
+                _ => 0,
+            };
+            app.replace_device_inventory(inventory);
+            app.status_line = format!("devices: {count}");
+            true
+        }
+        Err(err) => {
+            let message = redacted_error(&err);
+            let previous = app
+                .device_inventory
+                .loaded_snapshot()
+                .cloned()
+                .map(Box::new);
+            app.replace_device_inventory(DeviceInventory::Unreachable {
+                message: message.clone(),
+                previous,
+            });
+            app.status_line = format!("devices refresh failed: {message}");
             false
         }
     }
@@ -886,6 +957,156 @@ mod tests {
     #[test]
     fn panic_hook_restores_without_enter() {
         restore_terminal().unwrap();
+    }
+
+    fn nav_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_char(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn test_app() -> App {
+        let dir = tempdir().unwrap();
+        App::new(OwnMeshPaths::for_base(dir.path()), None)
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_screen_overlay_and_palette() {
+        let rt = nav_runtime();
+        for screen in Screen::ALL {
+            let mut app = test_app();
+            app.screen = *screen;
+            handle_key(&mut app, ctrl_char('c'), &rt);
+            assert!(app.should_quit, "Ctrl+C must quit on {screen:?}");
+        }
+        for overlay in [Overlay::Help, Overlay::Wizard, Overlay::Connector] {
+            let mut app = test_app();
+            app.overlay = overlay;
+            handle_key(&mut app, ctrl_char('c'), &rt);
+            assert!(app.should_quit, "Ctrl+C must quit under {overlay:?}");
+        }
+        let mut app = test_app();
+        app.open_palette();
+        handle_key(&mut app, ctrl_char('c'), &rt);
+        assert!(app.should_quit, "Ctrl+C must quit from the palette");
+        // Plain 'c' must not quit — only the control combination does.
+        let mut app = test_app();
+        handle_key(&mut app, press(KeyCode::Char('c')), &rt);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn keyboard_list_navigation_clamps_to_existing_rows() {
+        let rt = nav_runtime();
+        let mut app = test_app();
+        app.goto_screen(Screen::Profiles);
+        let len = app.profile_lines().len();
+        assert!(len > 1, "profiles fixture should have several rows");
+        for _ in 0..len + 5 {
+            handle_key(&mut app, press(KeyCode::Char('j')), &rt);
+        }
+        assert_eq!(app.list_cursor, len - 1, "down must clamp at the last row");
+        for _ in 0..len + 5 {
+            handle_key(&mut app, press(KeyCode::Char('k')), &rt);
+        }
+        assert_eq!(app.list_cursor, 0, "up must clamp at the first row");
+    }
+
+    #[test]
+    fn every_transition_path_resets_the_shared_list_cursor() {
+        let rt = nav_runtime();
+        let mut app = test_app();
+        app.goto_screen(Screen::Sessions);
+        app.set_sessions_from_json(&serde_json::json!({
+            "sessions": [
+                { "id": "s1", "state": "active" },
+                { "id": "s2", "state": "active" },
+                { "id": "s3", "state": "active" }
+            ]
+        }));
+        handle_key(&mut app, press(KeyCode::Down), &rt);
+        handle_key(&mut app, press(KeyCode::Down), &rt);
+        assert_eq!(app.list_cursor, 2);
+
+        // Numeric shortcut.
+        handle_key(&mut app, press(KeyCode::Char('5')), &rt);
+        assert_eq!(app.screen, Screen::Profiles);
+        assert_eq!(app.list_cursor, 0);
+
+        // Esc back to the dashboard.
+        app.goto_screen(Screen::Transfers);
+        app.move_list_cursor(2);
+        handle_key(&mut app, press(KeyCode::Esc), &rt);
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert_eq!(app.list_cursor, 0);
+
+        // Dashboard action navigation.
+        app.goto_screen(Screen::Activity);
+        app.move_list_cursor(1);
+        app.overview_action_cursor = app
+            .overview_actions()
+            .iter()
+            .position(|action| *action == app::OverviewAction::Devices)
+            .expect("devices action");
+        app.run_overview_action();
+        assert_eq!(app.screen, Screen::Devices);
+        assert_eq!(app.list_cursor, 0);
+    }
+
+    #[test]
+    fn shrinking_refreshes_and_empty_lists_keep_the_cursor_in_range() {
+        let mut app = test_app();
+        app.goto_screen(Screen::Sessions);
+        // Empty list pins the cursor at zero.
+        app.move_list_cursor(4);
+        assert_eq!(app.active_list_len(), 0);
+        assert_eq!(app.list_cursor, 0);
+
+        let sessions = |count: usize| {
+            serde_json::json!({
+                "sessions": (0..count)
+                    .map(|i| serde_json::json!({ "id": format!("s{i}"), "state": "active" }))
+                    .collect::<Vec<_>>()
+            })
+        };
+        app.set_sessions_from_json(&sessions(5));
+        app.move_list_cursor(10);
+        assert_eq!(app.list_cursor, 4, "down clamps at the last row");
+        // A shrinking refresh must clamp immediately (#135).
+        app.set_sessions_from_json(&sessions(1));
+        assert_eq!(app.list_cursor, 0);
+        app.set_sessions_from_json(&serde_json::json!({ "sessions": [] }));
+        assert_eq!(app.list_cursor, 0);
+
+        // Approval queue behaves the same way.
+        let approvals = |count: usize| {
+            serde_json::json!({
+                "approvals": (0..count)
+                    .map(|i| {
+                        serde_json::json!({
+                            "id": format!("a{i}"),
+                            "capability": "fs.read",
+                            "state": "pending"
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        app.set_approvals_from_json(&approvals(6));
+        app.approval_cursor = 5;
+        app.set_approvals_from_json(&approvals(2));
+        assert_eq!(app.approval_cursor, 1);
+        app.set_approvals_from_json(&serde_json::json!({ "approvals": [] }));
+        assert_eq!(app.approval_cursor, 0);
     }
 
     #[test]

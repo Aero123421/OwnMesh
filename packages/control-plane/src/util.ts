@@ -1,7 +1,7 @@
 /** Shared helpers for the OwnMesh control plane. */
 
 export const SERVICE_NAME = "ownmesh-control-plane";
-export const SERVICE_VERSION = "1.2.7";
+export const SERVICE_VERSION = "1.2.22";
 
 /** OAuth/token/device responses must not be stored by shared caches (RFC 9700). */
 export const NO_STORE_CACHE_CONTROL = "no-store, no-cache";
@@ -68,18 +68,25 @@ export async function sha256Hex(input: string | Uint8Array): Promise<string> {
 }
 
 /** RFC 7636 S256 code_challenge verification. */
+export async function pkceS256Challenge(verifier: string): Promise<string> {
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const bytes = new Uint8Array(digest);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** RFC 7636 S256 code_challenge verification. */
 export async function verifyPkceS256(
   verifier: string,
   challenge: string,
 ): Promise<boolean> {
-  const data = new TextEncoder().encode(verifier);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  // base64url without padding
-  const bytes = new Uint8Array(digest);
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  const b64 = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return b64 === challenge;
+  return (await pkceS256Challenge(verifier)) === challenge;
+}
+
+export function validPkceVerifier(verifier: string): boolean {
+  return verifier.length >= 43 && verifier.length <= 128 && /^[A-Za-z0-9._~-]+$/.test(verifier);
 }
 
 export function bearer(req: Request): string | null {
@@ -103,43 +110,52 @@ export class BodyTooLargeError extends Error {
  * Read a request body with a hard byte cap enforced before JSON parse.
  * Prefers Content-Length; otherwise streams until the cap is hit.
  */
-export async function readRequestTextLimited(
+export async function readRequestBytesLimited(
   req: Request,
   maxBytes: number = MAX_REQUEST_BODY_BYTES,
-): Promise<string> {
+): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new RangeError("request body limit must be a non-negative safe integer");
+  }
   const cl = req.headers.get("content-length");
   if (cl != null && cl !== "") {
     const n = Number(cl);
-    if (Number.isFinite(n) && n > maxBytes) {
+    // Content-Length is an optimization only. Malformed/understated values are
+    // ignored here and the actual stream remains authoritative below.
+    if (Number.isFinite(n) && n >= 0 && n > maxBytes) {
       throw new BodyTooLargeError();
     }
   }
-  if (!req.body) return "";
+  if (!req.body) return new Uint8Array();
   const reader = req.body.getReader();
-  const chunks: Uint8Array[] = [];
+  // Allocate once at the configured ceiling. This bounds allocation count even
+  // when an attacker supplies a stream containing millions of tiny chunks.
+  const buffer = new Uint8Array(maxBytes);
   let total = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    if (!value) continue;
-    total += value.byteLength;
-    if (total > maxBytes) {
+    if (!value || value.byteLength === 0) continue;
+    if (value.byteLength > maxBytes - total) {
       try {
         await reader.cancel();
       } catch {
-        /* ignore */
+        /* best-effort cancellation after the authoritative size decision */
       }
       throw new BodyTooLargeError();
     }
-    chunks.push(value);
+    buffer.set(value, total);
+    total += value.byteLength;
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.byteLength;
-  }
-  return new TextDecoder().decode(merged);
+  return buffer.slice(0, total);
+}
+
+export async function readRequestTextLimited(
+  req: Request,
+  maxBytes: number = MAX_REQUEST_BODY_BYTES,
+): Promise<string> {
+  const bytes = await readRequestBytesLimited(req, maxBytes);
+  return new TextDecoder().decode(bytes);
 }
 
 export async function readRequestJsonLimited<
@@ -150,10 +166,53 @@ export async function readRequestJsonLimited<
   return JSON.parse(text) as T;
 }
 
+export class UnsupportedMediaTypeError extends Error {
+  readonly status = 415;
+  constructor(message = "unsupported request media type") {
+    super(message);
+    this.name = "UnsupportedMediaTypeError";
+  }
+}
+
+export class DuplicateFormFieldError extends Error {
+  readonly status = 400;
+  constructor() {
+    super("duplicate security-sensitive form field");
+    this.name = "DuplicateFormFieldError";
+  }
+}
+
+const SECURITY_SENSITIVE_FORM_FIELDS = new Set([
+  "client_id", "redirect_uri", "response_type", "grant_type", "scope",
+  "code", "code_verifier", "code_challenge", "code_challenge_method",
+  "device_code", "user_code", "refresh_token", "token", "token_type_hint",
+  "client_assertion", "client_assertion_type", "client_secret", "assertion",
+  "username", "password", "transaction_id", "csrf", "csrf_token", "decision",
+]);
+
+function assertValidFormEncoding(text: string): void {
+  for (const pair of text.split("&")) {
+    const separator = pair.indexOf("=");
+    const encodedKey = separator < 0 ? pair : pair.slice(0, separator);
+    const encodedValue = separator < 0 ? "" : pair.slice(separator + 1);
+    try {
+      // decodeURIComponent rejects malformed escapes and percent-encoded byte
+      // sequences that are not valid UTF-8. URLSearchParams does not.
+      decodeURIComponent(encodedKey.replace(/\+/g, " "));
+      decodeURIComponent(encodedValue.replace(/\+/g, " "));
+    } catch {
+      throw new SyntaxError("malformed URL-encoded form body");
+    }
+  }
+}
+
 export async function readBody(req: Request): Promise<Record<string, string>> {
-  const ct = req.headers.get("content-type") || "";
+  const mediaType = (req.headers.get("content-type") || "")
+    .split(";", 1)[0]!
+    .trim()
+    .toLowerCase();
   const out: Record<string, string> = {};
-  if (ct.includes("application/json")) {
+  if (mediaType === "application/json" || mediaType.endsWith("+json")) {
     const body = await readRequestJsonLimited<Record<string, unknown>>(req);
     for (const [k, v] of Object.entries(body)) {
       if (v === undefined || v === null) continue;
@@ -161,15 +220,32 @@ export async function readBody(req: Request): Promise<Record<string, string>> {
     }
     return out;
   }
-  // formData path still bounded by the platform; reject obviously oversized CL.
-  const cl = req.headers.get("content-length");
-  if (cl != null && Number(cl) > MAX_REQUEST_BODY_BYTES) {
-    throw new BodyTooLargeError();
+  if (mediaType === "multipart/form-data") {
+    // OAuth/device routes do not accept file uploads. Reject before invoking
+    // Request.formData(), which may buffer multipart parts in the runtime.
+    throw new UnsupportedMediaTypeError();
   }
-  const form = await req.formData();
-  form.forEach((v, k) => {
-    out[k] = String(v);
-  });
+  if (mediaType && mediaType !== "application/x-www-form-urlencoded") {
+    throw new UnsupportedMediaTypeError();
+  }
+
+  const bytes = await readRequestBytesLimited(req);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+  } catch {
+    throw new SyntaxError("invalid UTF-8 form body");
+  }
+  assertValidFormEncoding(text);
+  const params = new URLSearchParams(text);
+  const seen = new Set<string>();
+  for (const [key, value] of params) {
+    if (SECURITY_SENSITIVE_FORM_FIELDS.has(key) && seen.has(key)) {
+      throw new DuplicateFormFieldError();
+    }
+    seen.add(key);
+    out[key] = value;
+  }
   return out;
 }
 
@@ -242,13 +318,36 @@ export async function verifyEd25519Hex(
   }
 }
 
-/** Generate a human-friendly user_code like ABCD-EFGH. */
-export function generateUserCode(): string {
-  const alphabet = "BCDFGHJKLMNPQRSTVWXZ";
-  const pick = () => alphabet[Math.floor(Math.random() * alphabet.length)]!;
-  let s = "";
-  for (let i = 0; i < 8; i++) s += pick();
-  return `${s.slice(0, 4)}-${s.slice(4)}`;
+const USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ";
+
+/** Canonicalize a human-entered device code; malformed input fails before lookup. */
+export function normalizeUserCode(input: string): string | null {
+  const compact = input.trim().toUpperCase().replace(/[\s-]+/g, "");
+  if (compact.length !== 8) return null;
+  for (const character of compact) {
+    if (!USER_CODE_ALPHABET.includes(character)) return null;
+  }
+  return `${compact.slice(0, 4)}-${compact.slice(4)}`;
+}
+
+/** Generate a human-friendly user_code like ABCD-EFGH using Web Crypto. */
+export function generateUserCode(
+  fill: (array: Uint8Array) => Uint8Array = (array) => crypto.getRandomValues(array),
+): string {
+  // 20^8 = 25.6 billion candidates. RFC 8628 expiry/rate limits remain the
+  // primary online-guessing controls; rejection sampling avoids modulo bias.
+  const alphabet = USER_CODE_ALPHABET;
+  const cutoff = 256 - (256 % alphabet.length);
+  let raw = "";
+  while (raw.length < 8) {
+    const bytes = fill(new Uint8Array(16));
+    for (const byte of bytes) {
+      if (byte >= cutoff) continue;
+      raw += alphabet[byte % alphabet.length]!;
+      if (raw.length === 8) break;
+    }
+  }
+  return `${raw.slice(0, 4)}-${raw.slice(4)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,8 +383,14 @@ export type InternalContextClaims = {
   body_sha256?: string;
 };
 
-/** Default / maximum internal-context lifetime (short-lived). */
+/** Maximum accepted internal-context lifetime (short-lived). */
 export const INTERNAL_CONTEXT_TTL_MS = 30_000;
+
+/**
+ * Default minted lifetime. Keep headroom below the verifier maximum so a DO
+ * whose clock is slightly behind the signer does not reject a fresh token.
+ */
+export const INTERNAL_CONTEXT_DEFAULT_TTL_MS = 25_000;
 
 /** Hard cap on remembered nonces (after TTL prune). */
 export const INTERNAL_CONTEXT_REPLAY_MAX = 4096;
@@ -447,7 +552,7 @@ export async function signInternalContext(
       throw new Error("ttl_exceeds_max");
     }
   }
-  const exp = claims.exp ?? now + (claims.ttlMs ?? INTERNAL_CONTEXT_TTL_MS);
+  const exp = claims.exp ?? now + (claims.ttlMs ?? INTERNAL_CONTEXT_DEFAULT_TTL_MS);
   if (!Number.isFinite(exp)) throw new Error("exp_invalid");
   // Enforce short maximum lifetime at sign time (explicit exp or derived).
   if (exp > now + INTERNAL_CONTEXT_TTL_MS) {
