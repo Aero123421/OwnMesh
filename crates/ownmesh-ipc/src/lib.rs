@@ -70,7 +70,10 @@ pub use rpc::{
     RpcRequest, RpcResponse, JSONRPC_VERSION,
 };
 pub use server::{reject_unknown_handler, IpcServer, MethodHandler, RevokedClients, ServerConfig};
-pub use transport::{connect, process_birth_id, ClientConnection, LocalListener, ServerConnection};
+pub use transport::{
+    connect, process_birth_id, running_process_birth_id, ClientConnection, LocalListener,
+    ServerConnection,
+};
 #[cfg(windows)]
 pub use transport::{
     windows_process_facts, windows_running_service_facts, WindowsPipePeerFacts,

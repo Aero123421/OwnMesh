@@ -229,7 +229,13 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 }
             }
         };
-        let stale_sessions = registry_stale_sessions + supervisor_host_stale;
+        // A session the reattach pass could not prove either dead or live is
+        // stale by exactly the definition already in use here: state the
+        // daemon is displaying that it cannot vouch for. Counting it lifts
+        // `overall` to `stale_sessions` with the `reconcile_stale_sessions`
+        // recommendation, which is the action an operator should take.
+        let stale_sessions =
+            registry_stale_sessions + supervisor_host_stale + self.reattach_retained_sessions;
         // P0-A: transition-journal health. Pending records are an early signal;
         // retained-expired records are fail-closed state that must not be
         // reported as healthy.
@@ -1111,6 +1117,13 @@ install it or use an explicit path. {}",
             });
         }
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        // #31: read-time reconciliation. A record whose attested child is
+        // provably gone must not keep being displayed as `running` — the
+        // displayed state is a product contract, and a stale `running` is what
+        // made `close`/`replay` look broken on a session that had already
+        // ended. Only provably-dead records are cleared; anything
+        // indeterminate stays visible.
+        self.reconcile_dead_persistent_sessions()?;
         let info = self.sessions.get(&p.id).map_err(session_err)?;
         let mut value = serde_json::to_value(info).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
@@ -3214,6 +3227,27 @@ fn workspace_diagnosis_state(bound: bool, enforce_workspace: bool) -> &'static s
     }
 }
 
+/// Declared contract version of the `system.diagnose` payload (#161).
+///
+/// This is deliberately validated by the Control Plane independently of the
+/// broad `ownmesh.device/1.x` handshake: a device protocol version says the
+/// Agent and Worker can talk, not that they agree on this payload.
+///
+/// Compatibility rule, in both directions:
+///
+/// * Same major — additive. A newer Agent may add checks, states, and
+///   sections; a Worker that understands this major must keep every known
+///   security-relevant check validated and ignore the rest.
+/// * Different major — the Worker must answer `unsupported_diagnosis_version`
+///   with the version numbers, never "the device sent a malformed payload".
+///
+/// **Do not raise the minor until Workers that accept any `1.x` are the
+/// oldest deployment in the field.** Workers up to 1.2.22 compare the schema
+/// string for exact equality with `ownmesh.system_diagnosis/1.0`, so an Agent
+/// that declared `1.1` early would be rejected outright by a Worker one
+/// release behind — the exact skew failure #161 is about.
+pub(crate) const SYSTEM_DIAGNOSIS_CONTRACT: &str = "ownmesh.system_diagnosis/1.0";
+
 fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> Value {
     let supervisor_state = if !facts.supervisor_required {
         "not_required"
@@ -3321,7 +3355,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         _ => "none",
     };
     json!({
-        "schema": "ownmesh.system_diagnosis/1.0",
+        "schema": SYSTEM_DIAGNOSIS_CONTRACT,
         "overall": overall,
         "observed_at": observed_at,
         "agent": {
@@ -3405,8 +3439,66 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
 mod system_diagnosis_tests {
     use super::{
         profile_discovery_health_with, system_diagnosis_payload, workspace_diagnosis_state,
-        SystemDiagnosisFacts,
+        SystemDiagnosisFacts, SYSTEM_DIAGNOSIS_CONTRACT,
     };
+
+    /// #161: the payload declares an explicit, parseable diagnosis contract
+    /// and emits every check id the Control Plane requires. A silent addition
+    /// or rename here is what makes an online device look like it returned a
+    /// malformed response.
+    #[test]
+    fn diagnosis_declares_its_contract_and_every_required_check() {
+        let facts = SystemDiagnosisFacts {
+            lockdown: false,
+            workspace_state: "bound_enforced",
+            supervisor_required: false,
+            supervisor_available: true,
+            session_count: 0,
+            nonterminal_sessions: 0,
+            stale_sessions: 0,
+            transition_pending: 0,
+            transition_expired_pending: 0,
+            transition_retained_unresolved: 0,
+            op_journal_entries: 0,
+            op_journal_durable_bytes: 0,
+            op_journal_in_progress: 0,
+            op_journal_uncertain: 0,
+            op_journal_degraded: false,
+            profile_discovery: ("ok", vec![]),
+            credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
+            agent_route: None,
+        };
+        let value = system_diagnosis_payload("2026-08-25T00:00:00Z", facts);
+        assert_eq!(value["schema"], SYSTEM_DIAGNOSIS_CONTRACT);
+        let (name, version) = SYSTEM_DIAGNOSIS_CONTRACT
+            .split_once('/')
+            .expect("contract is name/major.minor");
+        assert_eq!(name, "ownmesh.system_diagnosis");
+        let (major, minor) = version.split_once('.').expect("version is major.minor");
+        assert!(major.parse::<u32>().is_ok() && minor.parse::<u32>().is_ok());
+        // See SYSTEM_DIAGNOSIS_CONTRACT: Workers up to 1.2.22 compare this
+        // string for exact equality, so the minor must stay 0 until every
+        // deployed Worker accepts any 1.x payload.
+        assert_eq!(
+            version, "1.0",
+            "raising the diagnosis minor breaks every Worker <= 1.2.22 (#161)"
+        );
+        let ids: Vec<&str> = value["checks"]
+            .as_array()
+            .expect("checks is an array")
+            .iter()
+            .map(|check| check["id"].as_str().expect("check id is a string"))
+            .collect();
+        for required in [
+            "policy",
+            "workspace",
+            "daemon",
+            "session_supervisor",
+            "sessions",
+        ] {
+            assert!(ids.contains(&required), "missing required check {required}");
+        }
+    }
 
     #[test]
     fn workspace_diagnosis_is_a_fixed_redacted_boundary_state() {
