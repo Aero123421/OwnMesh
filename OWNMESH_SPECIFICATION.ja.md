@@ -336,6 +336,7 @@ Custom Domain を推奨するが必須ではない。
 ```text
 /mcp
 /.well-known/oauth-protected-resource
+/.well-known/oauth-protected-resource/mcp
 /.well-known/oauth-authorization-server
 /authorize
 /token

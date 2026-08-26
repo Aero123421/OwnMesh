@@ -1200,6 +1200,65 @@ mod tests {
             .is_err());
     }
 
+    /// Regression for #152: a completed structured child must be observable as
+    /// exited through supervisor status, not reported live until TTL sweep.
+    #[tokio::test]
+    async fn supervisor_status_observes_a_terminal_structured_child() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let mut manifest = HostManifest::new(
+            "ses_structured_exit",
+            "dev",
+            "ws",
+            "owner_a",
+            1,
+            unix_now() + 60,
+            unix_now() + 600,
+        )
+        .unwrap();
+        manifest.io_mode = HostIoMode::StructuredPipes;
+        manifest.profile_id = Some("fixture".into());
+        manifest.adapter_dialect = Some("jsonl".into());
+        let command = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "echo done & echo oops 1>&2".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf done; printf oops >&2; exit 0".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let binding = state
+            .spawn_with_io(
+                manifest,
+                command,
+                PtySize::default(),
+                HostIoMode::StructuredPipes,
+            )
+            .await
+            .unwrap();
+
+        let mut observed = false;
+        for _ in 0..200 {
+            if state.reattach(&binding).await.unwrap().exited {
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            observed,
+            "supervisor status never reported the completed structured child as exited"
+        );
+        let _ = state.terminate(&binding).await;
+    }
+
     fn shell_command() -> PtyCommand {
         PtyCommand {
             program: if cfg!(windows) {

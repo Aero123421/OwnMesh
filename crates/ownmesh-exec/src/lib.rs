@@ -62,9 +62,10 @@ pub enum ExecError {
     ResourceLimit(String),
     #[error("cancelled")]
     Cancelled,
-    /// Process spawn failed. The message carries an actionable Windows hint
-    /// when the failure is Win32 error 193 (invalid executable format), which
-    /// npm-style extensionless shims trigger before the resolver fix.
+    /// Process spawn failed because the OS rejected the executable image format.
+    #[error("{0}")]
+    ExecutableFormat(String),
+    /// Process spawn failed for another reason.
     #[error("{0}")]
     Spawn(String),
 }
@@ -416,6 +417,20 @@ fn current_link_target(path: &Path) -> ExecResult<Option<String>> {
     Ok(None)
 }
 
+/// Device/inode identity of a path, without hashing its contents.
+///
+/// Recognizes the same file reached through a different path, symlink, or
+/// hard link — the identity check [`pin_executable`] performs, minus the
+/// full-content digest, for callers that only need "is this the same file?".
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be opened or inspected.
+pub fn file_identity(path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    let file = File::open(path)?;
+    open_file_identity(&file)
+}
+
 /// Capture device/inode/content digest for a structured executable path.
 ///
 /// # Errors
@@ -685,6 +700,93 @@ pub fn user_cli_search_dirs(home: Option<&Path>) -> Vec<PathBuf> {
         );
         dirs
     }
+}
+
+/// Deterministic labels for every directory a bare-name spawn resolution
+/// searches: the service `PATH` first, then the user-local CLI extras that
+/// are not already on it (#145). Home prefixes collapse to `~` so diagnostics
+/// and errors stay readable without leaking absolute home paths.
+#[must_use]
+pub fn spawn_search_dir_labels() -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    // `dirs` is extended with the user-local extras on Unix only; Windows
+    // keeps the inherited user PATH, so the mut is unused there.
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        for dir in user_cli_search_dirs(home.as_deref()) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        collapse_home_in_labels(&dirs, &mut labels);
+    }
+    #[cfg(windows)]
+    {
+        for dir in &dirs {
+            labels.push(dir.display().to_string());
+        }
+    }
+    labels
+}
+
+#[cfg(not(windows))]
+fn collapse_home_in_labels(dirs: &[PathBuf], labels: &mut Vec<String>) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for dir in dirs {
+        if let Some(home) = &home {
+            if let Ok(stripped) = dir.strip_prefix(home) {
+                let rest = stripped.to_string_lossy();
+                if rest.is_empty() {
+                    labels.push("~".into());
+                } else {
+                    labels.push(format!("~/{rest}"));
+                }
+                continue;
+            }
+        }
+        labels.push(dir.display().to_string());
+    }
+}
+
+/// Bounded note listing the directories spawn resolution searches (#145).
+#[must_use]
+pub fn searched_dirs_note() -> String {
+    const MAX_DIRS_LISTED: usize = 12;
+    let labels = spawn_search_dir_labels();
+    if labels.is_empty() {
+        return "resolution searched the daemon service PATH (empty) and found no user-local \
+                CLI directories; shell startup files are never sourced"
+            .into();
+    }
+    let shown: Vec<String> = labels.iter().take(MAX_DIRS_LISTED).cloned().collect();
+    let omitted = labels.len().saturating_sub(shown.len());
+    let omitted_note = if omitted > 0 {
+        format!(" (+{omitted} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "resolution searched the daemon service PATH plus these user-local CLI directories: \
+         {}{omitted_note}; shell startup files are never sourced",
+        shown.join(", ")
+    )
+}
+
+/// Bounded, actionable description of a spawn-resolution failure (#145): the
+/// generic cause is followed by the directories actually searched so an
+/// operator can see why "works in my shell" differs from the daemon service
+/// resolution — without ever sourcing a shell rc.
+#[must_use]
+pub fn describe_spawn_resolve_error(error: &SpawnResolveError) -> String {
+    let base = error.to_string();
+    if !matches!(error, SpawnResolveError::NotFound) {
+        return base;
+    }
+    format!("{base}; {}", searched_dirs_note())
 }
 
 /// True when `path` is a regular file the platform can actually spawn.
@@ -1026,13 +1128,40 @@ fn windows_batch_argv(script: &Path, args: &[String]) -> Result<Vec<String>, Spa
 /// extensionless npm-style POSIX shims; everything else keeps the raw OS
 /// message so the underlying cause is never swallowed.
 #[must_use]
-pub fn describe_spawn_error(program: &str, source: &std::io::Error) -> String {
+pub fn map_spawn_error(program: &str, source: &std::io::Error) -> ExecError {
+    let message = describe_spawn_error(program, source);
+    if source.raw_os_error() == Some(193) {
+        ExecError::ExecutableFormat(message)
+    } else {
+        ExecError::Spawn(message)
+    }
+}
+
+fn describe_spawn_error(program: &str, source: &std::io::Error) -> String {
     if source.raw_os_error() == Some(193) {
         format!(
             "failed to start `{program}`: not a valid Win32 application (error 193). \
 This usually means an extensionless POSIX shim was selected instead of its invocable \
 `{program}.exe/.cmd/.bat` sibling; rerun after upgrading, or use an explicit executable \
 extension so the invocable sibling wins"
+        )
+    } else if cfg!(target_os = "linux")
+        && matches!(
+            source.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+        )
+    {
+        // Linux systemd --user hardening ships `RestrictNamespaces=yes`
+        // (ADR 0011). Containers, sandbox tools and unshare create user or
+        // mount namespaces, so their first clone/unshare fails with EPERM and
+        // previously surfaced as an opaque OS error (#144). Name the directive
+        // and the documented operator drop-in; never loosen the default.
+        format!(
+            "failed to start `{program}`: {source}. This can happen when the program creates \
+Linux namespaces (containers, sandbox tools, unshare) while the ownmeshd service unit sets \
+`RestrictNamespaces=yes`. The default stays fail-closed; to allow namespaces for this device \
+only, add a local drop-in setting `RestrictNamespaces=no` (`systemctl --user edit \
+ownmesh-ownmeshd.service`) — `ownmesh doctor` discloses the effective unit"
         )
     } else {
         format!("failed to start `{program}`: {source}")
@@ -1562,7 +1691,7 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
                 // cmd.exe with literal argv; tokens cmd.exe would reinterpret
                 // fail closed (P1-C).
                 let argv = resolve_spawn_argv(&req.program, &req.args, req.cwd.as_deref())
-                    .map_err(|e| ExecError::Spawn(e.to_string()))?;
+                    .map_err(|e| ExecError::Spawn(describe_spawn_resolve_error(&e)))?;
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
                 c
@@ -1577,7 +1706,7 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
                 // (P1-D/P1-C). An unresolvable program fails closed before
                 // any process is spawned.
                 let argv = resolve_spawn_argv(&req.program, &req.args, req.cwd.as_deref())
-                    .map_err(|e| ExecError::Spawn(e.to_string()))?;
+                    .map_err(|e| ExecError::Spawn(describe_spawn_resolve_error(&e)))?;
                 let mut c = Command::new(&argv[0]);
                 c.args(&argv[1..]);
                 c
@@ -2112,7 +2241,7 @@ async fn run_command_cancellable_inner(
     };
     let mut child = command
         .spawn()
-        .map_err(|source| ExecError::Spawn(describe_spawn_error(&req.program, &source)))?;
+        .map_err(|source| map_spawn_error(&req.program, &source))?;
     // Retain custody until the child exits. On macOS a shebang launch may
     // return from posix_spawn before the interpreter has reopened the staged
     // script path; deleting it immediately would turn an approved launch into
@@ -2858,6 +2987,61 @@ mod tests {
             "actionable remediation expected: {msg}"
         );
         assert!(msg.contains("pi.exe/.cmd/.bat"), "{msg}");
+    }
+
+    /// #145: an unresolvable bare name must name the directories actually
+    /// searched so "works in my shell" mismatches are diagnosable.
+    #[test]
+    fn spawn_resolve_error_lists_searched_directories() {
+        let msg = describe_spawn_resolve_error(&SpawnResolveError::NotFound);
+        assert!(msg.contains("executable could not be resolved"), "{msg}");
+        assert!(
+            msg.contains("service PATH"),
+            "the service PATH must be named: {msg}"
+        );
+        assert!(
+            msg.contains("shell startup files are never sourced"),
+            "{msg}"
+        );
+        // The deterministic user-local extras appear (home-collapsed).
+        // Windows has no separate user-local discovery step (user bins ride
+        // the user PATH), so this expectation is Unix-only.
+        #[cfg(not(windows))]
+        {
+            let labels = spawn_search_dir_labels();
+            assert!(
+                labels.iter().any(|label| label.starts_with("~/.local/bin")),
+                "user-local dirs must be part of the searched set: {labels:?}"
+            );
+        }
+        // Bounded listing: at most 12 directories plus an omission note.
+        assert!(msg.len() < 2 * 1024, "message must stay bounded: {msg}");
+        // Non-NotFound errors keep their own Display text only.
+        let other = describe_spawn_resolve_error(&SpawnResolveError::CmdUnsafeArgument);
+        assert_eq!(other, SpawnResolveError::CmdUnsafeArgument.to_string());
+    }
+
+    /// #144: on Linux, an EPERM at spawn time names the shipped
+    /// RestrictNamespaces guard and the operator drop-in instead of surfacing
+    /// an opaque OS error. Other platforms keep the raw message.
+    #[test]
+    fn eperm_spawn_error_names_restrict_namespaces_guidance_on_linux() {
+        let eperm = std::io::Error::from_raw_os_error(1);
+        let msg = describe_spawn_error("docker", &eperm);
+        if cfg!(target_os = "linux") {
+            assert!(msg.contains("RestrictNamespaces=yes"), "{msg}");
+            assert!(msg.contains("RestrictNamespaces=no"), "{msg}");
+            assert!(msg.contains("ownmesh doctor"), "{msg}");
+        } else {
+            assert!(!msg.contains("RestrictNamespaces"), "{msg}");
+        }
+        // A non-EPERM error is never annotated with namespace guidance.
+        #[cfg(not(windows))]
+        {
+            let generic = std::io::Error::from_raw_os_error(2);
+            let msg = describe_spawn_error("docker", &generic);
+            assert!(!msg.contains("RestrictNamespaces"), "{msg}");
+        }
     }
 
     #[test]
