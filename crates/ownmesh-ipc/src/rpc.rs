@@ -14,6 +14,10 @@ pub mod methods {
     pub const HELLO: &str = "ipc.hello";
     /// Daemon status snapshot.
     pub const STATUS: &str = "daemon.status";
+    /// Live Agent-route presence as observed by the daemon transport
+    /// (`online` / `offline` / `disabled` / `unknown`). Requires the client
+    /// credential — it is not part of the uncredentialed probe surface.
+    pub const ROUTE_STATUS: &str = "daemon.route_status";
     /// Graceful ping used by reconnect probes.
     pub const PING: &str = "ipc.ping";
 
@@ -84,6 +88,14 @@ pub mod methods {
     pub const ADMIN_DAEMON_UNLOCK_REQUEST: &str = "admin.daemon_unlock.request";
     pub const ADMIN_TOKEN_REVOKE_REQUEST: &str = "admin.token_revoke.request";
     pub const ADMIN_APPROVAL_BRIDGE_REQUEST: &str = "admin.approval_bridge.request";
+    pub const ADMIN_GRANTS_MINT_REQUEST: &str = "admin.grants_mint.request";
+
+    /// List device-local grants (temporary + bounded tool).
+    pub const GRANTS_LIST: &str = "grants.list";
+    /// Show one grant by id.
+    pub const GRANTS_SHOW: &str = "grants.show";
+    /// Revoke one grant immediately (tightening; local IPC).
+    pub const GRANTS_REVOKE: &str = "grants.revoke";
 
     /// Daemon-managed credential lifecycle (fixed management client only).
     pub const CREDENTIAL_PROVISION: &str = "credential.provision";
@@ -388,6 +400,34 @@ pub struct DaemonStatus {
     pub uptime_secs: u64,
 }
 
+/// Live Agent-route presence as observed by the daemon transport (#141).
+/// `Online` means an authenticated ready Agent WebSocket session is live
+/// right now — the same condition the control plane reports to MCP clients
+/// as `connection_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRoutePresence {
+    /// No enrolled device credential or rejected configuration: remote
+    /// routing is intentionally off.
+    Disabled,
+    /// Transport configured but no live authenticated ready session. Covers
+    /// reconnect backoff, a hung connect, and post-ready peer closes.
+    Offline,
+    /// An authenticated ready Agent WebSocket session is live.
+    Online,
+}
+
+impl AgentRoutePresence {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Offline => "offline",
+            Self::Online => "online",
+        }
+    }
+}
+
 /// JSON-RPC application error codes (local IPC).
 pub mod app_error {
     /// Peer failed authentication.
@@ -409,4 +449,18 @@ pub mod app_error {
     /// A requested operation is intentionally unavailable on this OS because
     /// its required custody primitive is not implemented there.
     pub const PLATFORM_UNSUPPORTED: i64 = -32_014;
+    /// An approval-bound executable invocation/backing identity changed before
+    /// the OS image-open step. The caller must request a fresh authorization.
+    pub const EXECUTABLE_IDENTITY_DRIFT: i64 = -32_015;
+    /// The durable operation journal has no safe evictable capacity for a new side effect.
+    pub const JOURNAL_CAPACITY: i64 = -32_016;
+    /// A retained transition record requires explicit recovery/reconciliation.
+    pub const TRANSITION_RECOVERY_REQUIRED: i64 = -32_017;
+    /// The resolved executable cannot be launched by the target OS (for example Win32 error 193).
+    pub const EXECUTABLE_FORMAT: i64 = -32_018;
+    /// The request would execute an OwnMesh binary that re-enters this daemon's
+    /// IPC. Running it would deadlock the runtime lock the daemon holds across
+    /// the child's lifetime, stalling every later request for the device
+    /// (#160), so it is refused before spawn.
+    pub const SELF_REENTRANT_EXEC: i64 = -32_019;
 }

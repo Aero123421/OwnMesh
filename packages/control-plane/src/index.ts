@@ -35,7 +35,15 @@ import {
   protectedResourceMetadata,
   type AuthenticatedPrincipal,
 } from "./oauth.ts";
-import { handleApprove, handleMcp, MCP_SYNC_WAIT_MS, MCP_TOOLS } from "./mcp.ts";
+import {
+  handleApprove,
+  handleMcp,
+  MCP_SYNC_WAIT_MS,
+  MCP_TOOLS,
+  mcpCatalogRevision,
+  parseMcpMaxTimeoutMs,
+  PUBLISHED_MCP_TOOLS,
+} from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
 import {
   handleChatGptConnector,
@@ -47,11 +55,14 @@ import {
   handleOwnerPasskeyVerify,
   ownerAuthConfigured,
   ownerLoginRedirect,
+  ownerPresenceForCommitment,
   ownerPresenceForOperation,
   ownerPresenceRedirect,
   ownerPasskeyScript,
   ownerPrincipalFromRequest,
+  parseApprovalSelection,
   sameOriginBrowserPost,
+  approvalCommitmentForIds,
 } from "./owner-auth.ts";
 import {
   TransferRoom,
@@ -60,14 +71,18 @@ import {
   verifyTransferTicket,
 } from "./transfer-room.ts";
 import {
+  BodyTooLargeError,
+  DuplicateFormFieldError,
   internalContextHeaderName,
   internalDoHeaders,
   json,
+  readBody,
   requireScope,
   SERVICE_NAME,
   SERVICE_VERSION,
   sha256Hex,
   signInternalContext,
+  UnsupportedMediaTypeError,
 } from "./util.ts";
 
 export interface Env {
@@ -82,6 +97,8 @@ export interface Env {
   ALLOW_DYNAMIC_CLIENT_REGISTRATION?: string;
   OWNMESH_ALLOWED_ORIGINS?: string;
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
+  MCP_OPS_MAX_PER_TENANT?: string;
+  MCP_MAX_TIMEOUT_MS?: string;
   AUTH_RATE_LIMITER?: RateLimitBinding;
   MCP_RATE_LIMITER?: RateLimitBinding;
   AUTH_IP_RATE_LIMITER?: RateLimitBinding;
@@ -303,7 +320,7 @@ type BrowserAuthentication = {
 async function browserAuthentication(
   request: Request,
   env: Env,
-  freshOperationId?: string,
+  fresh?: { kind: "operation"; operationId: string } | { kind: "commitment"; commitment: string },
 ): Promise<BrowserAuthentication> {
   if (devBypass(env, request)) {
     const url = new URL(request.url);
@@ -316,10 +333,11 @@ async function browserAuthentication(
       cookie: request.headers.get("cookie") || "",
       "x-ownmesh-request-url": request.url,
     });
-    if (freshOperationId) {
+    if (fresh) {
       headers.set("x-ownmesh-auth-purpose", "approve");
-      headers.set("x-ownmesh-operation-id", freshOperationId);
       headers.set("x-ownmesh-require-fresh", "true");
+      if (fresh.kind === "operation") headers.set("x-ownmesh-operation-id", fresh.operationId);
+      if (fresh.kind === "commitment") headers.set("x-ownmesh-approval-commitment", fresh.commitment);
     }
     const response = await env.AUTH_PROVIDER.fetch(new Request("https://auth-provider/authenticate", {
       method: "POST",
@@ -335,7 +353,7 @@ async function browserAuthentication(
       if (body.principal_id && body.tenant_id) {
         return {
           principal: { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name },
-          fresh: !freshOperationId || body.fresh === true,
+          fresh: !fresh || body.fresh === true,
         };
       }
     }
@@ -343,10 +361,12 @@ async function browserAuthentication(
   const issuer = env.OAUTH_ISSUER || new URL(request.url).origin;
   const owner = await ownerPrincipalFromRequest(request, env, issuer);
   if (!owner) return { principal: null, fresh: false };
-  const fresh = freshOperationId
-    ? await ownerPresenceForOperation(request, env, issuer, owner, freshOperationId)
-    : true;
-  return { principal: owner, fresh };
+  const freshOk = !fresh
+    ? true
+    : fresh.kind === "operation"
+      ? await ownerPresenceForOperation(request, env, issuer, owner, fresh.operationId)
+      : await ownerPresenceForCommitment(request, env, issuer, owner, fresh.commitment);
+  return { principal: owner, fresh: freshOk };
 }
 
 function originAllowed(request: Request, env: Env, issuer: string): boolean {
@@ -588,6 +608,13 @@ export default {
         status: "ok",
         liveness: true,
         storage: env.DB ? "d1" : "unavailable",
+        // #158: the deployed catalog generation, so a deploy can verify that
+        // the Worker now serving traffic is the release it just published and
+        // an operator can compare a client snapshot without a bearer token.
+        mcp_catalog: {
+          revision: await mcpCatalogRevision(),
+          tools: PUBLISHED_MCP_TOOLS.length,
+        },
       });
     }
 
@@ -642,7 +669,10 @@ export default {
       }));
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") {
-      return json(protectedResourceMetadata(issuer));
+      return json(protectedResourceMetadata(issuer, issuer));
+    }
+    if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+      return json(protectedResourceMetadata(`${issuer}/mcp`, issuer));
     }
 
     let store: ControlPlaneStore;
@@ -705,9 +735,23 @@ export default {
       }
       let authRequest = request;
       if (request.method === "POST") {
-        const form = await request.clone().formData();
+        let form: Record<string, string>;
+        try {
+          form = await readBody(request.clone());
+        } catch (error) {
+          if (error instanceof BodyTooLargeError) {
+            return json({ error: "invalid_request" }, { status: 413, noStore: true });
+          }
+          if (error instanceof UnsupportedMediaTypeError) {
+            return json({ error: "unsupported_media_type" }, { status: 415, noStore: true });
+          }
+          if (error instanceof DuplicateFormFieldError || error instanceof SyntaxError) {
+            return json({ error: "invalid_request" }, { status: 400, noStore: true });
+          }
+          throw error;
+        }
         const postUrl = new URL(request.url);
-        for (const [key, value] of form.entries()) postUrl.searchParams.set(key, String(value));
+        for (const [key, value] of Object.entries(form)) postUrl.searchParams.set(key, value);
         authRequest = new Request(postUrl, { method: "POST", headers: request.headers });
       }
       const principal = await browserPrincipal(authRequest, env);
@@ -766,25 +810,57 @@ export default {
         );
       }
 
-      const operationId = url.searchParams.get("operation_id") || "";
-      // The fresh-auth proof is bound to the URL operation. Do not let a POST
-      // move authority into an unverified body-only operation_id.
-      if (request.method === "POST" && !operationId) {
+      const selection = parseApprovalSelection(url);
+      if (selection.kind === "invalid") {
         return json(
-          { error: "invalid_request", error_description: "operation_id required in approval URL" },
+          { error: "invalid_request", error_description: selection.error },
           { status: 400, noStore: true },
         );
       }
-      const authentication = await browserAuthentication(request, env, operationId || undefined);
+
+      const requireFresh = selection.kind === "single" || selection.kind === "batch";
+      let freshBinding: { kind: "operation"; operationId: string } | { kind: "commitment"; commitment: string } | undefined;
+      if (selection.kind === "single") {
+        freshBinding = { kind: "operation", operationId: selection.operationId };
+      } else if (selection.kind === "batch") {
+        const commitment = await approvalCommitmentForIds(store, selection.operationIds);
+        if (!commitment) {
+          const session = await browserAuthentication(request, env);
+          if (!session.principal) {
+            if (request.method === "GET" && ownerAuthConfigured(env)) {
+              return ownerPresenceRedirect(request, issuer);
+            }
+            return json(
+              {
+                error: session.principal ? "fresh_authentication_required" : "unauthorized",
+                error_description: "approval requires recent user verification for this exact operation set",
+              },
+              { status: 401, noStore: true },
+            );
+          }
+          return json(
+            {
+              error: "invalid_request",
+              error_description: "batch approval requires pending operations with server-side payload hashes",
+            },
+            { status: 400, noStore: true },
+          );
+        }
+        freshBinding = { kind: "commitment", commitment };
+      }
+
+      const authentication = await browserAuthentication(request, env, freshBinding);
       const principal = authentication.principal;
-      if (!principal || !authentication.fresh) {
+      if (!principal || (requireFresh && !authentication.fresh)) {
         if (request.method === "GET" && ownerAuthConfigured(env)) {
-          return ownerPresenceRedirect(request, issuer);
+          return requireFresh ? ownerPresenceRedirect(request, issuer) : ownerLoginRedirect(request, issuer);
         }
         return json(
           {
             error: authentication.principal ? "fresh_authentication_required" : "unauthorized",
-            error_description: "approval requires recent user verification for this exact operation",
+            error_description: requireFresh
+              ? "approval requires recent user verification for this exact operation set"
+              : "approval inbox requires an independently authenticated human session",
           },
           { status: 401, noStore: true },
         );
@@ -835,6 +911,7 @@ export default {
           presenceForDevice: (device) => deviceConnectionStatus(env, device),
           // Short fixed fast path only; command timeout remains device-side.
           waitForDeviceMs: MCP_SYNC_WAIT_MS,
+          maxTimeoutMs: parseMcpMaxTimeoutMs(env.MCP_MAX_TIMEOUT_MS),
           transferTicketSecret: env.SESSION_SECRET,
           terminalizeTransferRoom: env.TRANSFER_ROOM && env.SESSION_SECRET ? async (control) => {
             const signed = await issueTransferTerminalControl(env.SESSION_SECRET!, { v: 1, ...control });

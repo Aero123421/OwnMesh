@@ -24,14 +24,21 @@ base64 = "0.22.1"
 # build, but `cargo run -p ownmesh-tui` compiles this crate alone.
 clap = { version = "4.5.27", features = ["derive", "env"] }
 crossterm = "0.28.1"
+anyhow = "1.0.95"
 ownmesh-config = { path = "../ownmesh-config" }
 ownmesh-diagnostics = { path = "../ownmesh-diagnostics" }
 ownmesh-domain = { path = "../ownmesh-domain" }
+ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
 ownmesh-policy = { path = "../ownmesh-policy" }
 ownmesh-profiles = { path = "../ownmesh-profiles" }
 ownmesh-transfer = { path = "../ownmesh-transfer" }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.12.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 tokio = { version = "1.43.0", features = [
     "macros",
@@ -44,3 +51,12 @@ unicode-width = "0.2.0"
 
 [dev-dependencies]
 tempfile = "3.15.0"
+
+# PTY smoke tests spawn the real binary behind a pseudo-terminal. The same
+# platform pins as ownmesh-session-host apply: see the comment there for why
+# Darwin needs 0.9 and Windows stays on 0.8.1.
+[target.'cfg(not(windows))'.dev-dependencies]
+portable-pty = "=0.9.0"
+
+[target.'cfg(windows)'.dev-dependencies]
+portable-pty = "=0.8.1"

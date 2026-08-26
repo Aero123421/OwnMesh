@@ -9,3 +9,7 @@ OWNMESH_DEV_AUTH_BYPASS=false
 # Prefer statically provisioned clients. Enable only when DCR is intentionally exposed.
 ALLOW_DYNAMIC_CLIENT_REGISTRATION=false
 OWNMESH_ALLOWED_ORIGINS=http://127.0.0.1:8787
+# Per-tenant durable MCP operation row cap (default 20000).
+# MCP_OPS_MAX_PER_TENANT=20000
+# Synchronous command timeout clamp in milliseconds (default 300000, hard ceiling 3600000).
+# MCP_MAX_TIMEOUT_MS=300000

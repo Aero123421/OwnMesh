@@ -75,6 +75,13 @@ pub enum Msg {
     DevicesTitle,
     DevicesLocal,
     DevicesHint,
+    DevicesInventory,
+    DevicesHintRefresh,
+    DevicesEmpty,
+    DevicesNotConfigured,
+    DevicesAuthRequired,
+    DevicesUnreachable,
+    DevicesTruncated,
     // Workspaces
     WorkspacesTitle,
     WorkspacesRoot,
@@ -196,6 +203,13 @@ impl Msg {
         Self::DevicesTitle,
         Self::DevicesLocal,
         Self::DevicesHint,
+        Self::DevicesInventory,
+        Self::DevicesHintRefresh,
+        Self::DevicesEmpty,
+        Self::DevicesNotConfigured,
+        Self::DevicesAuthRequired,
+        Self::DevicesUnreachable,
+        Self::DevicesTruncated,
         Self::WorkspacesTitle,
         Self::WorkspacesRoot,
         Self::WorkspacesHint,
@@ -306,6 +320,13 @@ impl Msg {
             Self::DevicesTitle => "devices.title",
             Self::DevicesLocal => "devices.local",
             Self::DevicesHint => "devices.hint",
+            Self::DevicesInventory => "devices.inventory",
+            Self::DevicesHintRefresh => "devices.hint_refresh",
+            Self::DevicesEmpty => "devices.empty",
+            Self::DevicesNotConfigured => "devices.not_configured",
+            Self::DevicesAuthRequired => "devices.auth_required",
+            Self::DevicesUnreachable => "devices.unreachable",
+            Self::DevicesTruncated => "devices.truncated",
             Self::WorkspacesTitle => "workspaces.title",
             Self::WorkspacesRoot => "workspaces.root",
             Self::WorkspacesHint => "workspaces.hint",
@@ -472,7 +493,7 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "Navigate with Tab/arrows. Ctrl+K opens commands. Setup wizard: Ctrl+K → Wizard. Approvals: a approve, d deny.",
+        "Navigate with Tab/arrows. Ctrl+K opens commands. Setup wizard: Ctrl+K → Wizard. Approvals: a approve, d deny. q quits normally; Ctrl+C exits from any screen or overlay.",
     );
     insert(&mut m, Msg::DaemonOnline, "Daemon online");
     insert(&mut m, Msg::DaemonOffline, "Daemon offline");
@@ -500,14 +521,45 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::DevicesHint,
-        "Device enrollment and multi-device mesh appear after control-plane pairing.",
+        "Press r to refresh the authenticated Control Plane device list. This screen never polls in the background.",
+    );
+    insert(&mut m, Msg::DevicesInventory, "Control Plane devices");
+    insert(
+        &mut m,
+        Msg::DevicesHintRefresh,
+        "r refresh devices (explicit network request)",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesEmpty,
+        "No enrolled devices were returned.",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesNotConfigured,
+        "Control Plane is not configured.",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesAuthRequired,
+        "Authentication required. Reauthenticate to list devices.",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesUnreachable,
+        "Control Plane is unreachable.",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesTruncated,
+        "Showing the first 64 devices.",
     );
     insert(&mut m, Msg::WorkspacesTitle, "Workspaces");
     insert(&mut m, Msg::WorkspacesRoot, "Daemon workspace root");
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "Workspace-only presets confine file ops to the configured root.",
+        "workspace_root_enforcement is independent of access_preset. This screen shows the local workspace root; remote MCP waits for activation_state=active on list/show.",
     );
     insert(&mut m, Msg::SessionsTitle, "Sessions");
     insert(&mut m, Msg::SessionsEmpty, "No interactive sessions yet.");
@@ -707,7 +759,7 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "Tab/矢印で移動。Ctrl+K でコマンド。セットアップ: Ctrl+K → ウィザード。承認: a 許可、d 拒否。",
+        "Tab/矢印で移動。Ctrl+K でコマンド。セットアップ: Ctrl+K → ウィザード。承認: a 許可、d 拒否。通常終了は q。Ctrl+C はどの画面・オーバーレイからでも緊急終了します。",
     );
     insert(&mut m, Msg::DaemonOnline, "デーモン接続中");
     insert(&mut m, Msg::DaemonOffline, "デーモン未接続");
@@ -739,14 +791,49 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::DevicesHint,
-        "複数デバイスはコントロールプレーン連携後に表示されます。",
+        "r で認証済みコントロールプレーンのデバイス一覧を更新します。この画面はバックグラウンドで問い合わせません。",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesInventory,
+        "コントロールプレーンのデバイス",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesHintRefresh,
+        "r デバイス更新（明示的なネットワーク要求）",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesEmpty,
+        "登録デバイスは返りませんでした。",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesNotConfigured,
+        "コントロールプレーンが未設定です。",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesAuthRequired,
+        "認証が必要です。再認証してデバイスを一覧します。",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesUnreachable,
+        "コントロールプレーンに到達できません。",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesTruncated,
+        "先頭64台までを表示しています。",
     );
     insert(&mut m, Msg::WorkspacesTitle, "ワークスペース");
     insert(&mut m, Msg::WorkspacesRoot, "デーモンのワークスペース根");
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "Workspace Only プリセットはファイル操作を根配下に限定します。",
+        "workspace_root_enforcement は access_preset と独立です。この画面はローカルのワークスペース root です。リモート MCP は list/show の activation_state が active になるまで使えません。",
     );
     insert(&mut m, Msg::SessionsTitle, "セッション");
     insert(
@@ -946,7 +1033,7 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "用 Tab/方向键导航。Ctrl+K 打开命令。向导: Ctrl+K → 向导。审批: a 批准，d 拒绝。",
+        "用 Tab/方向键导航。Ctrl+K 打开命令。向导: Ctrl+K → 向导。审批: a 批准，d 拒绝。正常退出按 q；Ctrl+C 可从任何界面或浮层紧急退出。",
     );
     insert(&mut m, Msg::DaemonOnline, "守护进程在线");
     insert(&mut m, Msg::DaemonOffline, "守护进程离线");
@@ -971,13 +1058,32 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
     );
     insert(&mut m, Msg::DevicesTitle, "设备");
     insert(&mut m, Msg::DevicesLocal, "本机（本地守护进程）");
-    insert(&mut m, Msg::DevicesHint, "多设备网格在控制平面配对后显示。");
+    insert(
+        &mut m,
+        Msg::DevicesHint,
+        "按 r 刷新已认证控制平面的设备列表。此屏幕不会在后台轮询。",
+    );
+    insert(&mut m, Msg::DevicesInventory, "控制平面设备");
+    insert(
+        &mut m,
+        Msg::DevicesHintRefresh,
+        "r 刷新设备（显式网络请求）",
+    );
+    insert(&mut m, Msg::DevicesEmpty, "未返回已注册设备。");
+    insert(&mut m, Msg::DevicesNotConfigured, "尚未配置控制平面。");
+    insert(
+        &mut m,
+        Msg::DevicesAuthRequired,
+        "需要认证。请重新认证后再列出设备。",
+    );
+    insert(&mut m, Msg::DevicesUnreachable, "无法连接控制平面。");
+    insert(&mut m, Msg::DevicesTruncated, "仅显示前 64 台设备。");
     insert(&mut m, Msg::WorkspacesTitle, "工作区");
     insert(&mut m, Msg::WorkspacesRoot, "守护进程工作区根目录");
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "仅工作区预设会将文件操作限制在根目录内。",
+        "workspace_root_enforcement 独立于 access_preset。此屏幕显示本地工作区根路径；远程 MCP 需等到 list/show 的 activation_state 为 active。",
     );
     insert(&mut m, Msg::SessionsTitle, "会话");
     insert(&mut m, Msg::SessionsEmpty, "尚无交互会话。");
@@ -1169,7 +1275,7 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "Навигация Tab/стрелки. Ctrl+K — команды. Мастер: Ctrl+K → Wizard. Одобрения: a принять, d отклонить.",
+        "Навигация Tab/стрелки. Ctrl+K — команды. Мастер: Ctrl+K → Wizard. Одобрения: a принять, d отклонить. Обычный выход — q; Ctrl+C завершает работу с любого экрана или панели.",
     );
     insert(&mut m, Msg::DaemonOnline, "Демон в сети");
     insert(&mut m, Msg::DaemonOffline, "Демон не в сети");
@@ -1201,14 +1307,41 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::DevicesHint,
-        "Мультиустройственная сеть появится после сопряжения с control-plane.",
+        "Нажмите r, чтобы обновить список устройств Control Plane. Экран не опрашивает сеть в фоне.",
+    );
+    insert(&mut m, Msg::DevicesInventory, "Устройства Control Plane");
+    insert(
+        &mut m,
+        Msg::DevicesHintRefresh,
+        "r обновить устройства (явный сетевой запрос)",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesEmpty,
+        "Зарегистрированные устройства не возвращены.",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesNotConfigured,
+        "Control Plane не настроен.",
+    );
+    insert(
+        &mut m,
+        Msg::DevicesAuthRequired,
+        "Требуется аутентификация. Повторно войдите, чтобы увидеть устройства.",
+    );
+    insert(&mut m, Msg::DevicesUnreachable, "Control Plane недоступен.");
+    insert(
+        &mut m,
+        Msg::DevicesTruncated,
+        "Показаны первые 64 устройства.",
     );
     insert(&mut m, Msg::WorkspacesTitle, "Рабочие области");
     insert(&mut m, Msg::WorkspacesRoot, "Корень рабочей области демона");
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "Пресет «только рабочая область» ограничивает файловые операции корнем.",
+        "workspace_root_enforcement не зависит от access_preset. Этот экран показывает локальный корень рабочей области; удалённый MCP ждёт activation_state=active в list/show.",
     );
     insert(&mut m, Msg::SessionsTitle, "Сессии");
     insert(&mut m, Msg::SessionsEmpty, "Интерактивных сессий пока нет.");

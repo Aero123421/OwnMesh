@@ -1,5 +1,6 @@
 //! Application state, navigation, and pure helpers.
 
+use crate::control_plane::{classify_local_inventory, DeviceInventory};
 use crate::i18n::{t, Lang, Msg};
 use crate::palette::{filter_commands, PaletteAction, PaletteState};
 use crate::theme::{ColorMode, Theme};
@@ -193,6 +194,7 @@ pub struct App {
     pub status_line: String,
     pub should_quit: bool,
     pub list_cursor: usize,
+    pub device_inventory: DeviceInventory,
     pending_setup: Option<SetupRequest>,
     pending_reauthentication: bool,
 }
@@ -212,6 +214,11 @@ impl App {
                 .map(|instance| instance.base_url.clone())
         });
         let readiness = readiness_from_local(&paths, &cfg, daemon.as_ref());
+        let device_inventory = classify_local_inventory(
+            &paths,
+            readiness.server_url.as_deref(),
+            readiness.account_present,
+        );
         // Read-only local observations only: no network probes, no secret material.
         let doctor = run_doctor(&doctor_input_from_local(
             &paths,
@@ -241,6 +248,7 @@ impl App {
             status_line: String::new(),
             should_quit: false,
             list_cursor: 0,
+            device_inventory,
             pending_setup: None,
             pending_reauthentication: false,
         }
@@ -275,9 +283,8 @@ impl App {
                 });
             }
         }
-        if self.approval_cursor >= self.approvals.len() {
-            self.approval_cursor = self.approvals.len().saturating_sub(1);
-        }
+        // Refreshes may shrink or clear the queue; keep cursors valid (#135).
+        self.clamp_cursors();
     }
 
     pub fn set_sessions_from_json(&mut self, value: &Value) {
@@ -292,23 +299,75 @@ impl App {
                 .get("id")
                 .or_else(|| s.get("session_id"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("?");
+                .unwrap_or("?")
+                .to_owned();
             let state = s.get("state").and_then(|v| v.as_str()).unwrap_or("");
             self.sessions.push(format!("{id}  {state}"));
         }
+        // A shrinking list must never leave the cursor out of range (#135).
+        self.clamp_cursors();
+    }
+
+    pub fn replace_device_inventory(&mut self, inventory: DeviceInventory) {
+        self.device_inventory = inventory;
     }
 
     pub fn next_screen(&mut self) {
         let i = (self.screen.primary_index() + 1) % Screen::PRIMARY.len();
-        self.screen = Screen::from_primary_index(i);
-        self.list_cursor = 0;
+        self.goto_screen(Screen::from_primary_index(i));
     }
 
     pub fn prev_screen(&mut self) {
         let n = Screen::PRIMARY.len();
         let i = (self.screen.primary_index() + n - 1) % n;
-        self.screen = Screen::from_primary_index(i);
+        self.goto_screen(Screen::from_primary_index(i));
+    }
+
+    /// Switch screens and deterministically reset the shared list cursor.
+    ///
+    /// Every transition path (keys, palette, dashboard actions, Esc) goes
+    /// through here so a stale cursor can never leak into another screen.
+    pub fn goto_screen(&mut self, screen: Screen) {
+        self.screen = screen;
         self.list_cursor = 0;
+    }
+
+    /// Rows addressable by the shared list cursor on the active screen.
+    ///
+    /// Mirrors exactly what `ui::draw_list_screen` renders for each screen,
+    /// so clamping against this length always matches the drawn rows.
+    #[must_use]
+    pub fn active_list_len(&self) -> usize {
+        match self.screen {
+            Screen::Sessions => self.sessions.len(),
+            Screen::Profiles => self.profile_lines().len(),
+            Screen::Transfers => self.transfer_lines().len(),
+            Screen::Activity => self.activity.len(),
+            _ => 0,
+        }
+    }
+
+    /// Move the shared list cursor by `delta`, clamped to existing rows
+    /// (`0..len`). Empty lists keep the cursor pinned at zero (issue #135).
+    pub fn move_list_cursor(&mut self, delta: isize) {
+        let len = self.active_list_len();
+        if len == 0 {
+            self.list_cursor = 0;
+            return;
+        }
+        self.list_cursor = (self.list_cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Clamp navigation cursors to current content after refreshes shrink
+    /// or clear lists.
+    pub fn clamp_cursors(&mut self) {
+        if self.approval_cursor >= self.approvals.len() {
+            self.approval_cursor = self.approvals.len().saturating_sub(1);
+        }
+        let len = self.active_list_len();
+        if self.list_cursor >= len {
+            self.list_cursor = len.saturating_sub(1);
+        }
     }
 
     pub fn move_overview_action(&mut self, delta: isize) {
@@ -370,9 +429,9 @@ impl App {
             }
             OverviewAction::Connector => self.overlay = Overlay::Connector,
             OverviewAction::Reauthenticate => self.pending_reauthentication = true,
-            OverviewAction::Devices => self.screen = Screen::Devices,
-            OverviewAction::Workspace => self.screen = Screen::Workspaces,
-            OverviewAction::Doctor => self.screen = Screen::Diagnostics,
+            OverviewAction::Devices => self.goto_screen(Screen::Devices),
+            OverviewAction::Workspace => self.goto_screen(Screen::Workspaces),
+            OverviewAction::Doctor => self.goto_screen(Screen::Diagnostics),
         }
     }
 
@@ -448,19 +507,16 @@ impl App {
     /// Handle a palette action.
     pub fn dispatch_palette(&mut self, action: PaletteAction) {
         match action {
-            PaletteAction::Goto(screen) => {
-                self.screen = screen;
-                self.list_cursor = 0;
-            }
+            PaletteAction::Goto(screen) => self.goto_screen(screen),
             PaletteAction::OpenWizard => self.open_setup_wizard(),
             PaletteAction::OpenHelp => self.overlay = Overlay::Help,
             PaletteAction::Quit => self.should_quit = true,
             PaletteAction::ApproveSelected => {
-                self.screen = Screen::Approvals;
+                self.goto_screen(Screen::Approvals);
                 self.queue_selected_approval(ApprovalDecision::Approve);
             }
             PaletteAction::DenySelected => {
-                self.screen = Screen::Approvals;
+                self.goto_screen(Screen::Approvals);
                 self.queue_selected_approval(ApprovalDecision::Deny);
             }
         }
@@ -651,11 +707,15 @@ fn doctor_input_from_local(
             auth_session_present,
             enrolled_device_id_present: false,
         },
+        credential_store: ownmesh_diagnostics::CredentialStoreObservation::default(),
         daemon: DaemonObservation {
             endpoint: None,
             reachable: daemon.is_some(),
             pid: daemon.map(|status| status.pid),
             message: None,
+            // The TUI readiness view does not query the live route; doctor
+            // owns that observation (#141).
+            agent_route: None,
         },
         // Network is opt-in; TUI never probes the control plane.
         control_plane: ControlPlaneObservation {
@@ -664,6 +724,7 @@ fn doctor_input_from_local(
             probed: false,
             reachable: None,
             http_status: None,
+            reported_version: None,
             message: None,
         },
         privacy_policy: PrivacyPolicyObservation {
@@ -679,5 +740,7 @@ fn doctor_input_from_local(
             update_network_off: cfg.update.mode == "off",
         },
         service: ServiceObservation::default(),
+        journals: ownmesh_diagnostics::JournalsObservation::default(),
+        profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
     }
 }

@@ -2,7 +2,89 @@
 
 use crate::error::{ConfigError, ConfigResult};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Explicit layout overrides supplied as typed process arguments.
+///
+/// A service descriptor binds a daemon to the exact directories validated at
+/// install time. On Windows a Scheduled Task action cannot carry environment
+/// variables safely, so the same binding is expressed as `ownmeshd run`
+/// arguments and installed here before any layout is resolved (#148).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathOverrides {
+    /// Overrides `OWNMESH_CONFIG_DIR` and the platform default.
+    pub config_dir: Option<PathBuf>,
+    /// Overrides `OWNMESH_STATE_DIR` and the platform default.
+    pub state_dir: Option<PathBuf>,
+    /// Overrides `OWNMESH_RUNTIME_DIR` and the platform default.
+    pub runtime_dir: Option<PathBuf>,
+}
+
+impl PathOverrides {
+    /// True when no override was supplied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.config_dir.is_none() && self.state_dir.is_none() && self.runtime_dir.is_none()
+    }
+
+    fn validate(&self) -> ConfigResult<()> {
+        for (name, value) in [
+            ("--config-dir", self.config_dir.as_deref()),
+            ("--state-dir", self.state_dir.as_deref()),
+            ("--runtime-dir", self.runtime_dir.as_deref()),
+        ] {
+            let Some(path) = value else { continue };
+            if path.as_os_str().is_empty() {
+                return Err(ConfigError::Other(format!("{name} must not be empty")));
+            }
+            if !path.is_absolute() {
+                return Err(ConfigError::Other(format!(
+                    "{name} must be an absolute path: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+static PATH_OVERRIDES: OnceLock<PathOverrides> = OnceLock::new();
+
+/// Install process-wide layout overrides, highest precedence.
+///
+/// Typed arguments outrank the environment deliberately: the descriptor that
+/// launched this process named these directories, and a stray `OWNMESH_*`
+/// variable in the launched context must not silently split one installation
+/// into two state trees.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] for a relative or empty override, or when a
+/// different set of overrides was already installed in this process.
+pub fn install_path_overrides(overrides: &PathOverrides) -> ConfigResult<()> {
+    overrides.validate()?;
+    match PATH_OVERRIDES.set(overrides.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if PATH_OVERRIDES.get() == Some(overrides) => Ok(()),
+        Err(_) => Err(ConfigError::Other(
+            "conflicting OwnMesh path overrides were already installed in this process".into(),
+        )),
+    }
+}
+
+/// Overrides installed for this process, if any.
+#[must_use]
+pub fn path_overrides() -> Option<&'static PathOverrides> {
+    PATH_OVERRIDES.get()
+}
+
+fn override_path(select: fn(&PathOverrides) -> Option<&Path>) -> Option<PathBuf> {
+    PATH_OVERRIDES
+        .get()
+        .and_then(select)
+        .map(std::borrow::ToOwned::to_owned)
+}
 
 /// Resolved `OwnMesh` filesystem layout for the current user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,19 +102,26 @@ pub struct OwnMeshPaths {
 impl OwnMeshPaths {
     /// Resolve default paths for the current platform and environment.
     ///
-    /// Environment overrides:
-    /// - `OWNMESH_CONFIG_DIR`
-    /// - `OWNMESH_STATE_DIR`
-    /// - `OWNMESH_RUNTIME_DIR`
-    /// - `OWNMESH_CACHE_DIR`
+    /// Precedence, highest first:
+    /// 1. process overrides from [`install_path_overrides`] (typed arguments
+    ///    supplied by the service descriptor that launched this process);
+    /// 2. environment overrides `OWNMESH_CONFIG_DIR`, `OWNMESH_STATE_DIR`,
+    ///    `OWNMESH_RUNTIME_DIR`, `OWNMESH_CACHE_DIR`;
+    /// 3. the platform default layout.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when the home / profile directory cannot be determined.
     pub fn discover() -> ConfigResult<Self> {
-        let config_dir = env_path("OWNMESH_CONFIG_DIR").unwrap_or(default_config_dir()?);
-        let state_dir = env_path("OWNMESH_STATE_DIR").unwrap_or(default_state_dir()?);
-        let runtime_dir = env_path("OWNMESH_RUNTIME_DIR").unwrap_or(default_runtime_dir()?);
+        let config_dir = override_path(|o| o.config_dir.as_deref())
+            .or_else(|| env_path("OWNMESH_CONFIG_DIR"))
+            .unwrap_or(default_config_dir()?);
+        let state_dir = override_path(|o| o.state_dir.as_deref())
+            .or_else(|| env_path("OWNMESH_STATE_DIR"))
+            .unwrap_or(default_state_dir()?);
+        let runtime_dir = override_path(|o| o.runtime_dir.as_deref())
+            .or_else(|| env_path("OWNMESH_RUNTIME_DIR"))
+            .unwrap_or(default_runtime_dir()?);
         let cache_dir = env_path("OWNMESH_CACHE_DIR").unwrap_or(default_cache_dir()?);
         Ok(Self {
             config_dir,
@@ -80,9 +169,13 @@ impl OwnMeshPaths {
 
     /// Ensure config/state/runtime/cache directories exist.
     ///
+    /// Directories are created owner-only on Unix so the layout is valid under
+    /// any umask; the daemon custody attestation rejects group/world-writable
+    /// ancestors.
+    ///
     /// # Errors
     ///
-    /// Returns IO errors from `create_dir_all`.
+    /// Returns IO errors from directory creation.
     pub fn ensure_layout(&self) -> ConfigResult<()> {
         for dir in [
             &self.config_dir,
@@ -91,13 +184,36 @@ impl OwnMeshPaths {
             &self.cache_dir,
             &self.keystore_dir(),
         ] {
-            std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
+            create_dir_owner_only(dir).map_err(|source| ConfigError::Io {
                 path: Some(dir.clone()),
                 source,
             })?;
         }
         Ok(())
     }
+}
+
+/// Create a directory tree with owner-only permissions on Unix, independent of
+/// the process umask.
+///
+/// OwnMesh's config/state/runtime/cache directories hold credentials and
+/// custody-validated state. The daemon's custody attestation rejects
+/// group/world-writable ancestors (`validate_parent_custody` in ownmesh-ipc),
+/// so a umask such as `002` that makes `create_dir_all` produce `0775`
+/// directories would otherwise prevent the daemon from starting. Creating the
+/// tree with mode `0700` keeps the layout correct-by-construction; existing
+/// directories are left untouched (their ownership is attested separately).
+#[cfg(unix)]
+fn create_dir_owner_only(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_dir_owner_only(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -188,6 +304,8 @@ fn default_runtime_dir() -> ConfigResult<PathBuf> {
     {
         if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
             Ok(PathBuf::from(xdg).join("ownmesh"))
+        } else if let Some(runtime) = linux_user_runtime_dir() {
+            Ok(runtime)
         } else {
             Ok(default_state_dir()?.join("run"))
         }
@@ -196,6 +314,35 @@ fn default_runtime_dir() -> ConfigResult<PathBuf> {
     {
         Ok(home_dir()?.join("ownmesh/run"))
     }
+}
+
+/// Owner-only `/run/user/<uid>` when `XDG_RUNTIME_DIR` is unset but the
+/// standard user-runtime directory already exists. Matches the systemd
+/// `--user` unit's `OWNMESH_RUNTIME_DIR` without requiring shell-profile
+/// edits.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_user_runtime_dir() -> Option<PathBuf> {
+    let uid = rustix::process::geteuid().as_raw();
+    let base = PathBuf::from("/run/user").join(uid.to_string());
+    if !trusted_linux_runtime_base(&base, uid) {
+        return None;
+    }
+    let ownmesh = base.join("ownmesh");
+    // Only switch when the systemd-style dir already exists so a headless
+    // install that baked state_dir/run into the unit keeps working.
+    ownmesh.is_dir().then_some(ownmesh)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn trusted_linux_runtime_base(path: &std::path::Path, expected_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_dir() || meta.uid() != expected_uid || meta.mode() & 0o077 != 0 {
+        return false;
+    }
+    true
 }
 
 fn default_cache_dir() -> ConfigResult<PathBuf> {
@@ -236,5 +383,87 @@ mod tests {
         paths.ensure_layout().unwrap();
         assert!(paths.config_file().starts_with(dir.path()));
         assert!(paths.keystore_dir().exists());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn trusted_linux_runtime_base_requires_owner_only_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let mode = |bits| std::fs::Permissions::from_mode(bits);
+        std::fs::set_permissions(dir.path(), mode(0o700)).unwrap();
+        assert!(trusted_linux_runtime_base(dir.path(), uid));
+        std::fs::set_permissions(dir.path(), mode(0o755)).unwrap();
+        assert!(!trusted_linux_runtime_base(dir.path(), uid));
+        assert!(!trusted_linux_runtime_base(
+            &dir.path().join("missing"),
+            uid
+        ));
+        assert!(!trusted_linux_runtime_base(dir.path(), uid.wrapping_add(1)));
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, mode(0o700)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            !trusted_linux_runtime_base(&link, uid),
+            "a symlink must not count as the trusted runtime base"
+        );
+    }
+
+    /// Regression: `ensure_layout` must create owner-only directories even
+    /// under the most permissive umask (000). The daemon custody attestation
+    /// rejects group/world-writable ancestors, so a umask-dependent layout
+    /// would prevent startup on systems with umask 002/000.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_layout_is_owner_only_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "OWNMESH_LAYOUT_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Parent: re-run this exact test in a child whose umask is 000 so
+            // `create_dir_all` would produce 0777 directories if the layout
+            // creation were umask-dependent.
+            let exe = std::env::current_exe().expect("current test executable");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(
+                    "umask 000; exec \"$0\" --exact \
+                     paths::tests::ensure_layout_is_owner_only_under_permissive_umask \
+                     --nocapture",
+                )
+                .arg(exe)
+                .env(CHILD, "1")
+                .output()
+                .expect("run umask-000 child");
+            assert!(
+                output.status.success(),
+                "umask-000 child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Child: umask is 000 here.
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        for d in [
+            &paths.config_dir,
+            &paths.state_dir,
+            &paths.runtime_dir,
+            &paths.cache_dir,
+            &paths.keystore_dir(),
+        ] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{} must be owner-only under umask 000, got mode {:o}",
+                d.display(),
+                mode
+            );
+        }
     }
 }

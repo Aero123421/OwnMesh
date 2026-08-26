@@ -66,7 +66,7 @@ test("flag + loopback host + loopback issuer (via default origin): device GET wo
   await withStore(async (store) => {
     await store.putDeviceCode({
       device_code: "dc_loop",
-      user_code: "ABCD-EFGH",
+      user_code: "BCDF-GHJK",
       client_id: "client_bypass",
       scope: "ownmesh.read",
       verification_uri: `${LOOPBACK_ORIGIN}/oauth/device`,
@@ -76,7 +76,7 @@ test("flag + loopback host + loopback issuer (via default origin): device GET wo
     });
     // No OAUTH_ISSUER → issuer falls back to request origin (loopback).
     const res = await worker.fetch(
-      new Request(`${LOOPBACK_ORIGIN}/oauth/device?user_code=ABCD-EFGH`),
+      new Request(`${LOOPBACK_ORIGIN}/oauth/device?user_code=BCDF-GHJK`),
       { OWNMESH_DEV_AUTH_BYPASS: "true" },
       ctx,
     );
