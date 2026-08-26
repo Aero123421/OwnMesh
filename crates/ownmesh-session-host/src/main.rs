@@ -270,8 +270,9 @@ explicit executable"
         }
         Err(ownmesh_exec::SpawnResolveError::NotFound) => {
             eprintln!(
-                "program `{program}` could not be resolved to a launchable executable (check PATH \
-and user-local CLI dirs); install it or use an explicit path"
+                "program `{program}` could not be resolved to a launchable executable; \
+install it or use an explicit path. {}",
+                ownmesh_exec::searched_dirs_note()
             );
             return Err(ExitCode::UsageConfig);
         }

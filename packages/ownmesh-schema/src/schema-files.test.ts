@@ -11,6 +11,7 @@ const REQUIRED_SCHEMAS = [
   "errors.schema.json",
   "protocol-envelope.schema.json",
   "operation-envelope.schema.json",
+  "workspace-registry.schema.json",
 ];
 
 describe("JSON Schema corpus", () => {

@@ -1,49 +1,31 @@
 # OwnMesh
 
-> **Any AI. Any CLI. Any machine. Your cloud.**
+OwnMesh は、ChatGPT などの AI クライアントから、自分の Windows / macOS /
+Linux マシンを使えるようにするソフトウェアです。すべてセルフホストです。
+各デバイスにはオープンソースの Agent を入れ、コントロールプレーンは
+自分の Cloudflare アカウントにデプロイした Cloudflare Worker として動きます。
+ベンダー管理のサービスはなく、テレメトリも送信もありません。
 
-OwnMesh は、セルフホスト型のオープンソース capability runtime です。
-ChatGPT などの MCP クライアントから、自分が所有する Windows / macOS /
-Linux マシンを、自分の Cloudflare アカウントに置いたコントロールプレーン
-経由で利用できます。
+AI オーケストレータでもリモートデスクトップでもありません。ローカルの
+Agent はユーザー権限で動作し、特権処理は任意導入の別プロセス(ネットワーク
+アクセスなしのブローカー)だけが担当します。
 
-OwnMesh は AI オーケストレータでも、ベンダー管理の中央 SaaS でもありません。
-通常の Agent はユーザー権限で動き、明示的に承認された特権処理だけを、任意導入の
-ネットワークレス・ブローカーに渡します。
+## できること
 
-## ステータス
-
-**v1.2.16 正式安定版** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
-
-公開する CLI サーフェスに、意図的な未実装項目は残っていません。機械検査される
-正本は [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json)
-です。ここでの「完成」は、この公開対象がすべて fail-closed で実装されているという
-意味です。将来仕様の全項目や、すべてのネイティブ配布形式まで完了したという意味では
-ありません。
-
-### 主な機能
-
-- デスクトップと SSH/Ubuntu Server の1コマンド初期設定、read-only の
-  `doctor`、ユーザーサービス管理、統一されたダーク系 TUI。
-- ChatGPT 対応 MCP OAuth、動的クライアント登録、ローテーションする refresh
-  token、単一オーナー向け passkey ログイン、厳密な callback 検証。
-- device の enroll/list/show/rename/labels/key rotation/revoke。
-- ローカル実行と認証済み remote exec/session。remote mutation は明示的な
-  idempotency key が必須で、ローカル実行へ黙ってフォールバックしません。
-- 承認済み command は invocation entry、backing executable、classification、
-  `argv[0]` を厳密に拘束し、実行ファイルの drift は spawn 前に拒否します。
-- 9種類の AI CLI profile と、scan/list/show/login/test/start/resume。
-- approval list/show/watch/approve/deny、policy の検査・preset・構造化 rule 更新、
-  lockdown/unlock、token revoke。
-- セキュリティ管理操作は、対象操作に結び付いた fresh passkey 承認後に1回だけ実行。
-- 認証済み・再開可能・上限付きの端末間 transfer と
-  plan/send/list/status/cancel CLI。宛先の置換は `overwrite_expected_sha256` が一致するときのみ。盲上書き/force フォールバックなし。
-- `ownmesh mcp serve --stdio`。設定済み issuer と OS credential store を使う
-  上限付き JSONL bridge で、stdout に秘密や診断ログを混ぜません。
+- **ChatGPT がそのままクライアントになる。** MCP エンドポイントを OAuth・
+  動的クライアント登録・オーナー向け passkey ログイン付きで公開します。
+- **複数マシンの操作。** CLI または内蔵 TUI でデバイスを登録すると、
+  コマンド実行、許可パスの読み書き、ログ照会、対話セッション、マシン間
+  ファイル転送ができます。
+- **ポリシーは自分で決める。** すべての要求が allow/ask/deny ルールを通過
+  します。承認・ポリシー変更・解除などの敏感な操作は、その操作専用の
+  fresh passkey 承認を追加で要求します。
+- **表示と実際の一致。** UI は検証済みの事実だけを表示します。出荷される
+  CLI サーフェスは機械検査され、
+  [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json)
+  に正本があります。
 
 ## インストール
-
-通常インストーラーは、リリース署名と checksum を検証してから導入します。
 
 Linux / macOS:
 
@@ -57,73 +39,58 @@ Windows PowerShell:
 $p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
 ```
 
-macOS の 1 行インストールは、署名検証用の `minisign` を入手するために
-[Homebrew](https://brew.sh) を必要とします。自分で `minisign` を導入するか、
-`OWNMESH_MINISIGN` で既存のバイナリを指定すれば不要です。Linux では、
-`minisign` が無い場合に hash 固定の版を installer が取得します。
+どちらの installer も、署名と checksum の検証が通ってからインストールしま
+す。macOS の 1 行インストールは署名検証用の `minisign` を Homebrew で取得
+します(`minisign` を自分で入れるか `OWNMESH_MINISIGN` で指定すれば不要)。
+Linux では見つからない場合に hash 固定の `minisign` を取得します。
 
-より厳密に確認する場合は、installer と `SHA256SUMS`、`SHA256SUMS.minisig`
-をダウンロードし、署名と installer の checksum を検証してから実行してください。
+手動で確認したい場合は、installer 本体と `SHA256SUMS`、`SHA256SUMS.minisig`
+をダウンロードし、実行前に検証してください。
 
-公開鍵は、検証対象のリリースからではなく **帯域外** で入手してください。
-リリース資産は自分自身を保証できません。クローンした
-[`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub) を使い、
-key ID が `C596813EFB0946A4` であることを確認します。同じ鍵が installer と
-`ownmesh update` にも埋め込まれており、3 つの経路が同一の trust root を共有
-します。リリースに同梱される `minisign.pub` は、key ID を既に知っている人向けの
-補助にすぎません。
+公開鍵は、検証対象のリリースではなくリポジトリのクローンから取ってくださ
+い。リリース資産は自分自身を保証できません。
+[`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub)、
+key ID `C596813EFB0946A4` を確認します。同じ鍵が installer と
+`ownmesh update` にも埋め込まれており、3 経路が同一の trust root を共有し
+ます。
 
-installer 本体も、展開数/サイズ上限、許可ファイル一覧、path traversal・link・
-device・重複拒否を適用します。既存のportable installを更新するときは、導入先と
-完全一致するOwnMesh processだけを停止し、以前動いていたserviceを再起動してversion
-を確認します。更新後のhealth確認に失敗した場合は旧バイナリへ戻します。
-
-初回インストール後は、Windows / macOS / Linux のすべてで次の1コマンドです。
+初回インストール後の更新は、全 OS 共通で 1 コマンドです。
 
 ```bash
 ownmesh update
 ```
 
-同じ署名チェーンを再検証し、session の終了、ユーザーサービスの停止、5バイナリの
-一括置換、以前動作していたサービスの再起動、CLI/daemon のversion確認までを自動で
-行います。失敗時は旧バイナリへrollbackします。Windowsではprivateな一時workerへ
-引き継いでから親CLIを終了するため、導入済み`ownmesh.exe`自身によるfile lockを
-避けます。進行状況は`ownmesh update status`で確認できます。Homebrew管理下では
-引き続き`brew upgrade ownmesh`を使います。
+署名チェーンの再検証、session の終了、5 バイナリの原子置換、サービスの再
+起動、version 確認までを行い、失敗時は旧バイナリへ戻します。進行状況は
+`ownmesh update status` で見られます。Homebrew 管理下では引き続き
+`brew upgrade ownmesh` を使います。
 
-## 初回セットアップ
+## セットアップ
 
 ### 1. コントロールプレーンを導入する
 
-以降のすべての手順でその URL が必要になるため、ここから始めます。クローンから:
+以降の手順で URL が必要になるため、最初に行います。
 
 ```bash
 cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
 ```
 
-guided deploy は D1 を作成または再利用し、migration、Worker deploy、必要な
-secret 設定を行い、オーナーログイン URL、ChatGPT MCP URL、そして手順 2 で
-そのまま使える `ownmesh setup` コマンドを表示します。詳細は
+guided deploy は D1 の作成/再利用、migration、Worker deploy、secret 設定を
+行い、オーナーログイン URL と ChatGPT MCP URL、そして次のコマンドを表示し
+ます。詳細は
 [`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) と
-[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md) を参照してください。
+[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md)。
 
 ### 2. マシンを接続する
 
-デスクトップでは TUI を起動し、**セットアップ**を選びます。Worker URL と
-アクセス範囲を選ぶと、ログイン・PC登録・Agentの自動起動まで順番に行います:
+デスクトップなら TUI を起動して「Finish setup」を選びます。
 
 ```bash
 ownmesh
 ```
 
-同じ処理を直接CLIで行う場合:
-
-```bash
-ownmesh setup --control-plane-url https://your-worker.example --quickstart
-```
-
-SSH / Ubuntu Server（URL と短いコードを表示し、別端末から承認）。TUIでも
-同じURL＋コード方式を使えます:
+SSH やヘッドレス環境では、URL と短いコードが表示され、別のデバイスから承認
+します。
 
 ```bash
 ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force
@@ -131,8 +98,8 @@ ownmesh setup --control-plane-url https://your-worker.example --quickstart --dev
 
 ### 3. 確認する
 
-読み取り専用で、状態を変更しません。`--check-network` を付けると
-コントロールプレーンの `/health` も確認します:
+読み取り専用で、状態は変えません。`--check-network` を付けるとコントロー
+ルプレーンの `/health` も確認します。
 
 ```bash
 ownmesh doctor --json
@@ -140,42 +107,48 @@ ownmesh doctor --json
 
 ## セキュリティ設計
 
-- 必須の中央 SaaS はなく、コントロールプレーンはユーザー所有。
-- telemetry、cloud relay、自動 update のネットワーク確認は既定 OFF。
-- 明示的な処理を除き、ファイル・コマンド出力・ログはローカルに保持。
-- OAuth/device credential は `config.toml` ではなく OS credential store に保存。
-- セキュリティ管理操作は型付きです。任意の method/params を通す裏口はありません。
-  同一ユーザーのローカル socket だけでは、人間の存在証明として扱いません。
-- 通常の `ownmeshd` は全 OS でユーザー権限。任意の特権ブローカーはネットワークレス。
-- Full Access に隠れた hard deny はありません。選択した policy の
-  allow/ask/deny はそのまま適用されます。
-
-特権実行が必要な場合だけ、別途導入します。
+- コントロールプレーンの所有者はユーザー自身。中央 SaaS は不要です。
+- telemetry・cloud relay・update の自動確認は既定 OFF。ファイル、コマンド
+  出力、ログは、明示的に転送しない限りローカルに留まります。
+- credential は OS credential store に保存され、`config.toml` には書きませ
+  ん。
+- 管理操作は型付きの操作として定義されており、任意の method/params を通す
+  経路はありません。同一ユーザーのローカル socket だけでは人の存在として
+  扱いません。
+- `ownmeshd` は常にユーザー権限です。任意の特権ブローカーはネットワークア
+  クセスを持たず、必要な場合だけ別途導入します:
 
 ```bash
 sudo ownmesh privileged install && ownmesh service install
 ```
 
-Windows では Administrator PowerShell で `ownmesh privileged install` を実行し、
-通常ユーザーに戻って `ownmesh service install` を実行します。
+(Windows では最初のコマンドを Administrator PowerShell で、次を通常ユーザー
+で実行します。)
 
-## 実装と実機証跡の区別
+- Full Access に隠れた hard deny はありません。選択した policy の
+  allow/ask/deny は記載どおりに適用されます。
 
-Windows x64、macOS arm64/x64、Linux musl arm64/x64 の portable archive を
-対象に、LICENSE/NOTICE/release notes、CycloneDX SBOM、SHA-256 checksum、必須の
-minisign 署名、GitHub build provenance を生成します。
+## リリース保証と未完了項目
 
-ネットワークレス特権ブローカーの lifecycle は Linux / macOS / Windows に
-実装済みです。Linux は root 実機 receipt 取得済みですが、macOS/Windows の
-native release receipt と、公開 MCP → installed Agent → broker の E8 receipt は
-未取得です。これらの経路を実機証明済みとは表現しません。Authenticode、Apple
-notarization、MSI/NSIS、macOS native package は v1.2.16 の対象外です。
+リリースは Windows x64 / macOS arm64・x64 / Linux musl arm64・x64 の
+portable archive で提供され、SHA-256 checksum、minisign 署名、CycloneDX
+SBOM、GitHub build provenance が付きます。
 
-ChatGPT の動的登録、OAuth、passkey return、refresh、MCP link は手動の live
-互換 receipt があります。local workerd suite は再現可能ですが、外部 ChatGPT を
-含む完全自動 E10 receipt は今後の検証項目です。
+検証済みのことと、まだ残っていること:
 
-## 開発ゲート
+- ネットワークレス特権ブローカーの lifecycle は 3 OS 実装済みです。Linux
+  は root 実機 receipt を取得済み。macOS/Windows の native receipt と
+  MCP → Agent → broker の一連の receipt は未取得で、実機証明済みとは表現し
+  ません。
+- ChatGPT の動的登録・OAuth・passkey return・refresh・MCP link には手動の
+  live 互換性 receipt があります。完全自動の外部検証は今後の項目です。
+- Authenticode、Apple notarization、MSI/NSIS、macOS native package はこの
+  リリース列の対象外です。
+
+## 開発
+
+Rust 1.92 / Node 22 / pnpm 9.15.0 をリポジトリ側で固定しています。品質ゲー
+ト:
 
 ```bash
 cargo fmt --all --check
@@ -188,6 +161,8 @@ pnpm -r typecheck
 pnpm -r lint
 ```
 
+セットアップと PR の方針は [CONTRIBUTING](./CONTRIBUTING.md) を参照。
+
 ## ドキュメント
 
 - [English README](./README.md)
@@ -197,7 +172,7 @@ pnpm -r lint
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [ロードマップ](./docs/ROADMAP.md) — 次に何をやり、何をやらないか
-- [v1.2.16 release notes](./docs/RELEASE_NOTES_v1.2.16.md)
+- [v1.2.22 release notes](./docs/RELEASE_NOTES_v1.2.22.md)
 - [目標仕様](./OWNMESH_SPECIFICATION.ja.md) — 将来ロードマップの正本
 
 ## ライセンス

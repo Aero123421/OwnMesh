@@ -264,6 +264,23 @@ Paths are canonicalized; unsafe links, writable locations, and descriptor
 injection are rejected. Descriptor writes are atomic and success is reported
 only after an OS probe confirms the state.
 
+### Linux session lifetime (lingering)
+
+The systemd `--user` service runs inside your login session. OwnMesh never
+enables lingering automatically, so on a Linux desktop the agent — and with it
+the ChatGPT route — stops when you log out and starts only after you log in
+again. `ownmesh doctor` warns while `Linger=no`. For an always-on device,
+enable it yourself once:
+
+```bash
+loginctl enable-linger $USER
+```
+
+Note: with lingering enabled, an unattended boot cannot unlock your desktop
+keyring. Device credentials that live in the Secret Service may fail to load
+until you log in; doctor discloses this as metadata only and never reads the
+keychain.
+
 ## Optional privileged broker
 
 Install the separate, networkless broker only when privileged commands are

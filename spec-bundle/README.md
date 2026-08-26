@@ -21,6 +21,7 @@ and TypeScript sides agreeing.
 | `schemas/errors.schema.json` | `ownmesh-domain` error taxonomy tests, `errors.test.ts` |
 | `schemas/protocol-envelope.schema.json` | `ownmesh-protocol` envelope tests, `fixtures-roundtrip.test.ts` |
 | `schemas/operation-envelope.schema.json` | `ownmesh-protocol` operation contract tests |
+| `schemas/workspace-registry.schema.json` | `ownmesh-protocol` registry schema test, `packages/ownmesh-schema` `schema-files.test.ts` — payload contract for `ready.workspace_registry` and the incremental `workspace.registry` refresh ([ADR 0014](../docs/adr/0014-agent-initiated-workspace-registry-refresh.md)) |
 | `examples/fixtures/*.json` | Round-tripped by Rust and TypeScript against the schemas above |
 
 ## Specification targets (not shipped contracts)

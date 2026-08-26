@@ -133,6 +133,33 @@ const ALL_SCHEMA_KEYS = [
   ...WORKSPACE_SCHEMA_KEYS,
 ] as const;
 
+test("RFC 9728 protected-resource metadata is served at origin and /mcp path", async () => {
+  const origin = await worker.fetch(
+    new Request("https://cp.test/.well-known/oauth-protected-resource"),
+    readyEnv(),
+    ctx,
+  );
+  const mcp = await worker.fetch(
+    new Request("https://cp.test/.well-known/oauth-protected-resource/mcp"),
+    readyEnv(),
+    ctx,
+  );
+  assert.equal(origin.status, 200);
+  assert.equal(mcp.status, 200);
+  const originBody = (await origin.json()) as {
+    resource?: string;
+    authorization_servers?: string[];
+  };
+  const mcpBody = (await mcp.json()) as {
+    resource?: string;
+    authorization_servers?: string[];
+  };
+  assert.equal(originBody.resource, "https://cp.test");
+  assert.deepEqual(originBody.authorization_servers, ["https://cp.test"]);
+  assert.equal(mcpBody.resource, "https://cp.test/mcp");
+  assert.deepEqual(mcpBody.authorization_servers, ["https://cp.test"]);
+});
+
 test("/health is D1-free liveness; concurrent /health/ready checks coalesce one bounded scan", async () => {
   let queryCount = 0;
   const { store } = openStoreWith(allMigrationFiles(), () => {

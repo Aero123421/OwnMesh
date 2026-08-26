@@ -19,7 +19,7 @@ mod schema;
 mod store;
 
 pub use error::{ConfigError, ConfigResult};
-pub use paths::OwnMeshPaths;
+pub use paths::{install_path_overrides, path_overrides, OwnMeshPaths, PathOverrides};
 pub use schema::{
     redact_control_plane_url, valid_instance_id, validate_control_plane_base_url, InstanceConfig,
     OwnMeshConfig, PolicyFile, ServiceSocketConfig, TelemetryConfig, UpdateConfig,

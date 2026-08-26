@@ -66,7 +66,10 @@ export type ErrorCode =
   | "OWNMESH_E_STALE_SNAPSHOT"
   | "OWNMESH_E_CONTROLLER_CONFLICT"
   | "OWNMESH_E_SESSION_NOT_CONTROLLER"
+  | "OWNMESH_E_JOURNAL_CAPACITY"
+  | "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED"
   | "OWNMESH_E_PROFILE_UNAVAILABLE"
+  | "OWNMESH_E_EXECUTABLE_FORMAT"
   | "OWNMESH_E_INTERNAL";
 
 export type ExitCode = 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
@@ -96,8 +99,11 @@ export function errorExitCode(code: ErrorCode): ExitCode {
     case "OWNMESH_E_STALE_SNAPSHOT":
     case "OWNMESH_E_CONTROLLER_CONFLICT":
     case "OWNMESH_E_SESSION_NOT_CONTROLLER":
+    case "OWNMESH_E_JOURNAL_CAPACITY":
+    case "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED":
       return 7;
     case "OWNMESH_E_PROFILE_UNAVAILABLE":
+    case "OWNMESH_E_EXECUTABLE_FORMAT":
       return 8;
     case "OWNMESH_E_INTERNAL":
       return 9;
@@ -109,6 +115,8 @@ export function errorRetryable(code: ErrorCode): boolean {
     code === "OWNMESH_E_DEVICE_OFFLINE" ||
     code === "OWNMESH_E_TIMEOUT" ||
     code === "OWNMESH_E_CONFLICT" ||
+    code === "OWNMESH_E_JOURNAL_CAPACITY" ||
+    code === "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED" ||
     code === "OWNMESH_E_INTERNAL"
   );
 }
