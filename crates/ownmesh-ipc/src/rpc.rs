@@ -458,4 +458,9 @@ pub mod app_error {
     pub const TRANSITION_RECOVERY_REQUIRED: i64 = -32_017;
     /// The resolved executable cannot be launched by the target OS (for example Win32 error 193).
     pub const EXECUTABLE_FORMAT: i64 = -32_018;
+    /// The request would execute an OwnMesh binary that re-enters this daemon's
+    /// IPC. Running it would deadlock the runtime lock the daemon holds across
+    /// the child's lifetime, stalling every later request for the device
+    /// (#160), so it is refused before spawn.
+    pub const SELF_REENTRANT_EXEC: i64 = -32_019;
 }
