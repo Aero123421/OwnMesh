@@ -142,6 +142,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   const b = await buildCanonicalAction({
@@ -151,6 +152,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   assert.equal(await hashCanonicalAction(a), await hashCanonicalAction(b));
@@ -165,6 +167,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   assert.notEqual(await hashCanonicalAction(a), await hashCanonicalAction(c));
@@ -178,6 +181,7 @@ test("bindCanonicalAction includes operation_id, expires_at, claim_version", asy
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_a",
   });
   const expiresAt = "2030-01-01T00:00:00.000Z";
@@ -212,11 +216,11 @@ test("principal credential generation is durable, rotates on credential changes,
 
     const before = await buildCanonicalAction({
       toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
-      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 2,
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 2, principalRevocationEpoch: 1,
     });
     const after = await buildCanonicalAction({
       toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
-      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3,
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3, principalRevocationEpoch: 1,
     });
     assert.notEqual(await hashCanonicalAction(before), await hashCanonicalAction(after));
     assert.equal(
@@ -259,7 +263,10 @@ test("principal credential generation is durable, rotates on credential changes,
   }
 });
 
-test("idempotency retry converges on the original operation across credential rotation", async () => {
+// #162: the E3 redelivery gate spans real wall-clock time, so it is the gate a
+// routine 15-minute rotation actually crosses. A refresh must not terminate a
+// queued operation; a revocation still must.
+test("idempotency retry survives a routine refresh and still dies on revocation", async () => {
   const store = new MemoryStore();
   const tok = await seedAuthed(store);
   const deviceId = "dev_e3_rotation_retry";
@@ -273,12 +280,12 @@ test("idempotency retry converges on the original operation across credential ro
       return { status: "dispatch_uncertain" };
     },
   };
-  const call = async (idempotencyKey: string, id: number) => {
+  const call = async (idempotencyKey: string, id: number, accessToken: string) => {
     const response = await handleMcp(
       new Request("https://cp.test/mcp", {
         method: "POST",
         headers: {
-          authorization: `Bearer ${tok.access_token}`,
+          authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({
@@ -308,28 +315,59 @@ test("idempotency retry converges on the original operation across credential ro
     return body.result?.structuredContent || {};
   };
 
-  const first = await call("idem_rotation_stable", 1);
+  const first = await call("idem_rotation_stable", 1, tok.access_token);
   const firstId = String(first.operation_id);
   assert.match(firstId, /^op_/);
   assert.equal(routed, 1);
-  assert.equal((await store.getMcpOperation(firstId))?.action?.principal_credential_generation, 1);
+  const bound = await store.getMcpOperation(firstId);
+  assert.equal(bound?.action?.principal_credential_generation, 1);
+  assert.equal(bound?.action?.principal_revocation_epoch, 1);
 
-  assert.equal(await store.advancePrincipalCredentialGeneration("prin_dev"), 2);
-  const retry = await call("idem_rotation_stable", 2);
-  assert.equal(retry.operation_id, firstId);
-  assert.equal(retry.status, "failed");
+  // A real refresh rotation: the issuance generation advances, the revocation
+  // epoch does not.
+  const rotated = await store.rotateRefresh(tok.refresh_token);
+  assert.equal(rotated.ok, true);
+  if (!rotated.ok) return;
+  const after = (await store.getPrincipal("prin_dev"))!;
+  assert.equal(after.credential_generation, 2);
+  assert.equal(after.revocation_epoch, 1);
+
+  // The retry converges on the original operation and stays deliverable. It is
+  // the *same* bound body being redelivered exactly once per retry (the first
+  // route returned dispatch_uncertain), never a second execution.
+  const refreshed = await call("idem_rotation_stable", 2, rotated.token.access_token);
+  assert.equal(refreshed.operation_id, firstId);
+  assert.equal(refreshed.status, "pending", "a routine refresh must not terminate a queued op");
+  assert.equal(routed, 2, "the original bound body is redelivered, not re-executed");
+  const stillBound = await store.getMcpOperation(firstId);
+  assert.equal(stillBound?.action?.principal_credential_generation, 1);
+  assert.equal(stillBound?.action?.principal_revocation_epoch, 1);
+
+  // Revocation is a withdrawal of authority and still terminates it.
+  assert.equal(await store.advancePrincipalRevocationEpoch("prin_dev", "explicit_revocation"), 2);
+  const revokedRetry = await call("idem_rotation_stable", 3, rotated.token.access_token);
+  assert.equal(revokedRetry.operation_id, firstId);
+  assert.equal(revokedRetry.status, "failed");
+  const error = (revokedRetry.data as { error?: Record<string, unknown> } | undefined)?.error;
+  assert.equal(error?.code, "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH");
+  assert.equal(error?.retryable, false);
+  // The bounded reason survives the public compaction, not just the durable row.
+  assert.equal((error?.details as { reason?: string } | undefined)?.reason, "explicit_revocation");
+  assert.equal(routed, 2, "a revoked operation is never dispatched again");
   assert.equal(
-    ((retry.data as { error?: { code?: string } } | undefined)?.error?.code),
-    "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+    (await store.getMcpOperation(firstId))?.action?.principal_revocation_epoch,
+    1,
+    "the old operation is never rebound to the new epoch",
   );
-  assert.equal(routed, 1, "same key must not re-execute under the new credential generation");
-  assert.equal((await store.getMcpOperation(firstId))?.action?.principal_credential_generation, 1);
 
-  const fresh = await call("idem_rotation_fresh", 3);
+  // Recovery is a *fresh* request under the current authority, never a retry of
+  // the old binding: a new key mints a distinct operation bound to the new
+  // epoch, and that one does dispatch.
+  const fresh = await call("idem_rotation_fresh", 4, rotated.token.access_token);
   const freshId = String(fresh.operation_id);
-  assert.notEqual(freshId, firstId);
-  assert.equal(routed, 2, "execution under the new generation requires a new key");
-  assert.equal((await store.getMcpOperation(freshId))?.action?.principal_credential_generation, 2);
+  assert.notEqual(freshId, firstId, "a fresh key must not converge on the terminated operation");
+  assert.equal(routed, 3);
+  assert.equal((await store.getMcpOperation(freshId))?.action?.principal_revocation_epoch, 2);
 });
 
 test("idempotency retry cannot redeliver an outbox after cancel_requested wins", async () => {
@@ -414,6 +452,7 @@ test("buildDeviceOperation always sets server payload_hash and wire binding fiel
     principalId: "prin_1",
     tenantId: "ten_1",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt,
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -503,6 +542,7 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   const firstHash = await hashCanonicalAction(firstAction);
@@ -772,6 +812,7 @@ test("command env is normalized into canonical action facts", async () => {
     principalId: "prin_env",
     tenantId: "ten_env",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
   });
   assert.deepEqual((canonical.facts as { env?: Record<string, string> }).env, {
     A: "1",
@@ -791,6 +832,7 @@ test("command env is normalized into canonical action facts", async () => {
     principalId: "prin_env",
     tenantId: "ten_env",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
   const facts = (op.bound_action.facts as { env?: Record<string, string> }).env;
@@ -937,6 +979,7 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -1664,6 +1707,7 @@ test("dispatch outbox survives large write claim (~300 KiB) and redelivers after
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",

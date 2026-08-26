@@ -196,10 +196,10 @@ export function oauthMetadata(
   return meta;
 }
 
-export function protectedResourceMetadata(resource: string) {
+export function protectedResourceMetadata(resource: string, authorizationServer = resource) {
   return {
     resource,
-    authorization_servers: [resource],
+    authorization_servers: [authorizationServer],
     scopes_supported: [
       "ownmesh.read",
       "ownmesh.write",

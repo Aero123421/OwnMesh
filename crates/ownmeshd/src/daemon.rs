@@ -86,6 +86,20 @@ async fn run_async() -> Result<(), ExitCode> {
         guard.reconcile_expired_transitions().await;
     }
 
+    // #141: live Agent-route presence, observed by the transport and exposed
+    // to doctor/system.diagnose via the runtime. Starts as Disabled and flips
+    // Offline/Online with each connect attempt / authenticated ready session.
+    let (presence_tx, presence_rx) = watch::channel(ownmesh_ipc::AgentRoutePresence::Disabled);
+    runtime.lock().await.install_route_presence(presence_rx);
+
+    // #146: device-local workspace registry changes wake the live transport
+    // to publish an incremental workspace.registry snapshot.
+    let workspace_registry_notify = Arc::new(tokio::sync::Notify::new());
+    runtime
+        .lock()
+        .await
+        .install_workspace_registry_notify(Arc::clone(&workspace_registry_notify));
+
     // P1-E review (ADR 0011): surface the effective-sandbox condition that
     // makes OwnMesh custody validation unsound BEFORE the first state access.
     // A systemd `--user` unit that forces a user namespace (PrivateUsers=yes
@@ -129,17 +143,24 @@ async fn run_async() -> Result<(), ExitCode> {
     );
 
     let (transport_shutdown, transport_shutdown_rx) = watch::channel(false);
-    let transport_task = match agent_transport::configured_transport(&paths, &cfg) {
+    let transport_task = match agent_transport::configured_transport(
+        &paths,
+        &cfg,
+        Some(workspace_registry_notify),
+    ) {
         Ok(Some(config)) => Some(tokio::spawn(agent_transport::run(
             config,
             Some(runtime),
             transport_shutdown_rx,
+            Some(presence_tx),
         ))),
         Ok(None) => {
+            drop(presence_tx);
             tracing::info!("no active enrolled device credential; remote Agent transport disabled");
             None
         }
         Err(err) => {
+            drop(presence_tx);
             // Fail closed for remote connectivity while keeping the local IPC
             // boundary available for repair/re-enrollment.
             tracing::error!(error = %err, "remote Agent transport configuration rejected");
@@ -1341,6 +1362,72 @@ mod tests {
             "replay must be the compact receipt: {second}"
         );
         assert_eq!(first["operation_id"], second["operation_id"]);
+
+        server.request_shutdown();
+        let _ = handle.await;
+    }
+
+    /// #142: a remote-style operation whose execution fails after the journal
+    /// reserve must reconcile the marker into a terminal failed receipt. A
+    /// retry with the same key replays that stored failure instead of being
+    /// refused forever as an in-progress/uncertain key, and doctor no longer
+    /// sees an in-flight marker.
+    #[tokio::test]
+    async fn failed_operation_replays_stored_failure_instead_of_stranding_marker() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+        let client = test_client(endpoint, paths.runtime_dir.clone());
+
+        {
+            let mut g = runtime.lock().await;
+            g.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        }
+
+        let key = "idem-failed-stat";
+        let first_error = client
+            .call(
+                methods::OPS_FS_STAT,
+                Some(json!({
+                    "path": "definitely-missing-path.txt",
+                    "idempotency_key": key,
+                })),
+            )
+            .await
+            .expect_err("stat of a missing path fails");
+        let failure_text = first_error.to_string();
+        assert!(
+            !failure_text.contains("in-progress or uncertain"),
+            "the original error must surface, not a journal refusal: {failure_text}"
+        );
+
+        // The journal key is reconciled: no durable in_progress marker remains.
+        {
+            let g = runtime.lock().await;
+            assert!(
+                !g.op_journal_key_is_in_progress_for_test(key),
+                "terminal failure must not strand an in_progress marker"
+            );
+        }
+
+        // A retry with the same key replays the stored failed receipt —
+        // the same definitive error, never a new side effect and never an
+        // eternal CONFLICT refusal.
+        let second_error = client
+            .call(
+                methods::OPS_FS_STAT,
+                Some(json!({
+                    "path": "definitely-missing-path.txt",
+                    "idempotency_key": key,
+                })),
+            )
+            .await
+            .expect_err("replay returns the stored failure");
+        let replay_text = second_error.to_string();
+        assert!(
+            !replay_text.contains("in-progress or uncertain"),
+            "replayed failure must not be a journal refusal: {replay_text}"
+        );
 
         server.request_shutdown();
         let _ = handle.await;

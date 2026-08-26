@@ -107,6 +107,9 @@ impl DaemonRuntime {
             generation: String::new(),
         };
         let stored = self.upsert_workspace(entry)?;
+        // #146: publish the new registry generation incrementally so the
+        // control plane can activate the workspace without a reconnect.
+        self.notify_workspace_registry_changed();
         self.append_audit(
             "workspace.add",
             Some("workspace.add"),
@@ -185,6 +188,8 @@ impl DaemonRuntime {
             self.workspaces[idx].label = if label.is_empty() { None } else { Some(label) };
         }
         self.persist_workspaces()?;
+        // #146: a root change regenerates the generation — publish it.
+        self.notify_workspace_registry_changed();
         let stored = self.workspaces[idx].clone();
         self.append_audit(
             "workspace.update",
@@ -233,6 +238,8 @@ impl DaemonRuntime {
             });
         }
         self.persist_workspaces()?;
+        // #146: removal must deactivate the workspace on the control plane.
+        self.notify_workspace_registry_changed();
         self.append_audit(
             "workspace.remove",
             Some("workspace.remove"),

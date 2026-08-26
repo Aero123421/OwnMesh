@@ -1,7 +1,7 @@
 /** Shared helpers for the OwnMesh control plane. */
 
 export const SERVICE_NAME = "ownmesh-control-plane";
-export const SERVICE_VERSION = "1.2.17";
+export const SERVICE_VERSION = "1.2.22";
 
 /** OAuth/token/device responses must not be stored by shared caches (RFC 9700). */
 export const NO_STORE_CACHE_CONTROL = "no-store, no-cache";
