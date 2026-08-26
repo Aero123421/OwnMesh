@@ -8,7 +8,7 @@ import {
   oauthMetadata,
 } from "./oauth.ts";
 import { MemoryStore } from "./store.ts";
-import { verifyPkceS256 } from "./util.ts";
+import { pkceS256Challenge, verifyPkceS256 } from "./util.ts";
 
 test("refresh token reuse is detected and family revoked", async () => {
   __test.reset();
@@ -160,6 +160,98 @@ test("authorization_code + PKCE S256 exchange", async () => {
   const tok = (await tokRes.json()) as { access_token: string; refresh_token: string };
   assert.ok(tok.access_token.startsWith("atk_"));
   assert.ok(tok.refresh_token.startsWith("rtk_"));
+});
+
+
+test("authorization code binding mismatch does not burn the code", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const verifier = "0123456789012345678901234567890123456789013";
+  const challenge = await pkceS256Challenge(verifier);
+  await store.putClient({
+    client_id: "client_retry",
+    tenant_id: "ten_default",
+    client_name: "retry",
+    redirect_uris: ["http://127.0.0.1:8750/callback"],
+    created_at: new Date().toISOString(),
+  });
+  await store.putAuthCode({
+    code: "ac_retry", client_id: "client_retry", principal_id: "prin_dev",
+    redirect_uri: "http://127.0.0.1:8750/callback", scope: "ownmesh.read",
+    code_challenge: challenge, code_challenge_method: "S256",
+    expires_at: Date.now() + 60_000, used: false,
+  });
+
+  const wrong = await handleToken(new Request("https://cp.test/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code", code: "ac_retry",
+      redirect_uri: "http://127.0.0.1:8750/callback", client_id: "client_retry",
+      code_verifier: "1123456789012345678901234567890123456789013",
+    }),
+  }), store);
+  assert.equal(wrong.status, 400);
+  assert.deepEqual(await wrong.json(), { error: "invalid_grant" });
+
+  const correct = await handleToken(new Request("https://cp.test/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code", code: "ac_retry",
+      redirect_uri: "http://127.0.0.1:8750/callback", client_id: "client_retry",
+      code_verifier: verifier,
+    }),
+  }), store);
+  assert.equal(correct.status, 200);
+});
+
+test("authorization code concurrent valid redemption succeeds exactly once", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const verifier = "concurrent-verifier-012345678901234567890123456789012345";
+  const challenge = await pkceS256Challenge(verifier);
+  await store.putClient({
+    client_id: "client_race", tenant_id: "ten_default", client_name: "race",
+    redirect_uris: ["http://127.0.0.1:8750/callback"], created_at: new Date().toISOString(),
+  });
+  await store.putAuthCode({
+    code: "ac_race", client_id: "client_race", principal_id: "prin_dev",
+    redirect_uri: "http://127.0.0.1:8750/callback", scope: "ownmesh.read",
+    code_challenge: challenge, code_challenge_method: "S256", expires_at: Date.now() + 60_000, used: false,
+  });
+  const makeRequest = () => new Request("https://cp.test/oauth/token", {
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code: "ac_race",
+      redirect_uri: "http://127.0.0.1:8750/callback", client_id: "client_race", code_verifier: verifier }),
+  });
+  const responses = await Promise.all([handleToken(makeRequest(), store), handleToken(makeRequest(), store)]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 400]);
+});
+
+test("device authorization retries user-code collisions without overwriting", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: "client_collision", tenant_id: "ten_default", client_name: "collision",
+    redirect_uris: [], created_at: new Date().toISOString(),
+  });
+  await store.putDeviceCode({
+    device_code: "existing", user_code: "BCDF-GHJK", client_id: "client_collision",
+    scope: "ownmesh.read", verification_uri: "https://cp.test/oauth/device", interval_sec: 5,
+    expires_at: Date.now() + 60_000, status: "pending",
+  });
+  const candidates = ["BCDF-GHJK", "JKLM-NPQR"];
+  const { handleDeviceAuthorization } = await import("./oauth.ts");
+  const response = await handleDeviceAuthorization(new Request("https://cp.test/oauth/device_authorization", {
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: "client_collision", scope: "ownmesh.read" }),
+  }), store, "https://cp.test", () => candidates.shift()!);
+  assert.equal(response.status, 200);
+  const body = await response.json() as { user_code: string; device_code: string };
+  assert.equal(body.user_code, "JKLM-NPQR");
+  assert.equal((await store.getDeviceCodeByUserCode("BCDF-GHJK"))?.device_code, "existing");
+  assert.equal((await store.getDeviceCodeByUserCode("JKLM-NPQR"))?.device_code, body.device_code);
 });
 
 test("ChatGPT authorization receives a rotating refresh token without offline_access", async () => {

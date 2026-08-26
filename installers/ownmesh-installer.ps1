@@ -15,6 +15,15 @@
     $ErrorActionPreference = "Stop"
     $ProgressPreference = "SilentlyContinue"
 
+    # Windows PowerShell 5.1 started from pwsh inherits Core's PSModulePath.
+    # Desktop cmdlets (Unblock-File, ConvertFrom-Json) then fail to auto-load
+    # because Core's Microsoft.PowerShell.Utility is tried first. Keep the 5.1
+    # system module directory first; do not load user-writable module paths.
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $desktopModules = [IO.Path]::GetFullPath((Join-Path $PSHOME "Modules"))
+        $env:PSModulePath = $desktopModules
+    }
+
     $Repository = "Aero123421/OwnMesh"
     $RequestedVersion = if ($env:OWNMESH_VERSION) { $env:OWNMESH_VERSION } else { "latest" }
     $InstallDir = if ($env:OWNMESH_INSTALL_DIR) {
@@ -135,6 +144,175 @@
         }
     }
 
+    function Get-OwnMeshFileSha256 {
+        param([Parameter(Mandatory)][string]$LiteralPath)
+        if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) {
+            throw "SHA-256 target is not a file: $LiteralPath"
+        }
+        # Do not use the Utility-module file-hash cmdlet: it is missing when
+        # Windows PowerShell 5.1 inherits a Core PSModulePath.
+        $stream = [IO.File]::Open(
+            $LiteralPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        try {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $bytes = $sha.ComputeHash($stream)
+                return ([BitConverter]::ToString($bytes)).Replace("-", "").ToLowerInvariant()
+            } finally {
+                $sha.Dispose()
+            }
+        } finally {
+            $stream.Dispose()
+        }
+    }
+
+    function Invoke-OwnMeshSchTasks {
+        param(
+            [Parameter(Mandatory)][ValidateSet("Query", "End", "Run")][string]$Action,
+            [Parameter(Mandatory)][string]$TaskName
+        )
+
+        if ($TaskName -cnotin @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
+            throw "Refusing unlisted scheduled task name"
+        }
+
+        # Windows PowerShell 5.1 wraps native stderr as NativeCommandError. With
+        # $ErrorActionPreference Stop that becomes terminating even under *>$null,
+        # so a missing OwnMesh scheduled task aborted upgrades. Route through cmd
+        # and temporarily ignore native errors; only the exit code is authoritative.
+        $previousEap = $ErrorActionPreference
+        $previousNative = $null
+        if (Test-Path -LiteralPath variable:PSNativeCommandUseErrorActionPreference) {
+            $previousNative = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        try {
+            $ErrorActionPreference = "Continue"
+            cmd.exe /c "schtasks.exe /$Action /TN `"$TaskName`" 1>nul 2>nul" | Out-Null
+            return $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousEap
+            if ($null -ne $previousNative) {
+                $PSNativeCommandUseErrorActionPreference = $previousNative
+            }
+        }
+    }
+
+    function Stop-InstalledOwnMeshProcesses {
+        param(
+            [Parameter(Mandatory)][string]$TargetDir,
+            [Parameter(Mandatory)][string[]]$BinaryNames
+        )
+
+        $allowed = @{}
+        foreach ($name in $BinaryNames) {
+            $path = [IO.Path]::GetFullPath((Join-Path $TargetDir $name))
+            $allowed[$path] = $true
+        }
+
+        # Do not execute the pre-existing binary: the signed payload has not
+        # replaced it yet. Stop only known scheduled-task names and processes
+        # whose kernel-reported executable path exactly matches this install.
+        $serviceWasRunning = $false
+        $matching = @()
+        foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
+            try {
+                $path = $process.Path
+                if (-not $path) { continue }
+                $full = [IO.Path]::GetFullPath($path)
+                if (-not $allowed.ContainsKey($full)) { continue }
+                $matching += $process
+                if ([IO.Path]::GetFileName($full).Equals(
+                    "ownmeshd.exe",
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $serviceWasRunning = $true
+                }
+            } catch {
+                # An uninspectable process is never selected by name alone.
+            }
+        }
+
+        $serviceTaskPresent = $false
+        foreach ($taskName in @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
+            if ((Invoke-OwnMeshSchTasks -Action Query -TaskName $taskName) -eq 0) {
+                $serviceTaskPresent = $true
+            }
+        }
+        if ($serviceWasRunning -and -not $serviceTaskPresent) {
+            throw "A manually started ownmeshd.exe is running outside the installed user service; stop it and retry"
+        }
+        foreach ($taskName in @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
+            $null = Invoke-OwnMeshSchTasks -Action End -TaskName $taskName
+        }
+        foreach ($process in $matching) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+
+        $deadline = [DateTime]::UtcNow.AddSeconds(8)
+        do {
+            $remaining = @()
+            foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
+                try {
+                    if ($process.Path) {
+                        $full = [IO.Path]::GetFullPath($process.Path)
+                        if ($allowed.ContainsKey($full)) { $remaining += $process }
+                    }
+                } catch {}
+            }
+            if ($remaining.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+
+        if ($remaining.Count -gt 0) {
+            $names = ($remaining | ForEach-Object { $_.ProcessName }) -join ", "
+            throw "OwnMesh processes did not stop before update: $names"
+        }
+        return $serviceWasRunning
+    }
+
+    function Restore-OwnMeshBackup {
+        param(
+            [Parameter(Mandatory)][string]$TargetDir,
+            [Parameter(Mandatory)][string]$BackupDir,
+            [Parameter(Mandatory)][string[]]$BinaryNames
+        )
+
+        foreach ($name in $BinaryNames) {
+            $target = Join-Path $TargetDir $name
+            $backup = Join-Path $BackupDir $name
+            if (-not (Test-Path -LiteralPath $backup -PathType Leaf)) {
+                if (Test-Path -LiteralPath $target) {
+                    Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+                }
+                continue
+            }
+            $restore = Join-Path $TargetDir (".{0}.restore-{1}-{2}" -f $name, $PID, ([Guid]::NewGuid().ToString('N')))
+            Copy-Item -LiteralPath $backup -Destination $restore -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $target) {
+                $item = Get-Item -LiteralPath $target -Force
+                if (-not (Test-Path -LiteralPath $target -PathType Leaf) -or
+                    ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "Rollback refused unsafe target for $name"
+                }
+                $failed = Join-Path $TargetDir (".{0}.failed-{1}-{2}" -f $name, $PID, ([Guid]::NewGuid().ToString('N')))
+                [IO.File]::Replace($restore, $target, $failed, $true)
+                Remove-Item -LiteralPath $failed -Force -ErrorAction Stop
+            } else {
+                Move-Item -LiteralPath $restore -Destination $target -ErrorAction Stop
+            }
+            $actual = Get-OwnMeshFileSha256 -LiteralPath $target
+            $expected = Get-OwnMeshFileSha256 -LiteralPath $backup
+            if ($actual -ne $expected) {
+                throw "Rollback verification failed for $name"
+            }
+        }
+    }
+
     function Get-ChecksumFromSums {
         param(
             [Parameter(Mandatory)][string]$SumsPath,
@@ -170,7 +348,7 @@
         Assert-SafeUrl $PinnedMinisignUrl
         $archive = Join-Path $BootstrapDir "minisign-0.11-win64.zip"
         Invoke-WebRequest -Uri $PinnedMinisignUrl -OutFile $archive -UseBasicParsing
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+        $actual = Get-OwnMeshFileSha256 -LiteralPath $archive
         if ($actual -ne $PinnedMinisignSha256) {
             throw "pinned minisign bootstrap SHA-256 mismatch"
         }
@@ -438,6 +616,7 @@
     $stagedFiles = @()
     $replacedBins = @()
     $keepBackup = $false
+    $serviceWasRunning = $false
 
     try {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
@@ -471,7 +650,7 @@
         Assert-MinisignSums -SumsPath $sums -SigPath $sig -PubKeyPath $pubKey -MinisignPath $minisignPath
 
         $expected = Get-ChecksumFromSums -SumsPath $sums -AssetName $asset
-        $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-OwnMeshFileSha256 -LiteralPath $archive
         if ($actual -ne $expected) {
             throw "SHA-256 mismatch for $asset (expected $expected, got $actual)"
         }
@@ -486,6 +665,13 @@
                 throw "Partial extract: missing $bin"
             }
             $resolved[$bin] = $direct
+        }
+
+        if (Test-Path -LiteralPath (Join-Path $InstallDir "ownmesh.exe") -PathType Leaf) {
+            Write-Host "Stopping running OwnMesh components for upgrade..."
+            $serviceWasRunning = Stop-InstalledOwnMeshProcesses `
+                -TargetDir $InstallDir `
+                -BinaryNames $RequiredBinaries
         }
 
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -550,8 +736,8 @@
                         } else {
                             Move-Item -LiteralPath $restoreStaged -Destination $restorePath -ErrorAction Stop
                         }
-                        $restoredHash = (Get-FileHash -LiteralPath $restorePath -Algorithm SHA256).Hash
-                        $backupHash = (Get-FileHash -LiteralPath $bak -Algorithm SHA256).Hash
+                        $restoredHash = Get-OwnMeshFileSha256 -LiteralPath $restorePath
+                        $backupHash = Get-OwnMeshFileSha256 -LiteralPath $bak
                         if ($restoredHash -ne $backupHash) {
                             throw "Rollback verification failed for $bin"
                         }
@@ -578,10 +764,6 @@
             throw
         }
 
-        if (Test-Path -LiteralPath $backupDir) {
-            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
-        }
-
         $env:Path = "$InstallDir;$env:Path"
         if ($env:OWNMESH_NO_MODIFY_PATH -notin @("1", "true", "TRUE", "yes", "YES")) {
             $userPath = [string][Environment]::GetEnvironmentVariable("Path", "User")
@@ -604,10 +786,56 @@
             }
         }
 
-        $ownmeshPath = Join-Path $InstallDir "ownmesh.exe"
-        $installedVersion = & $ownmeshPath --version
-        if ($LASTEXITCODE -ne 0) {
-            throw "Installed binary did not start (--version smoke failed)"
+        try {
+            $ownmeshPath = Join-Path $InstallDir "ownmesh.exe"
+            $installedVersion = & $ownmeshPath --version
+            if ($LASTEXITCODE -ne 0) {
+                throw "Installed binary did not start (--version smoke failed)"
+            }
+            if ($serviceWasRunning) {
+                & $ownmeshPath --json service start *> $null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Updated OwnMesh service did not restart"
+                }
+                Start-Sleep -Milliseconds 500
+                $statusText = (& $ownmeshPath --json status | Out-String)
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Updated OwnMesh daemon did not become ready"
+                }
+                $status = $statusText | ConvertFrom-Json
+                $expectedVersion = ($installedVersion -split '\s+')[-1]
+                if ($status.daemon.version -ne $expectedVersion) {
+                    throw "Updated OwnMesh daemon version did not match the CLI"
+                }
+            }
+        } catch {
+            $postInstallError = $_.Exception.Message
+            $rollbackFailed = $false
+            try {
+                $null = Stop-InstalledOwnMeshProcesses `
+                    -TargetDir $InstallDir `
+                    -BinaryNames $RequiredBinaries
+                Restore-OwnMeshBackup `
+                    -TargetDir $InstallDir `
+                    -BackupDir $backupDir `
+                    -BinaryNames $RequiredBinaries
+                if ($serviceWasRunning) {
+                    if ((Invoke-OwnMeshSchTasks -Action Run -TaskName "OwnMesh-ownmeshd") -ne 0) {
+                        $null = Invoke-OwnMeshSchTasks -Action Run -TaskName "OwnMesh\ownmeshd"
+                    }
+                }
+            } catch {
+                $rollbackFailed = $true
+            }
+            if ($rollbackFailed) {
+                $keepBackup = $true
+                throw "Post-install verification failed and rollback failed; backup retained at $backupDir. $postInstallError"
+            }
+            throw "Post-install verification failed; previous binaries restored. $postInstallError"
+        }
+
+        if (Test-Path -LiteralPath $backupDir) {
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
         }
         Write-Host "Installed $installedVersion to $ownmeshPath"
         foreach ($bin in $RequiredBinaries) {

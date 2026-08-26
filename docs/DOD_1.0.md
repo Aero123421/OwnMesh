@@ -1,8 +1,8 @@
 # OwnMesh 1.x Definition of Done — release-quality audit
 
-**Release train:** v1.2.7
+**Release train:** v1.2.16
 
-**Audit date:** 2026-08-12
+**Audit date:** 2026-08-19
 
 **Authority:** `OWNMESH_SPECIFICATION.ja.md` §33 and the shipped-surface registry
 
@@ -11,7 +11,7 @@
 
 ## Conclusion
 
-OwnMesh v1.2.7 is a stable release for the product surface admitted by the
+OwnMesh v1.2.16 is a stable release for the product surface admitted by the
 machine-checked registry. The Rust unsupported registries and the manifest both
 contain zero intentionally unimplemented CLI surfaces. Parser acceptance alone
 does not count: the admitted commands have fail-closed handlers and the relevant
@@ -21,13 +21,13 @@ This scoped completeness claim is deliberately narrower than §33 of the full
 target specification. Native code signing/notarization, some cross-platform
 privileged-route receipts, a fully automated external ChatGPT receipt, and an
 independent security review remain separate evidence or packaging work. Those
-items do not make implemented v1.2.7 commands “beta”, but they also must not be
+items do not make implemented v1.2.16 commands “beta”, but they also must not be
 reported as completed proof.
 
 Legend: **done** = shipped behavior and repository evidence cover the item ·
 **partial** = useful shipped behavior exists, but the broader specification or
 external evidence is incomplete · **out of scope** = explicitly not part of the
-v1.2.7 stable product surface.
+v1.2.16 stable product surface.
 
 ## §33 DoD (18 items)
 
@@ -40,17 +40,17 @@ v1.2.7 stable product surface.
 | 5 | Normal Chat read/write/command/session tools | **done** | Public MCP routing and bounded `ownmesh mcp serve --stdio` are implemented with authenticated issuer binding, bounded messages, and no local-routing fallback. |
 | 6 | CLI/TUI set Full User / Full Access | **done** | No-argument TUI launch, setup policy selection, typed presets, and structured policy mutation are supported. Sensitive mutation uses fresh passkey approval. |
 | 7 | Privileged Broker per OS | **partial** | Networkless native lifecycle is implemented on Linux, macOS, and Windows while `ownmeshd` remains unprivileged. Linux has a native root receipt; macOS/Windows native release receipts and the full public E8 route remain open evidence. |
-| 8 | Generic command + arbitrary CLI PTY | **done** | Local exact-argv execution, authenticated remote exec/session creation, PTY lifecycle, bounded replay, process-tree termination, and explicit idempotency are supported. Raw shell is an explicit mode and never silently replaces structured execution. |
-| 9 | Official 9 profiles conformance | **done** | Nine structured adapters, device detection, persistent profile sessions, public MCP routing, and CLI scan/list/show/login/test/start/resume are implemented. |
-| 10 | Session observer/controller handoff | **done** | Session list/show/attach/claim/release/give/close/terminate, observer ACLs, expiring controller leases, durable handoff, and bounded replay are shipped and regression-tested. |
+| 8 | Generic command + arbitrary CLI PTY | **done** | Local exact-argv execution, authenticated remote exec/session creation, PTY lifecycle, bounded replay, process-tree termination, and explicit idempotency are supported. Raw shell is an explicit mode and never silently replaces structured execution. v1.2.16 binds command approval to the exact invocation entry, canonical backing identity, classification, and `argv[0]`; drift returns `OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT`, and generic/review command spawn consumes a prepared executable whose verified image remains under custody through OS spawn (ADR 0013). Completed op-journal receipts have a bounded 30-day terminal lifecycle (ADR 0010), with fail-closed persistence/recovery and schema-stable compact receipts. Default interactive sessions resolve their shell through the same shared resolver as detection/execution, so a bare `cmd.exe` that a workspace/current-directory file could shadow is rewritten to the absolute system path. Windows batch shims (`.cmd`/`.bat`) are classified `raw_shell` (their content is shell semantics), so a raw_shell-denying policy cannot authorize them. |
+| 9 | Official 9 profiles conformance | **done** | Nine structured adapters, device detection, persistent profile sessions, public MCP routing, and CLI scan/list/show/login/test/start/resume are implemented. Detection and launch share one deterministic resolver (PATHEXT-aware on Windows, user-local dirs on Linux). |
+| 10 | Session observer/controller handoff | **done** | Session list/show/attach/claim/release/give/close/terminate, observer ACLs, expiring controller leases, durable handoff, and bounded replay are shipped and regression-tested. Journal-health surfacing (system.diagnose + doctor) covers transition and op-journal state, and controller-mutating, terminal, and sidecar-input operations are fenced while a session transition is unresolved. |
 | 11 | TUI en/ja/zh-Hans/ru | **done** | The Ratatui UI and no-argument CLI handoff ship with en-US, ja-JP, zh-Hans, and ru-RU resources plus locale/snapshot coverage. |
-| 12 | R2/TURN relay default disabled | **done** | Relay is absent/disabled by default and the fail-closed invariant is tested. LAN/P2P discovery depth is not required for the v1.2.7 transfer route. |
+| 12 | R2/TURN relay default disabled | **done** | Relay is absent/disabled by default and the fail-closed invariant is tested. LAN/P2P discovery depth is not required for the v1.2.16 transfer route. |
 | 13 | Central telemetry default disabled | **done** | Setup defaults telemetry off; doctor and update keep network access off unless configured or explicitly requested. |
 | 14 | Local file/log not cloud-persisted by default | **done** | Local-first defaults are regression-tested. Transfer persists only explicitly requested bounded artifact pages and excludes credentials/private key material. |
-| 15 | Policy allow/ask/deny + temporary grant | **done** | Typed policy show/validate/explain/preset/rule mutation, exact approval decisions, and bounded temporary grants are shipped. Unsafe generic command/shell grants are deliberately refused while one-shot approval remains available. |
+| 15 | Policy allow/ask/deny + temporary grant | **done** | Typed policy show/validate/explain/preset/rule mutation, exact approval decisions, bounded temporary grants, and distinct bounded tool grants (`grant_type: "bounded_tool"`, ADR 0012) are shipped. Temporary grants still refuse `command.*`. Bounded grants lift **Ask** only (Deny wins, including recommended/workspace_only `command.run`) with an explicit tool allowlist, TTL ≤ 4h, and optional max-use. Batch `/approve` binds a server-side payload-hash commitment; deny-all needs no passkey. |
 | 16 | Device revoke, lockdown, token revoke | **done** | Device lifecycle, lockdown/unlock, and typed token revoke are implemented. Security-sensitive recovery/mutation requires fresh operation-bound passkey approval. |
 | 17 | Security tests, fuzz, audit, SBOM, signed update | **partial** | Blocking CI/security gates, fuzz targets, strict SBOM generation, signed update, and fail-closed release dependencies ship. Independent external review and native platform signing remain open. |
-| 18 | Apache-2.0, SECURITY, CONTRIBUTING, threat model | **done** | Repository policy and security documentation exist and distinguish stable product scope from aspirational specification scope. |
+| 18 | Apache-2.0, SECURITY, CONTRIBUTING, threat model | **done** | Repository policy and security documentation exist and distinguish stable product scope from aspirational specification scope. v1.2.16 documents prepared executable custody and exact invocation binding (ADR 0013), scoped systemd --user reconciliation (ADR 0011), and bounded op-journal retention (ADR 0010). |
 
 ## Release-quality gates
 
@@ -66,7 +66,7 @@ v1.2.7 stable product surface.
   release is forbidden. Provenance is attested by GitHub.
 - `scripts/check_release_quality.py` checks the publish graph, fail-closed
   workflow patterns, toolchain/version alignment, release-note selection, and
-  the registry-backed surface manifest. For v1.2.7 the unsupported counts are
+  the registry-backed surface manifest. For v1.2.16 the unsupported counts are
   zero and `completeness_claim` is true.
 - Release tags are annotated. Per
   [ADR 0001](./adr/0001-release-signing-sbom-provenance.md) they are also
@@ -90,10 +90,10 @@ v1.2.7 stable product surface.
 | W-E8-RECEIPTS | macOS/Windows native broker receipt and full public privileged route | Implementation and unit/loopback evidence do not substitute for the missing opt-in native/public receipts. |
 | W-E10-AUTO | Automated external ChatGPT exercise | Manual live compatibility plus local reproducible suites do not equal a fully automated third-party receipt. |
 | W-EXT-SEC | Independent external security review | Internal tests and review do not constitute an independent audit. |
-| W-PACKAGING | MSI/NSIS and native/universal macOS package | Portable signed archives and verified one-line installers are the v1.2.7 distribution contract. |
+| W-PACKAGING | MSI/NSIS and native/universal macOS package | Portable signed archives and verified one-line installers are the v1.2.16 distribution contract. |
 
 These caveats disclose evidence and scope. They do not reclassify implemented,
-registry-admitted v1.2.7 commands as unsupported, and they do not convert a
+registry-admitted v1.2.16 commands as unsupported, and they do not convert a
 broader §33 **partial** row into **done**.
 
 ## Required regression invariants

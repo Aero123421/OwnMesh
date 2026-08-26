@@ -35,12 +35,78 @@ impl ServicePaths {
     fn runtime_str(&self) -> String {
         self.runtime_dir.canonical.display().to_string()
     }
+
+    /// `ownmeshd` arguments that bind the daemon to the validated install-time
+    /// layout, as typed values rather than shell text.
+    ///
+    /// Windows Scheduled Task actions carry no environment block, so the same
+    /// binding the systemd unit and LaunchAgent express through
+    /// `OWNMESH_*_DIR` travels here as arguments. An injection-prone
+    /// `cmd /c set … &&` wrapper is deliberately avoided (#148).
+    #[must_use]
+    pub fn daemon_run_args(&self) -> Vec<String> {
+        vec![
+            "run".to_string(),
+            "--config-dir".to_string(),
+            self.config_str(),
+            "--state-dir".to_string(),
+            self.state_str(),
+            "--runtime-dir".to_string(),
+            self.runtime_str(),
+        ]
+    }
 }
 
 /// Render a systemd --user unit.
 ///
 /// Docs: https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html
 /// User units: https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#User%20Unit%20Search%20Path
+/// Sandboxing semantics: systemd.exec(5) documents that the filesystem
+/// namespacing directives (`ProtectSystem=`, `ProtectHome=`, `ReadWritePaths=`,
+/// `ReadOnlyPaths=`, `InaccessiblePaths=`, `PrivateTmp=`, `PrivateDevices=`,
+/// `ProtectKernelTunables=`, `ProtectControlGroups=`, `ProtectClock=`,
+/// `ProtectHostname=`, `BindPaths=`, `TemporaryFileSystem=`, …) are *only*
+/// available for system services, or for services in per-user instances of the
+/// service manager **in which case `PrivateUsers=` is implicitly enabled**
+/// (systemd NEWS v254: “They now imply PrivateUsers=yes, … processes/files
+/// will appear as owned by 'nobody' in the user unit”; the exact option set is
+/// `exec_context_need_unprivileged_private_users()` / `exec_needs_cap_sys_admin()`
+/// in systemd's src/core/execute.c, which differs across releases).
+///
+/// That user namespace maps **every** host uid outside the namespace — host
+/// root and every other host user alike — to the overflow uid 65534 and omits
+/// the root mapping in per-user instances, so OwnMesh custody validation
+/// cannot distinguish a host-root-owned system directory from an
+/// attacker-owned one inside it. Accepting the overflow uid would let a
+/// foreign-owned 0755/01777 ancestor pass and its owner could replace the
+/// daemon's state directory (A5 cross-user boundary; v1.2.13 review). The
+/// shipped unit therefore does **not** force a user namespace, and custody
+/// validation stays byte-for-byte strict (every state/config ancestor must be
+/// owned by the daemon's uid or host root; see ADR 0011). A local drop-in
+/// that re-adds `PrivateUsers=yes` or the namespacing directives fails closed
+/// at startup with `ancestor is owned by untrusted uid 65534` and is
+/// disclosed by `ownmesh doctor`.
+///
+/// Directive selection is empirical and version-qualified (verified with
+/// `systemd-run --user -p …` on systemd v259): `ProtectProc=invisible`
+/// (hidepid= on the unit's /proc instance) boots in a --user service without
+/// forcing a user namespace (uid_map stays `0 0 4294967295`); systemd.exec(5)
+/// documents it as system-only, so on versions where it is not applied it
+/// degrades to a no-op, never a boot failure. `ProtectClock=`,
+/// `ProtectKernelLogs=`, `ProtectKernelModules=` and any
+/// `CapabilityBoundingSet=` value fail user-service startup with exit status
+/// 218/CAPABILITIES on systemd v259 *even under* `PrivateUsers=yes` (verified
+/// empirically; systemd's exit-status table documents 218 as “Failed to drop
+/// capabilities”), so they are omitted — on other systemd versions/kernels
+/// they may apply, but a unit that breaks boot on current Ubuntu cannot be
+/// the shipped default. `ProtectHome=` is omitted because a read-only home
+/// conflicts with the registered-workspace model.
+/// `MemoryDenyWriteExecute=yes` is omitted because it breaks JIT runtimes
+/// (Node/V8) that spawned sessions rely on. `RestrictNamespaces=yes` blocks
+/// namespace-creation syscalls for the whole service including sessions; a
+/// session that needs them (rootless podman, docker, unshare, bwrap) can be
+/// enabled with a local drop-in that sets `RestrictNamespaces=no` —
+/// `ownmesh doctor` discloses the effective unit.
 #[must_use]
 #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub fn render_systemd_user_unit(paths: &ServicePaths) -> String {
@@ -53,6 +119,9 @@ pub fn render_systemd_user_unit(paths: &ServicePaths) -> String {
 Description=OwnMesh user-level device agent (ownmeshd)
 Documentation=https://github.com/Aero123421/OwnMesh
 After=default.target
+# A fail-closed custody check must not restart every 3s forever.
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -64,10 +133,64 @@ Environment=OWNMESH_STATE_DIR="{state}"
 Environment=OWNMESH_RUNTIME_DIR="{runtime}"
 # User-level only — never elevate.
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths="{config}" "{state}" "{runtime}"
-PrivateTmp=true
+# v1.2.13 reconciled --user sandbox (ADR 0011). This is a SCOPED
+# reconciliation, not a complete OS-level sandbox: the unit provides
+# process-level and proc-visibility confinement only, and deliberately
+# provides NO filesystem confinement (no ProtectSystem=/ProtectHome=/
+# ReadWritePaths=/PrivateTmp=; no systemd workspace allow-list — filesystem
+# governance is the daemon's own custody validation plus the
+# registered-workspace model). systemd.exec(5) documents
+# that the filesystem namespacing directives (ProtectSystem=/ProtectHome=/
+# ReadWritePaths=/PrivateTmp=/ProtectKernelTunables=/ProtectControlGroups=/
+# ProtectHostname=/…) are only available for system services, or for
+# per-user services in which case PrivateUsers= is implicitly enabled
+# (systemd NEWS v254; the exact option set is
+# exec_context_need_unprivileged_private_users() /
+# exec_needs_cap_sys_admin() in systemd's src/core/execute.c, and it differs
+# across releases). That user namespace maps every host uid outside the
+# namespace — host root and every other host user alike — to the overflow
+# uid 65534, so OwnMesh custody validation cannot distinguish a
+# host-root-owned system directory from an attacker-owned one inside it.
+# Accepting the overflow uid would let a foreign-owned 0755/01777 ancestor
+# pass and its owner could replace the daemon's state directory (A5
+# cross-user boundary), so the shipped unit does NOT force a user namespace
+# and custody stays byte-for-byte strict. A local drop-in that re-adds
+# PrivateUsers=yes or the namespacing directives fails closed at startup
+# with `ancestor is owned by untrusted uid 65534` and is disclosed by
+# `ownmesh doctor`.
+#
+# Shipped hardening (all available in an unprivileged --user service
+# without a user namespace):
+#   * ProtectProc=invisible — hidepid= on the unit's /proc instance
+#     (verified to boot on systemd v259; systemd.exec(5) documents it as
+#     system-only, so on versions where it is not applied it degrades to a
+#     no-op, never a boot failure).
+#   * Process-level guards: UMask=0077, RestrictSUIDSGID=true,
+#     RestrictRealtime=true, LockPersonality=true,
+#     SystemCallArchitectures=native, RestrictNamespaces=yes.
+#
+# Version/privilege-qualified omissions (verified empirically on systemd
+# v259, unprivileged --user): `ProtectClock=`, `ProtectKernelLogs=`,
+# `ProtectKernelModules=` and any `CapabilityBoundingSet=` value (including
+# the empty set) fail startup with exit status 218/CAPABILITIES even under
+# PrivateUsers=yes, because applying them needs capabilities the --user
+# manager does not have (systemd.exec(5) documents that an unset
+# CapabilityBoundingSet= leaves the bounding set unmodified; the login
+# session's set is inherited unchanged). `ProtectHome=` is omitted because
+# a read-only home conflicts with the registered-workspace model;
+# `MemoryDenyWriteExecute=yes` is omitted because it breaks JIT runtimes
+# (Node/V8) that spawned sessions rely on. `RestrictNamespaces=yes` blocks
+# namespace-creation syscalls for the whole service including sessions; a
+# session that needs them (rootless podman, docker, unshare, bwrap) can be
+# enabled with a local drop-in that sets `RestrictNamespaces=no` —
+# `ownmesh doctor` discloses the effective unit.
+ProtectProc=invisible
+UMask=0077
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictNamespaces=yes
 
 [Install]
 WantedBy=default.target
@@ -125,15 +248,12 @@ pub fn render_launch_agent_plist(paths: &ServicePaths) -> String {
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub fn render_scheduled_task_xml(paths: &ServicePaths) -> String {
     let exe = xml_escape(&paths.exe_str());
-    // Command line: quoted exe + run
-    let args = xml_escape("run");
-    let config = xml_escape(&paths.config_str());
-    let state = xml_escape(&paths.state_str());
-    let runtime = xml_escape(&paths.runtime_str());
-    // Environment via cmd wrapper is avoided; Task Scheduler supports little env
-    // injection safely. We pass env through a tiny wrapper command line using
-    // `cmd /c set ...&&` is injection-prone — instead document that ownmeshd
-    // discovers default user paths. Still embed WorkingDirectory.
+    // A Task Scheduler action carries no environment block, and a
+    // `cmd /c set … &&` wrapper would be injection-prone. The install-time
+    // layout therefore travels as typed `ownmeshd run` arguments, exactly as
+    // the `/TR` fallback builds them, so both registration paths bind the same
+    // daemon context (#148).
+    let args = xml_escape(&windows_task_arguments(paths));
     let workdir = {
         let p = paths
             .executable
@@ -143,7 +263,6 @@ pub fn render_scheduled_task_xml(paths: &ServicePaths) -> String {
             .unwrap_or_default();
         xml_escape(&p)
     };
-    let _ = (config, state, runtime); // reserved for future Task env support
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -195,11 +314,30 @@ pub fn render_scheduled_task_xml(paths: &ServicePaths) -> String {
     )
 }
 
+/// Windows task argument string (everything after the executable).
+///
+/// Shared by the XML `<Arguments>` element and the `/TR` fallback so the two
+/// registration paths are behaviorally identical.
+#[must_use]
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub fn windows_task_arguments(paths: &ServicePaths) -> String {
+    paths
+        .daemon_run_args()
+        .iter()
+        .map(|arg| quote_windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Build the Windows `schtasks /TR` action string with safe quoting.
 #[must_use]
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub fn windows_task_run_command(paths: &ServicePaths) -> String {
-    format!("{} run", quote_windows_arg(&paths.exe_str()))
+    format!(
+        "{} {}",
+        quote_windows_arg(&paths.exe_str()),
+        windows_task_arguments(paths)
+    )
 }
 
 #[cfg(test)]
@@ -264,6 +402,141 @@ mod tests {
         assert!(!unit.contains("User=root"));
     }
 
+    /// v1.2.13 regression (ADR 0011 update): the shipped user unit must NOT
+    /// force a user namespace. The filesystem namespacing directives
+    /// (PrivateUsers=yes, ProtectSystem=full, PrivateTmp=yes,
+    /// ProtectKernelTunables=yes, ProtectControlGroups=yes,
+    /// ProtectHostname=yes, ReadWritePaths=, …) implicitly enable
+    /// `PrivateUsers=` in a per-user service (systemd NEWS v254;
+    /// systemd.exec(5)), which maps every host uid outside the namespace —
+    /// host root and every other host user alike — to the overflow uid
+    /// 65534. OwnMesh custody validation cannot distinguish a
+    /// host-root-owned system directory from an attacker-owned one inside
+    /// that namespace, so accepting the overflow uid would let a
+    /// foreign-owned 0755/01777 ancestor pass and its owner could replace
+    /// the daemon's state directory (A5 cross-user boundary). The unit must
+    /// keep the process-level guards and ProtectProc=invisible, and must not
+    /// ship any directive that forces the user namespace.
+    #[test]
+    fn systemd_unit_keeps_no_userns_sandbox_with_process_guards() {
+        let (_dir, sp) = sample_paths();
+        let unit = render_systemd_user_unit(&sp);
+        // The process-level guards and ProtectProc=invisible must be present.
+        for directive in [
+            "ProtectProc=invisible",
+            "NoNewPrivileges=true",
+            "UMask=0077",
+            "RestrictSUIDSGID=true",
+            "RestrictRealtime=true",
+            "LockPersonality=true",
+            "SystemCallArchitectures=native",
+            "RestrictNamespaces=yes",
+            "StartLimitIntervalSec=30",
+            "StartLimitBurst=5",
+        ] {
+            assert!(
+                unit.lines().any(|line| line.trim_start() == directive),
+                "unit must keep {directive}:
+{unit}"
+            );
+        }
+        // The unit must not force a user namespace: any of these directives
+        // implicitly enables PrivateUsers= in a per-user service, hiding real
+        // uids and making custody validation unsound (v1.2.13 review).
+        for directive in [
+            "PrivateUsers=",
+            "ProtectSystem=",
+            "ProtectHome=",
+            "ReadWritePaths=",
+            "ReadOnlyPaths=",
+            "InaccessiblePaths=",
+            "PrivateTmp=",
+            "ProtectKernelTunables=",
+            "ProtectControlGroups=",
+            "ProtectHostname=",
+            "PrivateDevices=",
+            "BindPaths=",
+            "TemporaryFileSystem=",
+        ] {
+            let present_as_directive = unit
+                .lines()
+                .any(|line| line.trim_start().starts_with(directive));
+            assert!(
+                !present_as_directive,
+                "unit must not ship userns-forcing directive {directive}:
+{unit}"
+            );
+        }
+        // Version/privilege-qualified omissions: these fail a --user service
+        // with 218/CAPABILITIES on systemd v259 even under PrivateUsers=yes
+        // (verified empirically; systemd.exec(5) exit-status table).
+        for directive in [
+            "ProtectClock=",
+            "ProtectKernelLogs=",
+            "ProtectKernelModules=",
+            "CapabilityBoundingSet=",
+        ] {
+            let present_as_directive = unit
+                .lines()
+                .any(|line| line.trim_start().starts_with(directive));
+            assert!(
+                !present_as_directive,
+                "unit must not ship start-breaking directive {directive} on v259:
+{unit}"
+            );
+        }
+        // MemoryDenyWriteExecute= breaks JIT runtimes spawned sessions rely on.
+        assert!(
+            !unit
+                .lines()
+                .any(|line| line.trim_start().starts_with("MemoryDenyWriteExecute=")),
+            "unit must not ship MemoryDenyWriteExecute=:
+{unit}"
+        );
+        // The comment must cite systemd.exec(5) and the v259 qualification so
+        // a future edit cannot silently re-introduce broken directives.
+        assert!(
+            unit.contains("systemd.exec(5)") && unit.contains("v259"),
+            "unit comments must cite systemd.exec(5) and the empirical version:
+{unit}"
+        );
+    }
+
+    /// P1-E review (registered-workspace reconciliation): the shipped unit
+    /// must never restrict the user/workspace hierarchy. Workspaces are
+    /// dynamically registered anywhere under the user's home, so the unit
+    /// must not ship `ProtectHome=`/`ReadOnlyPaths=`/`InaccessiblePaths=`/
+    /// `ProtectSystem=` (all of which would also force the user namespace and
+    /// break custody, see ADR 0011), and the unit comment must document that
+    /// filesystem governance is the daemon's custody validation plus the
+    /// registered-workspace model.
+    #[test]
+    fn systemd_unit_keeps_registered_workspace_model_writable() {
+        let (_dir, sp) = sample_paths();
+        let unit = render_systemd_user_unit(&sp);
+        for directive in [
+            "ProtectHome=",
+            "ProtectSystem=",
+            "ReadOnlyPaths=",
+            "InaccessiblePaths=",
+            "ReadWritePaths=",
+        ] {
+            let present = unit
+                .lines()
+                .any(|line| line.trim_start().starts_with(directive));
+            assert!(
+                !present,
+                "unit must not confine the registered-workspace hierarchy with {directive}:\n{unit}"
+            );
+        }
+        // The comment must state the workspace-model reconciliation so a
+        // future edit cannot silently re-introduce home-restricting directives.
+        assert!(
+            unit.contains("registered-workspace model"),
+            "unit comments must document the registered-workspace reconciliation:\n{unit}"
+        );
+    }
+
     #[test]
     fn launch_agent_is_user_agent_not_daemon() {
         let (_dir, sp) = sample_paths();
@@ -288,7 +561,48 @@ mod tests {
         // Must not *run as* LocalSystem (description may mention it negatively).
         assert!(!xml.contains("<UserId>LocalSystem</UserId>"));
         assert!(!xml.contains("HighestAvailable"));
+    }
+
+    /// #148: the Windows task must bind the daemon to the same validated
+    /// config/state/runtime directories the installing CLI used, and the XML
+    /// import and `/TR` fallback must register the identical action.
+    #[test]
+    fn scheduled_task_binds_install_time_paths_in_both_registration_paths() {
+        let (_dir, sp) = sample_paths();
+        let xml = render_scheduled_task_xml(&sp);
         let tr = windows_task_run_command(&sp);
-        assert!(tr.ends_with(" run"));
+        let arguments = windows_task_arguments(&sp);
+
+        for flag in ["--config-dir", "--state-dir", "--runtime-dir"] {
+            assert!(xml.contains(flag), "task XML must carry {flag}:\n{xml}");
+            assert!(tr.contains(flag), "/TR fallback must carry {flag}: {tr}");
+        }
+        for dir in [
+            sp.config_dir.canonical.display().to_string(),
+            sp.state_dir.canonical.display().to_string(),
+            sp.runtime_dir.canonical.display().to_string(),
+        ] {
+            assert!(
+                xml.contains(&xml_escape(&dir)),
+                "task XML must bind {dir}:\n{xml}"
+            );
+            assert!(tr.contains(&dir), "/TR fallback must bind {dir}: {tr}");
+        }
+        // Both registration paths derive from one argument builder, so they
+        // cannot drift apart.
+        assert!(
+            tr.ends_with(&arguments),
+            "/TR fallback must end with the shared arguments: {tr}"
+        );
+        assert!(
+            xml.contains(&format!(
+                "<Arguments>{}</Arguments>",
+                xml_escape(&arguments)
+            )),
+            "task XML arguments must equal the shared arguments:\n{xml}"
+        );
+        // No shell wrapper: a `cmd /c set … &&` form would be injection-prone.
+        assert!(!tr.to_ascii_lowercase().contains("cmd /c"), "{tr}");
+        assert!(!xml.to_ascii_lowercase().contains("cmd /c"), "{xml}");
     }
 }

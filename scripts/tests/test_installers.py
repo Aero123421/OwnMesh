@@ -689,6 +689,226 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("Refusing existing reparse point", text)
         self.assertIn("[IO.File]::Replace", text)
         self.assertIn("Move-InstalledBinary", text)
+        self.assertIn("Stop-InstalledOwnMeshProcesses", text)
+        self.assertIn("Invoke-OwnMeshSchTasks", text)
+        self.assertIn("Get-OwnMeshFileSha256", text)
+        self.assertIn("Restore-OwnMeshBackup", text)
+        self.assertIn("Updated OwnMesh daemon version did not match the CLI", text)
+        # Windows PowerShell 5.1 NativeCommandError must not reach schtasks.exe.
+        self.assertNotRegex(text, r"(?m)^\s*& schtasks\.exe\b")
+        self.assertIn('cmd.exe /c "schtasks.exe /$Action /TN `"$TaskName`" 1>nul 2>nul"', text)
+        # Hashing and Desktop cmdlets must not depend on Get-FileHash auto-load
+        # when powershell.exe inherits a pwsh Core PSModulePath.
+        self.assertNotRegex(text, r"(?im)\bGet-FileHash\b")
+        self.assertIn('[Security.Cryptography.SHA256]::Create()', text)
+        self.assertIn('Join-Path $PSHOME "Modules"', text)
+
+    def test_windows_ps1_schtasks_helper_missing_task_on_powershell_51(self) -> None:
+        if not _is_windows():
+            self.skipTest("Windows PowerShell 5.1 only")
+        powershell = shutil.which("powershell")
+        if not powershell:
+            self.skipTest("powershell.exe not available")
+        text = PS_INSTALLER.read_text(encoding="utf-8")
+        start = text.find("function Invoke-OwnMeshSchTasks")
+        self.assertNotEqual(start, -1, "Invoke-OwnMeshSchTasks helper is missing")
+        end = text.find("function Stop-InstalledOwnMeshProcesses", start)
+        self.assertGreater(end, start, "could not bound Invoke-OwnMeshSchTasks")
+        snippet = (
+            text[start:end]
+            + "$ErrorActionPreference = 'Stop'\n"
+            + "Set-StrictMode -Version Latest\n"
+            + "$primary = Invoke-OwnMeshSchTasks -Action Query -TaskName 'OwnMesh-ownmeshd'\n"
+            + "$alt = Invoke-OwnMeshSchTasks -Action Query -TaskName 'OwnMesh\\ownmeshd'\n"
+            + "Write-Output \"query-primary=$primary\"\n"
+            + "Write-Output \"query-alt=$alt\"\n"
+            + "cmd.exe /c \"schtasks.exe /Query /TN `\"OwnMesh-DoesNotExist-XYZ`\" 1>nul 2>nul\" | Out-Null\n"
+            + "Write-Output \"query-fake=$LASTEXITCODE\"\n"
+            + "if ($LASTEXITCODE -eq 0) { throw 'synthetic missing task must not look present' }\n"
+        )
+        completed = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                snippet,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        combined = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, combined)
+        self.assertIn("query-primary=", combined)
+        self.assertIn("query-fake=", combined)
+        self.assertNotIn("NativeCommandError", combined)
+        self.assertNotIn("指定されたファイルが見つかりません", combined)
+
+    def test_windows_ps1_sha256_helper_with_core_psmodulepath(self) -> None:
+        if not _is_windows():
+            self.skipTest("Windows PowerShell 5.1 only")
+        powershell = shutil.which("powershell")
+        if not powershell:
+            self.skipTest("powershell.exe not available")
+        text = PS_INSTALLER.read_text(encoding="utf-8")
+        start = text.find("function Get-OwnMeshFileSha256")
+        self.assertNotEqual(start, -1, "Get-OwnMeshFileSha256 helper is missing")
+        end = text.find("function Invoke-OwnMeshSchTasks", start)
+        self.assertGreater(end, start, "could not bound Get-OwnMeshFileSha256")
+        with tempfile.TemporaryDirectory(prefix="ownmesh-sha256-") as tmp:
+            sample = Path(tmp) / "payload.bin"
+            sample.write_bytes(b"ownmesh-sha256-probe\n")
+            expected = _sha256(sample)
+            snippet = (
+                text[start:end]
+                + "$ErrorActionPreference = 'Stop'\n"
+                + "Set-StrictMode -Version Latest\n"
+                + f"$actual = Get-OwnMeshFileSha256 -LiteralPath '{sample}'\n"
+                + "Write-Output \"sha256=$actual\"\n"
+            )
+            env = os.environ.copy()
+            # Same leak a pwsh parent gives powershell.exe on GitHub Actions.
+            env["PSModulePath"] = str(Path(tmp) / "core-modules-only")
+            completed = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    snippet,
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            self.assertIn(f"sha256={expected}", combined.lower())
+            self.assertNotIn("CommandNotFoundException", combined)
+
+    def test_unix_installer_restarts_a_stale_deleted_inode_daemon(self) -> None:
+        """#150: a running ownmeshd whose image was replaced must be restarted.
+
+        Linux reports such a process as `<path> (deleted)` in `/proc/<pid>/exe`.
+        The installer previously compared that link for exact equality, missed
+        the stale daemon, and skipped both the restart and the live version
+        check while still reporting success.
+        """
+        if _is_windows() or platform.system() != "Linux":
+            self.skipTest("/proc (deleted) semantics are Linux-specific")
+        if not SH_INSTALLER.is_file():
+            self.fail("missing sh installer")
+        asset_name, windows = _asset_name()
+        if windows:
+            self.skipTest("not unix host")
+
+        with tempfile.TemporaryDirectory(prefix="ownmesh-stale-daemon-") as tmp:
+            tmp_path = Path(tmp)
+            package = tmp_path / "pkg"
+            assets = tmp_path / "assets"
+            install = tmp_path / "install"
+            trace = tmp_path / "cli-calls.log"
+
+            # `ownmesh` records every subcommand so the test can prove the
+            # restart and version health check ran; `ownmeshd` just blocks.
+            _write_fake_bins(package, windows=False)
+            (package / "ownmesh").write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{trace}"\n'
+                'if [ "$1" = "--version" ]; then echo "ownmesh 1.1.0-test"; exit 0; fi\n'
+                'if [ "$1" = "--json" ] && [ "$2" = "status" ]; then\n'
+                '  echo \'{"version":"1.1.0-test"}\'; exit 0\n'
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            (package / "ownmesh").chmod(0o755)
+            # `/proc/<pid>/exe` names the mapped ELF image, so the daemon
+            # fixture must be a real binary rather than a shell script (whose
+            # link would point at the interpreter instead of the install dir).
+            sleep_binary = shutil.which("sleep")
+            if sleep_binary is None:
+                self.skipTest("no sleep binary to use as an ELF daemon fixture")
+            shutil.copyfile(sleep_binary, package / "ownmeshd")
+            (package / "ownmeshd").chmod(0o755)
+            pub, _sec = _pack(package, assets, asset_name, windows=False)
+
+            env = os.environ.copy()
+            env["OWNMESH_ASSET_DIR"] = str(assets)
+            env["OWNMESH_INSTALL_DIR"] = str(install)
+            env["OWNMESH_NO_MODIFY_PATH"] = "1"
+            env["OWNMESH_MINISIGN_PUB"] = str(pub)
+            env.pop("OWNMESH_BASE_URL", None)
+
+            first = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+
+            # Start the installed daemon, then replace its executable so the
+            # kernel marks the still-mapped inode as deleted.
+            daemon = subprocess.Popen(
+                [str(install / "ownmeshd"), "120"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                link = Path(f"/proc/{daemon.pid}/exe")
+                while time.monotonic() < deadline and not link.exists():
+                    time.sleep(0.05)
+
+                replacement = tmp_path / "replacement-ownmeshd"
+                replacement.write_text(
+                    "#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n"
+                )
+                replacement.chmod(0o755)
+                os.replace(replacement, install / "ownmeshd")
+
+                self.assertTrue(
+                    os.readlink(link).endswith(" (deleted)"),
+                    "fixture did not reproduce the stale-inode state",
+                )
+
+                trace.write_text("", encoding="utf-8")
+                second = subprocess.run(
+                    ["sh", str(SH_INSTALLER)],
+                    cwd=str(ROOT),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            finally:
+                daemon.kill()
+                daemon.wait(timeout=10)
+
+            calls = trace.read_text(encoding="utf-8").splitlines()
+            self.assertIn(
+                "service restart",
+                calls,
+                f"stale daemon was not restarted; CLI calls were {calls}",
+            )
+            self.assertIn(
+                "--json status",
+                calls,
+                f"daemon version health check was skipped; CLI calls were {calls}",
+            )
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
@@ -712,6 +932,16 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("tar -xOzf", text)
         # OwnMesh payload extract must stream single members (`$member`), not full-archive xzf.
         self.assertIn('tar -xOzf "$archive" "$member"', text)
+        self.assertIn("SERVICE_WAS_RUNNING", text)
+        self.assertIn('"$INSTALL_DIR/ownmesh" service restart', text)
+        self.assertIn("updated daemon health check failed; previous binaries restored", text)
+        # A stale daemon whose executable was replaced still reports its old
+        # inode via `/proc/<pid>/exe` with a " (deleted)" suffix (#150). The
+        # suffix must be stripped for the pathname comparison, and matching must
+        # remain path-based rather than by process name.
+        self.assertIn("proc_exe_is_install_daemon", text)
+        self.assertIn('*" (deleted)") candidate="${candidate% (deleted)}" ;;', text)
+        self.assertNotIn("pgrep -x ownmeshd 2>/dev/null || true)\n      SERVICE_WAS_RUNNING", text)
         self.assertNotRegex(
             text,
             r'(?m)^(?!\s*#)\s*tar\s+-xzf\s+"\$archive"\s*$',
@@ -783,6 +1013,34 @@ class InstallerAdversarialTests(unittest.TestCase):
                 self.assertEqual(smoke.returncode, 0, smoke.stdout + smoke.stderr)
                 self.assertIn(binary, smoke.stdout.lower())
                 self.assertIn(expected_version, smoke.stdout)
+
+            # The published one-liner uses Windows PowerShell 5.1, often from a
+            # pwsh parent that leaks Core's PSModulePath. Keep the inherited
+            # env so a missing scheduled task and missing Get-FileHash both
+            # stay non-fatal on the upgrade stop path.
+            powershell51 = shutil.which("powershell")
+            if powershell51:
+                completed51 = subprocess.run(
+                    [
+                        powershell51,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(PS_INSTALLER),
+                    ],
+                    cwd=str(ROOT),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                combined51 = completed51.stdout + completed51.stderr
+                self.assertEqual(completed51.returncode, 0, combined51)
+                self.assertIn("Stopping running OwnMesh components for upgrade", combined51)
+                self.assertNotIn("NativeCommandError", combined51)
 
             # A file reparse point must be rejected before replacing any target.
             reparse_install = tmp_path / "reparse-install"

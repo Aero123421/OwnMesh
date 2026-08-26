@@ -26,7 +26,10 @@ ownmesh-diagnostics = { path = "../ownmesh-diagnostics" }
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
+ownmesh-exec = { path = "../ownmesh-exec" }
 ownmesh-persist = { path = "../ownmesh-persist" }
+ownmesh-profiles = { path = "../ownmesh-profiles" }
+ownmesh-transition-journal = { path = "../ownmesh-transition-journal" }
 ownmesh-policy = { path = "../ownmesh-policy" }
 ownmesh-protocol = { path = "../ownmesh-protocol" }
 ownmesh-update = { path = "../ownmesh-update" }
@@ -76,3 +79,6 @@ tokio = { version = "1.43.0", features = [
     "sync",
     "time",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process", "system"] }

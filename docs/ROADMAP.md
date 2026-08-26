@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.7 · **Last updated:** 2026-08-13
+**Baseline:** v1.2.16 · **Last updated:** 2026-08-25
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -61,6 +61,10 @@ These are the `W-*` waivers. The code exists; the receipt does not.
 - **Cloud-side policy documents.** [ADR 0008](./adr/0008-control-plane-authorization-scopes-and-binding.md)
   explains why the device is the only policy engine today. A multi-admin tenant
   that needs server-side restriction is the use case that would justify one.
+- ~~Agent-initiated workspace registry refresh.~~ **Done (v1.2.21):**
+  [ADR 0014](./adr/0014-agent-initiated-workspace-registry-refresh.md) added the
+  incremental `workspace.registry` message, closing the
+  `workspace_not_available` window for brand-new device-local workspaces.
 - **LAN discovery and direct P2P transfer depth** (`W-§12`). Relay stays off by
   default regardless.
 - **External adapter SDK** (§13.7) for community CLI adapters as separate

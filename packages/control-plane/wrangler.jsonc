@@ -19,7 +19,11 @@
     // public callbacks are stateless; all other registrations require a tenant token.
     "ALLOW_DYNAMIC_CLIENT_REGISTRATION": "true",
     // Optional comma-separated WebSocket origins in addition to OAUTH_ISSUER.
-    "OWNMESH_ALLOWED_ORIGINS": ""
+    "OWNMESH_ALLOWED_ORIGINS": "",
+    // Per-tenant durable MCP operation row cap. Invalid values fall back to 20000.
+    "MCP_OPS_MAX_PER_TENANT": "20000",
+    // Synchronous command timeout clamp in milliseconds. Invalid values fall back to 300000.
+    "MCP_MAX_TIMEOUT_MS": "300000"
     // SESSION_SECRET and the one-time passkey bootstrap hash OWNER_TOKEN_HASH
     // must be provided via Wrangler secrets.
     // AUTH_PROVIDER is optional when built-in single-owner auth is configured.

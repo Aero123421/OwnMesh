@@ -83,6 +83,58 @@ pub fn write_atomically(target: &Path, data: &[u8]) -> io::Result<()> {
     write_atomically_with(target, data, |_| Ok(()))
 }
 
+/// Durably copy `source` into a unique sibling and atomically replace `target`.
+///
+/// The target is never pre-deleted. The source is streamed into a write-capable
+/// temporary handle, synced, and only then published by sibling replacement.
+/// `prepare` can set final permissions before the file is synced.
+///
+/// # Errors
+///
+/// Returns only errors that occur before the atomic replacement commits.
+pub fn copy_atomically_with<F>(source: &Path, target: &Path, prepare: F) -> io::Result<u64>
+where
+    F: FnOnce(&File) -> io::Result<()>,
+{
+    let parent = ParentDirectory::open(target)?;
+    let (tmp, mut output) = create_unique_temp(target)?;
+    prepare(&output)?;
+    let mut input = File::open(source)?;
+    let expected = input.metadata()?.len();
+    let copied = io::copy(&mut input, &mut output)?;
+    if copied != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "atomic copy source length changed during read",
+        ));
+    }
+    output.sync_all()?;
+    drop(output);
+    drop(input);
+    parent.sync_before_commit()?;
+    replace_sibling(&tmp, target)?;
+    parent.sync_after_commit();
+    Ok(copied)
+}
+
+/// Sync the parent directory containing `path` where the platform exposes a
+/// durable directory handle. This is a no-op on platforms without that API.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be opened or synced.
+pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(parent_path(path))?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Publish `data` at `target` only if the target does not already exist.
 ///
 /// The complete, synced bytes are first written to a per-operation unique sibling. A hard-link

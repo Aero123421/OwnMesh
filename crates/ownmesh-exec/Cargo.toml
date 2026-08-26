@@ -11,7 +11,8 @@ description = "ownmesh-exec"
 readme = "README.md"
 
 # Windows exposes the configured OEM code page only through a tiny FFI surface.
-# Keep it local to the decoder rather than spawning a shell or guessing a locale.
+# Linux descriptor execution also requires one pre_exec closure that performs
+# only safe nix::fexecve over preallocated values. Both are scoped by ADR 0013.
 [lints.rust]
 unsafe_code = "allow"
 
@@ -31,10 +32,15 @@ sha2 = "0.10"
 hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["process"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
+nix = { version = "0.28", default-features = false, features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Globalization"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tempfile = "3"
