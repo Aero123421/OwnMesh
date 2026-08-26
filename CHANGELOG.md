@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v1.2.23 — Availability, workspace authority, and dependency refresh
+
+v1.2.23 is the first formal release after v1.2.21. The v1.2.22 source train
+below was prepared on `main`, but no v1.2.22 tag or GitHub Release was
+published; v1.2.23 therefore includes every v1.2.22 lifecycle, endpoint, and
+session fix as well as the changes in this section.
+
 Mitigates the concrete failure modes reproduced from the 2026-08-25 production
 session (#158–#162) and the reopened Linux session regression (#31). These
 changes do not claim every issue acceptance criterion is complete: live
@@ -56,6 +63,25 @@ tracked in their original issues.
   continuation returns `OWNMESH_E_AUTHORIZATION_REFRESHED` with
   `retryable: true` and `next_action: resubmit` instead of a bare
   `retryable: false` a caller cannot act on (#162).
+
+### Workspace registry and approval authority
+
+- A live Agent publishes `workspace.registry` changes only after the Control
+  Plane has durably written the new generation to D1 and the DeviceRoom state;
+  only then is `workspace.registry.ack` emitted. The Agent validates and accepts
+  that strict live ACK, so a successful acknowledgement can no longer outrun
+  authoritative activation or be confused with a reconnect-only handshake
+  (#165).
+- Approval decisions are bound to the target operation's original workspace ID
+  and Control Plane version. DeviceRoom resolves the target operation again at
+  final delivery, revalidates its workspace generation, and terminally refuses
+  the target if an administrator removed and recreated that workspace while the
+  approval was pending. The routing-only `workspace_id` is removed before the
+  strict runtime schema is invoked, so transport metadata cannot masquerade as
+  an approved runtime argument (#165).
+- Unix workspace-registry lock descriptors are opened close-on-exec. Persistent
+  session sidecars can no longer inherit the daemon's registry lock and keep a
+  restarted daemon from acquiring it after the original process exits (#165).
 
 ### Diagnosis and catalog compatibility
 
@@ -116,6 +142,33 @@ tracked in their original issues.
   also executes a real restricted platform binary and retargets its mutable
   proxy after preparation to prove the attacker-controlled invocation is never
   reopened.
+
+### Dependency and CI maintenance
+
+- Rust dependencies were updated with their regression suites kept green:
+  `hmac` 0.13, `chacha20poly1305` 0.11, `jsonschema` 0.50,
+  `thiserror` 2.0.20, `unicode-width` 0.2.2, `windows-sys` 0.61.2,
+  `base64` 0.23.1, `zip` 8.6.0, and the test-only `minisign` 0.9.1
+  (#72, #74–#81).
+- The Worker toolchain moved to Wrangler 4.123.0 and
+  `@cloudflare/workers-types` 5.20260817.1 (#130, #131). GitHub Actions moved to
+  the reviewed releases of `setup-node`, `checkout`, `download-artifact`,
+  `action-gh-release`, and `gitleaks-action` (#66–#70).
+- Dependabot proposals for Node 26 types (#73) and `portable-pty` 0.9 on Windows
+  (#82) were deliberately not merged: OwnMesh still supports Node 22.6+, and
+  Windows remains pinned to `portable-pty` 0.8.1 because 0.9 reintroduces the
+  documented ConPTY cursor-query hang.
+
+### Release verification
+
+- The Nightly real-binary suite now follows the authoritative ready-handshake
+  contract, waits on public transfer states rather than runner timing, uses the
+  production default IPC endpoint resolver, and preserves per-daemon logs.
+  E1, E2/E3, and E9 cover live workspace activation, PTY/review receipts,
+  restart/resume from a durable non-zero transfer cursor, partial cancellation,
+  and durable-state secret/material exclusion (#165).
+
+See `docs/RELEASE_NOTES_v1.2.23.md` for details.
 
 ## v1.2.22 — Service lifecycle, endpoint, and session honesty
 
