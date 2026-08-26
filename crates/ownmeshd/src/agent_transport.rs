@@ -3037,6 +3037,11 @@ fn map_request_to_method(
     // Optional recovery/admin approval decision notification from the control plane.
     // Local policy remains authoritative; this is not a ChatGPT attestation.
     if request.capability == "approval.decision" || action == "approval.decision" {
+        // The workspace/version already participated in exact-action verification,
+        // while the deferred request is bound again by its original payload hash.
+        // Do not leak the routing-only workspace field into the strict runtime
+        // approval schema (`deny_unknown_fields`).
+        args.remove("workspace_id");
         return Ok(("__approval_decision__", Value::Object(args)));
     }
 
@@ -6419,6 +6424,9 @@ mod tests {
             .insert("workspace_version".into(), json!(7));
         refresh_bound_hash(&mut request);
         assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+        let (method, params) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, "__approval_decision__");
+        assert!(params.get("workspace_id").is_none());
     }
 
     #[test]
