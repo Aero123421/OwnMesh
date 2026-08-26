@@ -27,9 +27,10 @@ pub use device_key::{
 pub use error::{IdentityError, IdentityResult};
 pub use secret::{SecretBytes, SecretPurpose, SecretString};
 pub use store::{
-    EncryptedFileKeystore, LegacyMirrorCleanupReport, MemorySecretStore, OsKeychainStore,
-    PreferredSecretStore, PreferredSecretStoreReport, PreferredStoreFallbackPolicy,
-    ResidualFallbackKind, ResidualFallbackSecret, SecretStore,
+    CredentialStoreDiagnosticSnapshot, EncryptedFileKeystore, LegacyMirrorCleanupReport,
+    MemorySecretStore, OsKeychainStore, PreferredSecretStore, PreferredSecretStoreReport,
+    PreferredStoreFallbackPolicy, ResidualFallbackKind, ResidualFallbackSecret, SecretStore,
+    CREDENTIAL_STORE_DIAGNOSTIC_FILE,
 };
 
 /// Stable crate name used by diagnostics and tests.

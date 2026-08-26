@@ -19,14 +19,14 @@ mod schema;
 mod store;
 
 pub use error::{ConfigError, ConfigResult};
-pub use paths::OwnMeshPaths;
+pub use paths::{install_path_overrides, path_overrides, OwnMeshPaths, PathOverrides};
 pub use schema::{
     redact_control_plane_url, valid_instance_id, validate_control_plane_base_url, InstanceConfig,
     OwnMeshConfig, PolicyFile, ServiceSocketConfig, TelemetryConfig, UpdateConfig,
     CONFIG_SCHEMA_VERSION, INSTANCE_ID_SYNTAX,
 };
 pub use store::{
-    acquire_config_policy_tx_lock, appears_secret_free, atomic_write,
+    acquire_config_policy_tx_lock, appears_secret_free, atomic_write, atomic_write_without_backup,
     ensure_config_policy_consistent, load_config, load_policy, recover_config_policy_transaction,
     save_config, save_config_and_policy_transactional, save_policy, ConfigPolicyTransaction,
     ConfigPolicyTxLock,

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 const MAX_REMOTE_TEXT_BYTES: usize = 4_096;
 const MAX_REMOTE_ARGS: usize = 64;
-const MAX_REMOTE_TIMEOUT_MS: u64 = 300_000;
+const MAX_REMOTE_TIMEOUT_MS: u64 = 3_600_000;
 
 pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
     run_exec_with(
@@ -39,7 +39,7 @@ where
         .timeout_ms
         .is_some_and(|value| value == 0 || value > MAX_REMOTE_TIMEOUT_MS)
     {
-        return emit_validation(cli, "timeout-ms must be between 1 and 300000");
+        return emit_validation(cli, "timeout-ms must be between 1 and 3600000");
     }
     if args.raw_shell && args.elevated {
         return emit_validation(cli, "--elevated is available only for structured commands");

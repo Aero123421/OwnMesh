@@ -102,12 +102,26 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
       // of trusting an independent payload value.
       protocol_version: "untrusted-payload-value",
       remote_routing_enabled: true,
+      pending_correlations: ["op_terminal_from_agent"],
+      workspace_registry: {
+        enforce_workspace: true,
+        workspaces: [
+          { id: "ws_repo", generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+          { id: "ws_default", generation: "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+        ],
+      },
     }),
   );
   assert.deepEqual(ready.authenticated_agent, {
     agent_version: "1.2.5",
     protocol_version: PROTOCOL,
+    workspaces: [
+      { id: "ws_default", generation: "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      { id: "ws_repo", generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    ],
+    enforce_workspace: true,
   });
+  assert.deepEqual(ready.agent_pending_correlations, ["op_terminal_from_agent"]);
   assert.equal((JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope).type, "ready.ack");
 
   // client operation -> agent
@@ -372,6 +386,30 @@ test("injectOperation clears pending when no ready agent", () => {
   assert.equal(r.status, "device_offline");
   assert.equal(room.router.pending.has(corr), false);
   assert.equal(room.router.status().pending, 0);
+});
+
+test("offline cancel control stays durable for Agent reconnect", () => {
+  const deviceId = "dev_cancel_queue_01abc";
+  const room = new DeviceRoomHarness(deviceId);
+  const corr = randomId("op_");
+  const routed = room.router.injectOperation({
+    type: "ownmesh_cancel_operation",
+    payload: {
+      operation_id: corr,
+      capability: "operation.cancel",
+      arguments: { target_operation_id: "op_target" },
+    },
+    correlation_id: corr,
+  });
+  assert.equal(routed.status, "pending");
+  assert.equal(room.router.pending.has(corr), true);
+
+  const agent = room.connect("agent");
+  room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
+  assert.equal(room.router.redeliverPendingToAgent(agent), 1);
+  const messages = room.drain(agent).map((raw) => JSON.parse(raw) as DeviceEnvelope);
+  assert.equal(messages[0]?.correlation_id, corr);
 });
 
 test("router redelivers durable pending operation.request with fresh seq after DO-authorized ready", async () => {

@@ -54,6 +54,7 @@ fn dispatch_transfer_inner(cli: &Cli, cmd: &TransferCmd) -> Result<(), TransferF
             destination_workspace,
             idempotency_key,
             ttl_seconds,
+            overwrite_expected_sha256,
         } => {
             validate_path("source", source)?;
             validate_path("destination", dest)?;
@@ -66,19 +67,23 @@ fn dispatch_transfer_inner(cli: &Cli, cmd: &TransferCmd) -> Result<(), TransferF
             ] {
                 validate_text(name, value)?;
             }
-            (
-                "ownmesh_transfer_plan",
-                json!({
-                    "source_device_id": source_device,
-                    "destination_device_id": destination_device,
-                    "source_workspace_id": source_workspace,
-                    "destination_workspace_id": destination_workspace,
-                    "source_path": source,
-                    "destination_path": dest,
-                    "idempotency_key": idempotency_key,
-                    "ttl_seconds": ttl_seconds,
-                }),
-            )
+            if let Some(hash) = overwrite_expected_sha256 {
+                validate_content_hash("overwrite-expected-sha256", hash)?;
+            }
+            let mut args = json!({
+                "source_device_id": source_device,
+                "destination_device_id": destination_device,
+                "source_workspace_id": source_workspace,
+                "destination_workspace_id": destination_workspace,
+                "source_path": source,
+                "destination_path": dest,
+                "idempotency_key": idempotency_key,
+                "ttl_seconds": ttl_seconds,
+            });
+            if let Some(hash) = overwrite_expected_sha256 {
+                args["overwrite_expected_sha256"] = json!(hash);
+            }
+            ("ownmesh_transfer_plan", args)
         }
         TransferCmd::Send {
             id,
@@ -132,6 +137,20 @@ fn validate_text(name: &str, value: &str) -> Result<(), TransferFailure> {
         format!(
             "invalid {name}: must be a trimmed, non-control string of at most {MAX_TEXT_BYTES} UTF-8 bytes"
         ),
+    ))
+}
+
+fn validate_content_hash(name: &str, value: &str) -> Result<(), TransferFailure> {
+    let valid = value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if valid {
+        return Ok(());
+    }
+    Err(TransferFailure::new(
+        ErrorCode::InvalidArgument,
+        format!("invalid {name}: must be 64 lowercase hex characters"),
     ))
 }
 
@@ -301,6 +320,50 @@ mod tests {
             ExitCode::UsageConfig
         );
         assert!(validate_path("source", "in/file.bin").is_ok());
+    }
+
+    #[test]
+    fn overwrite_expected_sha256_must_be_64_lowercase_hex() {
+        assert!(validate_content_hash(
+            "overwrite-expected-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .is_ok());
+        assert_eq!(
+            validate_content_hash("overwrite-expected-sha256", "not-a-hash")
+                .expect_err("invalid hash must fail")
+                .exit_code(),
+            ExitCode::UsageConfig
+        );
+        assert_eq!(
+            validate_content_hash(
+                "overwrite-expected-sha256",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            )
+            .expect_err("uppercase hex must fail")
+            .exit_code(),
+            ExitCode::UsageConfig
+        );
+        assert!(Cli::try_parse_from([
+            "ownmesh",
+            "transfer",
+            "plan",
+            "in/a.bin",
+            "out/a.bin",
+            "--source-device",
+            "dev_source",
+            "--destination-device",
+            "dev_destination",
+            "--source-workspace",
+            "ws_source",
+            "--destination-workspace",
+            "ws_destination",
+            "--idempotency-key",
+            "plan-1",
+            "--overwrite-expected-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .is_ok());
     }
 
     #[test]

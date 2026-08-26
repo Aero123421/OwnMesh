@@ -206,6 +206,36 @@ fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(bak)
 }
 
+/// Write `data` to `path` using temp file + atomic replace **without** a
+/// `.bak` backup of the previous contents.
+///
+/// The generic [`atomic_write`] preserves the previous file as `path.bak`
+/// *before* the replace so a failed replace never loses the old contents.
+/// For journals whose previous contents may hold sensitive or large result
+/// bodies (the op journal, P0-B), that backup would duplicate exactly the
+/// content compaction exists to remove — and a crash between the backup and
+/// the backup cleanup could leave it behind indefinitely. Writers that
+/// compact their own durable state on every persist must use this variant:
+/// the temp-file + rename atomicity is identical, only the backup copy is
+/// omitted.
+///
+/// # Errors
+///
+/// Returns IO errors. The target is never pre-deleted; on rename failure the
+/// original target contents remain intact.
+pub fn atomic_write_without_backup(path: &Path, data: &[u8]) -> ConfigResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: Some(parent.to_path_buf()),
+            source,
+        })?;
+    }
+    write_atomically(path, data).map_err(|source| ConfigError::Io {
+        path: Some(path.to_path_buf()),
+        source,
+    })
+}
+
 /// On-disk journal for a two-file config+policy setup transaction.
 ///
 /// Durable recovery: if a crash leaves the journal present, [`recover_config_policy_transaction`]
@@ -791,6 +821,28 @@ mod tests {
         // Repeated reads stay side-effect free.
         let _ = load_config(&paths).unwrap();
         assert!(!paths.config_file().exists());
+    }
+
+    /// P0-B: the no-backup atomic writer used for the op journal must never
+    /// create a `path.bak` copy of the previous contents — that backup would
+    /// duplicate exactly the large/sensitive result bodies compaction exists
+    /// to remove, and a crash between the backup and its cleanup could leave
+    /// it behind indefinitely. The generic writer still preserves the backup
+    /// for config/policy crash recovery.
+    #[test]
+    fn atomic_write_without_backup_never_creates_a_bak() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let bak = dir.path().join("op-journal.json.bak");
+        for body in [br#"{"op":"x"}"#.to_vec(), br#"{"op":"y"}"#.to_vec()] {
+            atomic_write_without_backup(&path, &body).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), body);
+            assert!(!bak.exists(), "no-backup writer must never create {bak:?}");
+        }
+        // The generic writer still does (config/policy crash recovery relies
+        // on the previous contents being preserved before the replace).
+        atomic_write(&path, br#"{"op":"z"}"#).unwrap();
+        assert!(bak.exists(), "generic writer keeps the .bak contract");
     }
 
     #[test]

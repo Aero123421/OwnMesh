@@ -22,6 +22,14 @@ pub const PIPE_FALLBACK_MAX_BYTES: usize = 256 * 1024;
 /// Wall-clock bound for pipe-fallback collection before process-tree kill.
 pub const PIPE_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 
+// Darwin can lag or miss the stdlib's non-blocking child-state observation
+// after concurrent PTY teardown. Retain a finite confirmation window while the
+// macOS path also confirms absence from the OS process table below.
+#[cfg(target_os = "macos")]
+const TERMINATION_POLL_ATTEMPTS: usize = 200;
+#[cfg(not(target_os = "macos"))]
+const TERMINATION_POLL_ATTEMPTS: usize = 40;
+
 /// Host I/O contract selected by the supervisor spawn request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,7 +70,8 @@ impl PtySession {
         write_stdin_line(writer.as_mut(), line).map_err(|err| err.to_string())
     }
 
-    /// Stop and reap the child process tree. `Drop` repeats this as a backstop.
+    /// Stop the child process tree and reap it when the OS permits an
+    /// immediate non-blocking reap. `Drop` repeats this as a backstop.
     pub fn terminate_and_wait(&self) -> Result<(), String> {
         let SessionKindInner::Pty { child, .. } = &self.kind else {
             return Ok(());
@@ -80,7 +89,19 @@ impl Drop for PtySession {
             let child = child
                 .get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = terminate_child_tree(child.as_mut(), self.handle.pid);
+            let pid = self.handle.pid;
+            let _ = terminate_child_tree(child.as_mut(), pid);
+            // Drop must not leave a live child just because confirmation
+            // timed out. The known PID is ours for this process lifetime.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
 }
@@ -111,15 +132,39 @@ pub struct StructuredProcessHost {
     child: Mutex<Child>,
     stdout: Arc<Mutex<ByteRing>>,
     stderr: Arc<Mutex<ByteRing>>,
+    /// Real child exit code, reaped exactly once by [`Self::reconcile_child_exit`].
+    /// Neither reader thread synthesizes a code of its own.
+    exit_code: Mutex<Option<u32>>,
     stop: Arc<AtomicBool>,
     readers: Vec<JoinHandle<()>>,
+    /// One flag per reader, set by its guard *after* the ring is marked
+    /// terminal. `true` therefore means "this stream published EOF in order and
+    /// will never append again", which a bounded wait can rely on.
+    reader_finished: Vec<Arc<AtomicBool>>,
 }
+
+/// How long a forced termination waits for the readers to publish EOF
+/// themselves before sealing the streams. Bounded because an orphaned
+/// descendant that inherited the pipes can hold them open indefinitely.
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+const READER_DRAIN_POLL: Duration = Duration::from_millis(10);
 
 impl StructuredProcessHost {
     pub fn spawn(cmd: &PtyCommand, size: PtySize) -> Result<Self, String> {
-        let mut command = Command::new(&cmd.program);
+        // P1-C/P1-D review: same shared launchable resolver as PTY spawns and
+        // command execution, so structured session launch agrees with profile
+        // detection and never spawns a bare name the daemon PATH lacks.
+        let resolved = ownmesh_exec::resolve_spawn_argv(
+            &cmd.program,
+            &cmd.args,
+            cmd.cwd.as_deref().map(std::path::Path::new),
+        )
+        .map_err(|e| format!("resolve structured session program `{}`: {e}", cmd.program))?;
+        let program = resolved[0].clone();
+        let args: Vec<String> = resolved[1..].to_vec();
+        let mut command = Command::new(&program);
         command
-            .args(&cmd.args)
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -144,8 +189,20 @@ impl StructuredProcessHost {
         let stop = Arc::new(AtomicBool::new(false));
         let out_ring = Arc::new(Mutex::new(ByteRing::new()));
         let err_ring = Arc::new(Mutex::new(ByteRing::new()));
-        let out_reader = spawn_pipe_ring_reader(stdout, Arc::clone(&out_ring), Arc::clone(&stop));
-        let err_reader = spawn_pipe_ring_reader(stderr, Arc::clone(&err_ring), Arc::clone(&stop));
+        let out_done = Arc::new(AtomicBool::new(false));
+        let err_done = Arc::new(AtomicBool::new(false));
+        let out_reader = spawn_pipe_ring_reader(
+            stdout,
+            Arc::clone(&out_ring),
+            Arc::clone(&stop),
+            Arc::clone(&out_done),
+        );
+        let err_reader = spawn_pipe_ring_reader(
+            stderr,
+            Arc::clone(&err_ring),
+            Arc::clone(&stop),
+            Arc::clone(&err_done),
+        );
         Ok(Self {
             handle: SessionHostHandle {
                 session_id: format!("proc_{pid}"),
@@ -158,8 +215,10 @@ impl StructuredProcessHost {
             child: Mutex::new(child),
             stdout: out_ring,
             stderr: err_ring,
+            exit_code: Mutex::new(None),
             stop,
             readers: vec![out_reader, err_reader],
+            reader_finished: vec![out_done, err_done],
         })
     }
 
@@ -176,11 +235,32 @@ impl StructuredProcessHost {
     }
 
     pub fn drain_stdout(&self, max: usize) -> Result<RawDrainOutput, String> {
-        drain_ring(&self.stdout, max)
+        self.drain_stream(&self.stdout, max)
     }
     pub fn drain_stderr(&self, max: usize) -> Result<RawDrainOutput, String> {
-        drain_ring(&self.stderr, max)
+        self.drain_stream(&self.stderr, max)
     }
+
+    /// Drain one stream, then report *aggregate* structured completion.
+    ///
+    /// Terminal state is deliberately not per-stream: one stream reaching EOF
+    /// early must not publish exit while the other still has final bytes to
+    /// transfer. The ring lock is released before the aggregate is computed so
+    /// the two ring locks are never held at once.
+    fn drain_stream(
+        &self,
+        ring: &Arc<Mutex<ByteRing>>,
+        max: usize,
+    ) -> Result<RawDrainOutput, String> {
+        let (bytes, truncated, remaining) = {
+            let mut ring = ring.lock().map_err(|e| e.to_string())?;
+            ring.drain(max.clamp(1, LIVE_OUTPUT_RING_BYTES))
+        };
+        let exited = self.is_exited();
+        let exit_code = if exited { self.exit_code() } else { None };
+        Ok((bytes, truncated, exited, exit_code, remaining))
+    }
+
     pub fn pending_stdout_bytes(&self) -> usize {
         self.stdout.lock().map(|r| r.remaining()).unwrap_or(0)
     }
@@ -191,24 +271,121 @@ impl StructuredProcessHost {
         self.pending_stdout_bytes()
             .saturating_add(self.pending_stderr_bytes())
     }
+
+    /// True when the structured session is terminal: the child has been reaped
+    /// **and** both pipe readers have crossed their EOF barriers.
+    ///
+    /// Requiring both stream EOFs after the child exit keeps the ordering
+    /// invariant the PTY host documents — final bytes are always in the ring
+    /// before completion is visible.
     pub fn is_exited(&self) -> bool {
-        self.stdout.lock().map(|r| r.exited).unwrap_or(true)
-            && self.stderr.lock().map(|r| r.exited).unwrap_or(true)
+        let streams_at_eof = self.stdout.lock().map(|r| r.exited).unwrap_or(true)
+            && self.stderr.lock().map(|r| r.exited).unwrap_or(true);
+        streams_at_eof && self.reconcile_child_exit().is_some()
+    }
+
+    /// Real exit code of the child once reaped, without re-reaping.
+    pub fn exit_code(&self) -> Option<u32> {
+        self.reconcile_child_exit()
+    }
+
+    /// Reap the child at most once and cache its real exit code.
+    ///
+    /// A signal-terminated child has no `code()`; the shell `128 + signal`
+    /// convention is used so callers still receive a non-zero terminal code.
+    fn reconcile_child_exit(&self) -> Option<u32> {
+        if let Ok(cached) = self.exit_code.lock() {
+            if cached.is_some() {
+                return *cached;
+            }
+        }
+        let status = {
+            let mut child = self.child.lock().ok()?;
+            child.try_wait().ok().flatten()?
+        };
+        let code = exit_status_code(status);
+        if let Ok(mut cached) = self.exit_code.lock() {
+            *cached = Some(code);
+        }
+        Some(code)
     }
 
     pub fn terminate(&mut self) -> Result<(), String> {
+        self.terminate_with(terminate_std_child_tree)
+    }
+
+    /// Termination with an injectable kill, so the failure path is testable.
+    fn terminate_with(
+        &mut self,
+        kill: impl FnOnce(&mut Child) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(mut stdin) = self.stdin.lock() {
             *stdin = None;
         }
-        let mut child = self.child.lock().map_err(|e| e.to_string())?;
-        let result = terminate_std_child_tree(&mut child);
+        let result = {
+            let mut child = self.child.lock().map_err(|e| e.to_string())?;
+            kill(&mut child)
+        };
+        // A failed kill proves nothing: the child may still be alive and its
+        // readers may still append. Returning here without publishing EOF keeps
+        // the host non-terminal so the supervisor re-tracks and retries it.
+        result?;
+
+        // The kill succeeded, so the child is reaped; capture its real status.
+        let _ = self.reconcile_child_exit();
+
+        // Give the readers a bounded chance to publish EOF themselves, which
+        // keeps the documented ordering: every byte they already read reaches
+        // the ring before its EOF becomes visible.
+        if !self.await_readers_finished(READER_DRAIN_GRACE) {
+            // A descendant that inherited the pipes is holding them open, so
+            // the readers may never wake. Publish completion and seal the
+            // streams in the same critical section: after this, a late push is
+            // dropped and disclosed instead of appearing after `exited=true`.
+            self.seal_streams();
+        }
+
         for reader in self.readers.drain(..) {
             let _ = std::thread::Builder::new().spawn(move || {
                 let _ = reader.join();
             });
         }
-        result
+        Ok(())
+    }
+
+    /// Wait up to `grace` for every reader to publish its own EOF.
+    fn await_readers_finished(&self, grace: Duration) -> bool {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            if self
+                .reader_finished
+                .iter()
+                .all(|done| done.load(Ordering::SeqCst))
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(READER_DRAIN_POLL);
+        }
+    }
+
+    /// Publish terminal state and refuse further appends, atomically per ring.
+    fn seal_streams(&self) {
+        for ring in [&self.stdout, &self.stderr] {
+            let mut ring = ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !ring.exited {
+                // Bytes that a parked reader has not transferred are lost by
+                // this forced cutoff; say so rather than implying clean EOF.
+                ring.truncated = true;
+            }
+            ring.sealed = true;
+            ring.exited = true;
+        }
     }
 }
 
@@ -218,12 +395,47 @@ impl Drop for StructuredProcessHost {
     }
 }
 
+/// Marks a stream ring terminal on every way out of its reader thread.
+///
+/// EOF, a non-retryable read error, a stop request, and an unwind all run this
+/// `Drop`, so a reader can never terminate silently and leave the stream
+/// looking permanently live.
+struct StreamEofGuard {
+    ring: Arc<Mutex<ByteRing>>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Drop for StreamEofGuard {
+    fn drop(&mut self) {
+        // A panicking reader must still publish EOF; the ring's byte state is
+        // append-only, so recovering a poisoned lock cannot expose a torn value.
+        {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ring.exited = true;
+        }
+        // Ordered after the ring is marked terminal, so an observer that sees
+        // this flag knows EOF is published and no append can follow.
+        self.finished.store(true, Ordering::SeqCst);
+    }
+}
+
 fn spawn_pipe_ring_reader<R: Read + Send + 'static>(
     mut reader: R,
     ring: Arc<Mutex<ByteRing>>,
     stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        // The guard runs after the final `push`, preserving the ordering
+        // invariant: every byte read from this stream is in the ring before
+        // its EOF becomes visible.
+        let _eof = StreamEofGuard {
+            ring: Arc::clone(&ring),
+            finished,
+        };
         let mut buf = [0_u8; 8192];
         while !stop.load(Ordering::SeqCst) {
             match reader.read(&mut buf) {
@@ -233,16 +445,31 @@ fn spawn_pipe_ring_reader<R: Read + Send + 'static>(
                         r.push(&buf[..n]);
                     }
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
                 Err(_) => break,
             }
         }
     })
 }
 
-fn drain_ring(ring: &Arc<Mutex<ByteRing>>, max: usize) -> Result<RawDrainOutput, String> {
-    let mut ring = ring.lock().map_err(|e| e.to_string())?;
-    let (bytes, truncated, remaining) = ring.drain(max.clamp(1, LIVE_OUTPUT_RING_BYTES));
-    Ok((bytes, truncated, ring.exited, ring.exit_code, remaining))
+/// Terminal exit code for a reaped child, including signal termination.
+fn exit_status_code(status: std::process::ExitStatus) -> u32 {
+    if let Some(code) = status.code() {
+        return u32::try_from(code).unwrap_or(u32::from(u8::MAX));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128_u32.saturating_add(u32::try_from(signal).unwrap_or(0));
+        }
+    }
+    // No code and no signal: terminal but unclassifiable. Report failure
+    // rather than inventing success.
+    1
 }
 
 fn terminate_std_child_tree(child: &mut Child) -> Result<(), String> {
@@ -277,6 +504,12 @@ struct ByteRing {
     truncated: bool,
     /// Child exited (EOF observed or try_wait succeeded).
     exited: bool,
+    /// No further append is accepted. Set together with `exited` when a forced
+    /// termination publishes completion while a reader may still be parked on
+    /// a pipe an orphaned descendant holds open. Sealing is what makes
+    /// "no bytes appear after `exited=true`" an invariant rather than a race:
+    /// a late push is dropped and disclosed through `truncated`.
+    sealed: bool,
     exit_code: Option<u32>,
 }
 
@@ -287,12 +520,19 @@ impl ByteRing {
             bytes: 0,
             truncated: false,
             exited: false,
+            sealed: false,
             exit_code: None,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
+            return;
+        }
+        if self.sealed {
+            // Terminal state is already published; accepting these bytes would
+            // make output appear after EOF. Drop them and disclose the loss.
+            self.truncated = true;
             return;
         }
         self.buf.extend(chunk.iter().copied());
@@ -438,7 +678,8 @@ impl LiveHost {
         }
     }
 
-    /// Kill and reap the child process tree; stop the reader thread.
+    /// Kill the child process tree, reap it when immediately safe, and stop
+    /// the reader thread.
     ///
     /// Uses OS process-tree containment (Windows `taskkill /T`, Unix session/pgid
     /// kill) so background descendants of interactive shells do not survive.
@@ -477,23 +718,69 @@ impl Drop for LiveHost {
 }
 
 /// Default interactive shell for the current platform.
+///
+/// The program is resolved through the shared executable resolver so session
+/// launch agrees with command execution, profile detection and review pinning:
+/// on Windows a bare `cmd.exe` would let `CreateProcess` search the current
+/// directory for a shadowing `cmd.exe` (a workspace or cwd file could impersonate
+/// the pinned system shell), so the default is the absolute system path
+/// (`%SystemRoot%\System32\cmd.exe`) exactly like batch shims are. On Unix the
+/// resolved `$SHELL`/`/bin/sh` is an absolute launchable path. Resolution
+/// failure is fail-closed: the caller-supplied name is NEVER preserved as-is —
+/// a bare name handed to a spawner would be re-searched by a different PATH or
+/// (on Windows) by `CreateProcess`'s current-directory search, letting a
+/// workspace/cwd file shadow the pinned system shell. The platform's absolute
+/// default shell (`/bin/sh` on Unix, the system `cmd.exe` on Windows) is used
+/// instead, so the spawn either runs the known-good interpreter or fails with a
+/// clear OS error.
 #[must_use]
 pub fn default_shell_command() -> PtyCommand {
-    if cfg!(windows) {
-        PtyCommand {
-            program: "cmd.exe".into(),
-            args: vec!["/Q".into(), "/K".into(), "prompt $G".into()],
-            cwd: None,
-            env: vec![("TERM".into(), "dumb".into())],
-        }
+    default_shell_command_with(
+        std::env::var("SHELL").ok().as_deref(),
+        std::env::var("SystemRoot").ok().as_deref(),
+    )
+}
+
+/// Pure core of [`default_shell_command`]; parameters keep the resolution and
+/// fallback unit-testable on any platform without mutating process env.
+///
+/// `shell` is the `$SHELL` value (Unix) and `system_root` is `%SystemRoot%`
+/// (Windows). The returned program is always an absolute launchable path (see
+/// [`default_shell_command`] for the fail-closed rationale).
+#[must_use]
+fn default_shell_command_with(shell: Option<&str>, system_root: Option<&str>) -> PtyCommand {
+    let (program, args, env) = if cfg!(windows) {
+        (
+            ownmesh_exec::windows_system_cmd_exe(system_root),
+            vec!["/Q".to_string(), "/K".to_string(), "prompt $G".to_string()],
+            vec![("TERM".to_string(), "dumb".to_string())],
+        )
     } else {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        PtyCommand {
-            program: shell,
-            args: vec![],
-            cwd: None,
-            env: vec![("TERM".into(), "xterm-256color".into())],
+        let shell = shell.unwrap_or("/bin/sh");
+        (
+            shell.to_string(),
+            Vec::new(),
+            vec![("TERM".to_string(), "xterm-256color".to_string())],
+        )
+    };
+    let (program, args) = match ownmesh_exec::resolve_spawn_argv(&program, &args, None) {
+        Ok(resolved) => (resolved[0].clone(), resolved[1..].to_vec()),
+        Err(_) => {
+            // Fail-closed fallback: never return the caller-supplied bare
+            // name. Use the platform's absolute default shell so the spawn
+            // runs a known-good interpreter or fails with a clear OS error.
+            if cfg!(windows) {
+                (ownmesh_exec::windows_system_cmd_exe(system_root), args)
+            } else {
+                ("/bin/sh".to_string(), args)
+            }
         }
+    };
+    PtyCommand {
+        program,
+        args,
+        cwd: None,
+        env,
     }
 }
 
@@ -501,6 +788,167 @@ fn write_stdin_line(writer: &mut dyn Write, line: &str) -> std::io::Result<()> {
     writer.write_all(line.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+/// Resolve a Darwin PTY leader's controlling terminal while the leader still
+/// exists. The returned name is already in the form accepted by `pkill -t`.
+#[cfg(target_os = "macos")]
+fn macos_controlling_tty(root_pid: u32) -> Option<String> {
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &root_pid.to_string(), "-o", "tty="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success() && output.stdout.len() <= 128)
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|tty| tty.trim().to_owned())
+        .filter(|tty| !tty.is_empty() && tty != "??" && tty != "-")
+}
+
+/// Signal every process attached to one dedicated Darwin PTY. `pattern` is
+/// fixed and `tty` comes from the exact process-table field above, not input.
+#[cfg(target_os = "macos")]
+fn signal_macos_tty(tty: &str, signal: &str) {
+    let _ = std::process::Command::new("/usr/bin/pkill")
+        .args([signal, "-t", tty, ".*"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Snapshot and kill Darwin descendants before signalling the PTY session
+/// leader. This is a fallback for runners where session/process-group signals
+/// are refused; capturing the PIDs first prevents them being orphaned when the
+/// leader exits. Traversal and accepted output are explicitly capped.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines)] // bounded TTY/session/ancestry snapshots form one kill transaction
+fn kill_macos_descendants(root_pid: u32, known_tty: Option<&str>) {
+    const MAX_DESCENDANTS: usize = 4096;
+    const MAX_PGREP_BYTES: usize = 128 * 1024;
+    const MAX_PS_BYTES: usize = 1024 * 1024;
+
+    let mut pending = vec![root_pid];
+    let mut descendants = Vec::new();
+    let mut seen = std::collections::HashSet::from([root_pid]);
+
+    // The controlling PTY is the strongest containment boundary available on
+    // Darwin without unsafe process APIs. It catches background jobs even if
+    // their parent or process group changed. Query it while the leader still
+    // exists, then ask Apple's supported `pgrep -t` selector for exact PIDs;
+    // the leader itself remains reserved for `Child::kill()` below.
+    let discovered_tty;
+    let tty = if let Some(known_tty) = known_tty {
+        Some(known_tty)
+    } else {
+        discovered_tty = macos_controlling_tty(root_pid);
+        discovered_tty.as_deref()
+    };
+    if let Some(tty) = tty {
+        if let Ok(output) = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-t", tty, ".*"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            if output.status.success() && output.stdout.len() <= MAX_PGREP_BYTES {
+                for line in output.stdout.split(|byte| *byte == b'\n') {
+                    let Ok(text) = std::str::from_utf8(line) else {
+                        continue;
+                    };
+                    let Ok(pid) = text.trim().parse::<u32>() else {
+                        continue;
+                    };
+                    if seen.insert(pid) && descendants.len() < MAX_DESCENDANTS {
+                        descendants.push(pid);
+                        pending.push(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Apple's pgrep/pkill deliberately do not implement the `-s sid` filter.
+    // portable-pty makes the command PID a session leader, so snapshot the
+    // numeric process table instead. Match both the session and controlling
+    // TTY so this remains authoritative if Darwin reports an unexpected
+    // session value during concurrent PTY teardown.
+    if let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,sess=,tty="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() && output.stdout.len() <= MAX_PS_BYTES {
+            for line in output.stdout.split(|byte| *byte == b'\n') {
+                let Ok(text) = std::str::from_utf8(line) else {
+                    continue;
+                };
+                let mut fields = text.split_whitespace();
+                let (Some(pid), Some(session), Some(process_tty), None) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                let (Ok(pid), Ok(session)) = (pid.parse::<u32>(), session.parse::<u32>()) else {
+                    continue;
+                };
+                if (session == root_pid || tty == Some(process_tty))
+                    && seen.insert(pid)
+                    && descendants.len() < MAX_DESCENDANTS
+                {
+                    descendants.push(pid);
+                    pending.push(pid);
+                }
+            }
+        }
+    }
+
+    while let Some(parent) = pending.pop() {
+        if descendants.len() >= MAX_DESCENDANTS {
+            break;
+        }
+        let Ok(output) = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-P", &parent.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            break;
+        };
+        // `pgrep` exits 1 when no child matched. Other failures cannot safely
+        // expand the snapshot, but the session/group kill below still runs.
+        if output.status.code() == Some(1) {
+            continue;
+        }
+        if !output.status.success() || output.stdout.len() > MAX_PGREP_BYTES {
+            break;
+        }
+        for line in output.stdout.split(|byte| *byte == b'\n') {
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let Ok(pid) = text.trim().parse::<u32>() else {
+                continue;
+            };
+            if seen.insert(pid) {
+                descendants.push(pid);
+                pending.push(pid);
+            }
+        }
+    }
+
+    // Every captured PID is signalled directly. The second snapshot after the
+    // leader signal handles anything created between this snapshot and kill.
+    for pid in descendants {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Kill a process tree by OS facilities that do not require `unsafe`.
@@ -522,21 +970,38 @@ fn kill_process_tree(pid: u32) {
     }
     #[cfg(unix)]
     {
+        #[cfg(target_os = "macos")]
+        let kill_program = "/bin/kill";
+        #[cfg(not(target_os = "macos"))]
+        let (pkill_program, kill_program) = ("pkill", "kill");
+
+        // Apple pgrep/pkill do not support `-s sid`; use the bounded Darwin
+        // session/ancestry snapshot and direct PID signals instead.
+        #[cfg(target_os = "macos")]
+        kill_macos_descendants(pid, None);
+
         // Session kill first (covers background jobs that changed PGID).
-        let _ = std::process::Command::new("pkill")
+        #[cfg(not(target_os = "macos"))]
+        let _ = std::process::Command::new(pkill_program)
             .args(["-KILL", "-s", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
         // Negative PID = process group (session leader is usually its own PGID).
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
+        // BSD /bin/kill does not take GNU `--`; that form is Linux-only.
+        let group = format!("-{pid}");
+        #[cfg(target_os = "macos")]
+        let group_args: [&str; 2] = ["-KILL", &group];
+        #[cfg(not(target_os = "macos"))]
+        let group_args: [&str; 3] = ["-KILL", "--", &group];
+        let _ = std::process::Command::new(kill_program)
+            .args(group_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-        let _ = std::process::Command::new("kill")
+        let _ = std::process::Command::new(kill_program)
             .args(["-KILL", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -545,21 +1010,154 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+/// Exact Darwin process-table observation for post-kill confirmation.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum MacosProcessState {
+    Absent,
+    Zombie,
+    Exiting(String),
+    Live(String),
+}
+
+/// Classify Darwin's compact `ps stat` value. The first character is the run
+/// state; later characters are flags. In particular, Apple documents `E` as
+/// `P_WEXIT` (the process is trying to exit), so it must not be confused with
+/// a runnable child merely because its primary state is temporarily `?`.
+#[cfg(target_os = "macos")]
+fn classify_macos_process_state(state: String) -> MacosProcessState {
+    if state.starts_with('Z') {
+        MacosProcessState::Zombie
+    } else if state.chars().skip(1).any(|flag| flag == 'E') {
+        MacosProcessState::Exiting(state)
+    } else {
+        MacosProcessState::Live(state)
+    }
+}
+
+/// `/bin/ps` is an absolute OS tool. Exit 1 means the exact PID selection
+/// matched nothing; exit 0 returns the bounded state code. Any other outcome is
+/// an observation failure and must not prove death.
+#[cfg(target_os = "macos")]
+fn macos_process_state(pid: u32) -> Result<MacosProcessState, String> {
+    const MAX_STATE_BYTES: usize = 128;
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|err| format!("query killed child {pid} in process table: {err}"))?;
+    match output.status.code() {
+        Some(0) if output.stdout.len() <= MAX_STATE_BYTES => {
+            let state = std::str::from_utf8(&output.stdout)
+                .map_err(|err| format!("decode killed child {pid} process state: {err}"))?
+                .trim()
+                .to_owned();
+            Ok(classify_macos_process_state(state))
+        }
+        Some(0) => Err(format!(
+            "query killed child {pid} in process table: oversized state output"
+        )),
+        Some(1) => Ok(MacosProcessState::Absent),
+        Some(code) => Err(format!(
+            "query killed child {pid} in process table: ps exited with {code}"
+        )),
+        None => Err(format!(
+            "query killed child {pid} in process table: ps ended without an exit code"
+        )),
+    }
+}
+
+/// Confirm/reap a Darwin child without accepting a live process as dead.
+/// Waiting is used only after `ps` reports `Z`, where the process has already
+/// exited and `wait` is an immediate OS reap rather than an unbounded liveness
+/// wait. `P_WEXIT` (`E`) is also authoritative confirmation that Darwin has
+/// committed the process to exit; it can be blocked in kernel teardown, so a
+/// synchronous wait here would violate the bounded termination contract.
+#[cfg(target_os = "macos")]
+fn macos_confirm_child_exit(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    pid: u32,
+) -> Result<bool, String> {
+    match macos_process_state(pid)? {
+        MacosProcessState::Absent => Ok(true),
+        MacosProcessState::Zombie => child
+            .wait()
+            .map(|_| true)
+            .map_err(|err| format!("reap zombie child {pid}: {err}")),
+        MacosProcessState::Exiting(_) => Ok(true),
+        MacosProcessState::Live(_) => Ok(false),
+    }
+}
+
 fn terminate_child_tree(
     child: &mut (dyn portable_pty::Child + Send + Sync),
     known_pid: Option<u32>,
 ) -> Result<(), String> {
     if matches!(child.try_wait(), Ok(Some(_))) {
+        // Darwin can report a completed wait while the PID is still live in
+        // the process table (concurrent PTY teardown). Trust the table.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(pid) = known_pid.or_else(|| child.process_id()) {
+                match macos_process_state(pid) {
+                    Ok(
+                        MacosProcessState::Absent
+                        | MacosProcessState::Zombie
+                        | MacosProcessState::Exiting(_),
+                    ) => return Ok(()),
+                    Ok(MacosProcessState::Live(_)) | Err(_) => {}
+                }
+            } else {
+                return Ok(());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         return Ok(());
     }
 
     let pid = known_pid.or_else(|| child.process_id());
+    // Do not externally kill the Darwin leader before `Child::kill()` gets to
+    // update its own process state. Snapshot/kill descendants first; the full
+    // session/group backstop runs immediately after the direct child signal.
+    #[cfg(target_os = "macos")]
+    let macos_tty = pid.and_then(macos_controlling_tty);
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = pid {
+        // Freeze the dedicated PTY before killing descendants. Without this
+        // barrier, killing a leaf such as `sleep` can wake its parent shell and
+        // let the next command run in the few milliseconds before that parent
+        // receives its own signal.
+        if let Some(tty) = macos_tty.as_deref() {
+            signal_macos_tty(tty, "-STOP");
+        }
+        kill_macos_descendants(pid, macos_tty.as_deref());
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(pid) = pid {
         kill_process_tree(pid);
     }
 
     // Direct kill remains as a backstop when tree kill is unavailable/racy.
-    if let Err(kill_err) = child.kill() {
+    let kill_result = child.kill();
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = pid {
+        // Reuse the pre-kill TTY name: once the leader is gone it can no longer
+        // be rediscovered, while an orphan created during teardown may still
+        // be attached to that PTY. Kill the frozen remainder before the normal
+        // session/group/direct-PID backstops run.
+        if let Some(tty) = macos_tty.as_deref() {
+            signal_macos_tty(tty, "-KILL");
+        }
+        kill_process_tree(pid);
+    }
+    if let Err(kill_err) = kill_result {
+        #[cfg(target_os = "macos")]
+        if let Some(pid) = pid {
+            if matches!(macos_confirm_child_exit(child, pid), Ok(true)) {
+                return Ok(());
+            }
+        }
         return match child.try_wait() {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(format!("kill child: {kill_err}; child is still running")),
@@ -570,22 +1168,97 @@ fn terminate_child_tree(
     }
 
     // Never block indefinitely in Drop/terminate paths (ConPTY can stall wait()).
-    for _ in 0..40 {
+    for _ in 0..TERMINATION_POLL_ATTEMPTS {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(()),
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                // On Darwin, `Child::try_wait()` can continue returning None
+                // after a concurrently torn-down PTY child has disappeared.
+                // Absence from the process table is an independent, exact
+                // confirmation; a zombie is reaped only after `ps` proves it
+                // has exited. Darwin's `P_WEXIT` state is already committed
+                // to kernel exit and is accepted without a potentially
+                // blocking wait; an ordinary live state is never accepted.
+                #[cfg(target_os = "macos")]
+                if let Some(pid) = pid {
+                    if macos_confirm_child_exit(child, pid)? {
+                        return Ok(());
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
             Err(err) => return Err(format!("wait for child: {err}")),
         }
     }
-    // Best-effort: child was signaled; accept unreaped state rather than hang the daemon.
-    Ok(())
+    // The child was signaled but has not confirmed exit within the bounded
+    // poll window. Reporting success here would let the supervisor untrack a
+    // host whose child may still be alive, and daemon transition recovery
+    // treats "not tracked" as authoritative proof of death (P0-A review).
+    // Fail honestly instead: the host stays tracked and the next sweep
+    // retries the kill. Drop paths ignore this error, so the never-hang
+    // contract is preserved.
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = pid {
+        let state = match macos_process_state(pid) {
+            Ok(MacosProcessState::Absent) => "absent".to_owned(),
+            Ok(MacosProcessState::Zombie) => "zombie".to_owned(),
+            Ok(MacosProcessState::Exiting(state)) => format!("exiting:{state}"),
+            Ok(MacosProcessState::Live(state)) => format!("live:{state}"),
+            Err(err) => format!("observation-error:{err}"),
+        };
+        return Err(format!(
+            "child did not confirm exit within the termination poll window (Darwin state: {state})"
+        ));
+    }
+    Err("child did not confirm exit within the termination poll window".into())
 }
 
 /// Spawn a PTY-backed process (pipe fallback on failure) for CLI one-shot use.
 pub fn spawn_pty(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String> {
-    match spawn_portable(cmd, size) {
+    // P1-C/P1-D review: resolve through the shared launchable resolver before
+    // any spawner sees the program, exactly like profile detection, command
+    // execution and review pinning. The daemon service PATH is system-only, so
+    // a user-local CLI found by deterministic discovery must launch by its
+    // absolute path, and on Windows an extensionless npm shim must never beat
+    // its invocable `.exe/.com/.cmd/.bat` sibling (Win32 error 193). A
+    // program that cannot be resolved fails closed with the exact reason
+    // instead of a bare-name spawn the daemon's PATH may not contain.
+    let resolved = ownmesh_exec::resolve_spawn_argv(
+        &cmd.program,
+        &cmd.args,
+        cmd.cwd.as_deref().map(std::path::Path::new),
+    )
+    .map_err(|e| format!("resolve session program `{}`: {e}", cmd.program))?;
+    let resolved_cmd = PtyCommand {
+        program: resolved[0].clone(),
+        args: resolved[1..].to_vec(),
+        ..cmd.clone()
+    };
+    match spawn_portable(&resolved_cmd, size) {
         Ok(s) => Ok(s),
-        Err(pty_err) => spawn_pipe_fallback(cmd, size, &pty_err),
+        Err(pty_err) => spawn_pipe_fallback(&resolved_cmd, size, &pty_err),
+    }
+}
+
+/// PTY spawn failures must stay honest about likely systemd hardening causes
+/// (#144): on Linux the shipped `--user` unit sets `RestrictNamespaces=yes`,
+/// so programs that create namespaces at startup fail with an opaque EPERM.
+/// Name the directive and the documented operator drop-in; the default stays
+/// fail-closed.
+fn annotate_pty_spawn_error(stage: &str, error: &dyn std::fmt::Display) -> String {
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if cfg!(target_os = "linux") && (lower.contains("permission denied") || lower.contains("eperm"))
+    {
+        format!(
+            "{stage}: {detail}. This can happen when the program creates Linux namespaces \
+(containers, sandbox tools, unshare) while the ownmeshd service unit sets \
+`RestrictNamespaces=yes`. The default stays fail-closed; a local drop-in setting \
+`RestrictNamespaces=no` (`systemctl --user edit ownmesh-ownmeshd.service`) allows namespaces \
+for this device — `ownmesh doctor` discloses the effective unit"
+        )
+    } else {
+        format!("{stage}: {detail}")
     }
 }
 
@@ -623,7 +1296,7 @@ fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String>
     let child = pair
         .slave
         .spawn_command(builder)
-        .map_err(|e| format!("spawn: {e}"))?;
+        .map_err(|e| annotate_pty_spawn_error("spawn", &e))?;
     drop(pair.slave);
 
     let pid = child.process_id();
@@ -648,6 +1321,27 @@ fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String>
 }
 
 fn spawn_live_portable(cmd: &PtyCommand, size: PtySize) -> Result<LiveHost, String> {
+    // P1-C/P1-D review (defense-in-depth): resolve through the shared
+    // launchable resolver before the spawner sees the program, exactly like
+    // `spawn_pty` and `StructuredProcessHost` do. A bare name must never reach
+    // the spawner — `CreateProcess` would search the working directory for a
+    // shadowing `cmd.exe`/`cmd.com` (a workspace or cwd file could impersonate
+    // the pinned shell), and a Unix spawner would re-search a PATH that may
+    // differ from the resolver's. Unresolved programs fail closed with the
+    // exact reason instead of being spawned as-is. Re-resolving an already
+    // absolute path is idempotent (launchable-file check only), so the
+    // daemon-resolved argv and the supervisor-resolved argv stay consistent.
+    let resolved = ownmesh_exec::resolve_spawn_argv(
+        &cmd.program,
+        &cmd.args,
+        cmd.cwd.as_deref().map(std::path::Path::new),
+    )
+    .map_err(|e| format!("resolve session program `{}`: {e}", cmd.program))?;
+    let resolved_cmd = PtyCommand {
+        program: resolved[0].clone(),
+        args: resolved[1..].to_vec(),
+        ..cmd.clone()
+    };
     let system = native_pty_system();
     let pair = system
         .openpty(PortableSize {
@@ -658,14 +1352,14 @@ fn spawn_live_portable(cmd: &PtyCommand, size: PtySize) -> Result<LiveHost, Stri
         })
         .map_err(|e| format!("openpty: {e}"))?;
 
-    let mut builder = CommandBuilder::new(&cmd.program);
-    for a in &cmd.args {
+    let mut builder = CommandBuilder::new(&resolved_cmd.program);
+    for a in &resolved_cmd.args {
         builder.arg(a);
     }
-    if let Some(cwd) = &cmd.cwd {
+    if let Some(cwd) = &resolved_cmd.cwd {
         builder.cwd(cwd);
     }
-    for (k, v) in &cmd.env {
+    for (k, v) in &resolved_cmd.env {
         builder.env(k, v);
     }
 
@@ -681,7 +1375,7 @@ fn spawn_live_portable(cmd: &PtyCommand, size: PtySize) -> Result<LiveHost, Stri
     let child = pair
         .slave
         .spawn_command(builder)
-        .map_err(|e| format!("spawn: {e}"))?;
+        .map_err(|e| annotate_pty_spawn_error("spawn", &e))?;
     drop(pair.slave);
 
     let pid = child.process_id();
@@ -899,8 +1593,10 @@ const READ_UNTIL_CHANNEL_CHUNKS: usize = 64;
 /// accumulator per read. Truncation is visible via the returned UTF-8 lossy text
 /// length being capped; the child is always terminated before return.
 ///
-/// The child is terminated and reaped before this function returns, including when
-/// acquiring or reading PTY state fails.
+/// The child is terminated before this function returns, including when
+/// acquiring or reading PTY state fails. It is reaped immediately when the OS
+/// exposes a non-blocking reap; Darwin kernel-exit teardown may finish
+/// asynchronously after the bounded return.
 #[allow(clippy::too_many_lines)] // bounded channel collector + terminate path stay collocated
 pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
     let read_result = (|| -> Result<String, String> {
@@ -1022,6 +1718,246 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_ps_exit_flag_is_not_classified_as_live() {
+        assert!(matches!(
+            classify_macos_process_state("?<Es".to_owned()),
+            MacosProcessState::Exiting(state) if state == "?<Es"
+        ));
+        assert!(matches!(
+            classify_macos_process_state("Z+".to_owned()),
+            MacosProcessState::Zombie
+        ));
+        assert!(matches!(
+            classify_macos_process_state("S+".to_owned()),
+            MacosProcessState::Live(state) if state == "S+"
+        ));
+    }
+
+    /// P1-C review: the default interactive shell is resolved through the
+    /// shared executable resolver before a spawner sees it. On Windows a bare
+    /// `cmd.exe` would let `CreateProcess` search the current directory for a
+    /// shadowing `cmd.exe` (a workspace/cwd file could impersonate the pinned
+    /// system shell); after resolution the program is the absolute system
+    /// path. On Unix the resolved `$SHELL`/`/bin/sh` is an absolute
+    /// launchable file, so default session launch agrees with command
+    /// execution, profile detection and review pinning — there is no
+    /// detect-ready-then-spawn-bare-name disagreement.
+    #[test]
+    fn default_shell_command_resolves_to_an_absolute_launchable_program() {
+        let cmd = default_shell_command();
+        let path = std::path::Path::new(&cmd.program);
+        assert!(
+            path.is_absolute(),
+            "default shell must resolve to an absolute path, got `{}`",
+            cmd.program
+        );
+        assert!(
+            ownmesh_exec::is_launchable_file(path),
+            "default shell must be a launchable file, got `{}`",
+            cmd.program
+        );
+        #[cfg(windows)]
+        assert!(
+            cmd.program.to_ascii_lowercase().ends_with("cmd.exe"),
+            "Windows default shell must resolve to the system cmd.exe, got `{}`",
+            cmd.program
+        );
+    }
+
+    /// v1.2.13 review (fail-closed): `default_shell_command` must NEVER
+    /// preserve the caller-supplied program when resolution fails. On Windows
+    /// a bare `cmd.exe` would let `CreateProcess` search the working directory
+    /// for a shadowing `cmd.exe`/`cmd.com` (Microsoft CreateProcess
+    /// documentation); on Unix a bare `$SHELL` would be re-searched by the
+    /// spawner's PATH, which may disagree with the resolver that profile
+    /// detection and command execution use. The pure core is exercised with an
+    /// unresolvable `$SHELL` (absolute and bare forms) and must return the
+    /// platform's absolute launchable default instead.
+    #[cfg(not(windows))]
+    #[test]
+    fn default_shell_falls_back_to_absolute_default_when_shell_unresolvable() {
+        let broken = default_shell_command_with(Some("/nonexistent/ownmesh-shell-probe"), None);
+        let path = std::path::Path::new(&broken.program);
+        assert!(
+            path.is_absolute(),
+            "fallback shell must be absolute, got `{}`",
+            broken.program
+        );
+        assert!(
+            ownmesh_exec::is_launchable_file(path),
+            "fallback shell must be a launchable file, got `{}`",
+            broken.program
+        );
+        assert_ne!(
+            broken.program, "/nonexistent/ownmesh-shell-probe",
+            "an unresolvable $SHELL must never be preserved for a spawner"
+        );
+        // A bare (non-absolute) $SHELL that PATH cannot resolve must also fall
+        // back instead of being handed to the spawner as a bare name.
+        let bare = default_shell_command_with(Some("ownmesh-shell-bare-probe"), None);
+        let bare_path = std::path::Path::new(&bare.program);
+        assert!(
+            bare_path.is_absolute(),
+            "bare $SHELL fallback must be absolute"
+        );
+        assert!(ownmesh_exec::is_launchable_file(bare_path));
+    }
+
+    /// v1.2.13 review: on Windows the default shell is the pinned absolute
+    /// `%SystemRoot%\System32\cmd.exe` from the start — never a bare
+    /// `cmd.exe` that `CreateProcess` would resolve with the current
+    /// directory first in its search order.
+    #[cfg(windows)]
+    #[test]
+    fn default_shell_uses_absolute_system_cmd_exe() {
+        let cmd = default_shell_command_with(None, Some("C:\\Windows"));
+        assert_eq!(cmd.program, "C:\\Windows\\System32\\cmd.exe");
+        assert!(std::path::Path::new(&cmd.program).is_absolute());
+        let via_env = default_shell_command();
+        assert!(via_env.program.to_ascii_lowercase().ends_with("cmd.exe"));
+        assert!(std::path::Path::new(&via_env.program).is_absolute());
+    }
+
+    /// v1.2.13 review (defense-in-depth): `LiveHost::spawn` resolves through
+    /// the shared launchable resolver and fails closed with the exact reason;
+    /// an unresolvable program must never reach the spawner as a bare name
+    /// (a shadowing cwd `cmd.exe` on Windows, or a PATH re-search on Unix).
+    #[test]
+    fn live_host_spawn_fails_closed_on_unresolvable_program() {
+        let cmd = PtyCommand {
+            program: "ownmesh-test-no-such-binary-xyz".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+        };
+        let err = LiveHost::spawn(&cmd, PtySize::default())
+            .err()
+            .expect("an unresolvable program must fail closed, never spawn a bare name");
+        assert!(
+            err.contains("resolve session program"),
+            "the failure must name the unresolved program, got: {err}"
+        );
+    }
+
+    /// P0-A review: `terminate_child_tree` must never report success before
+    /// the child confirms exit. The supervisor untracks a host only on `Ok`
+    /// and daemon transition recovery treats "not tracked" as authoritative
+    /// proof of death, so an unreaped child reported as terminated could let
+    /// an expired transition record be cleared while its sidecar is still
+    /// alive. These tests pin the honest result contract with a fake child:
+    /// already-exited returns `Ok` immediately, a child that exits after
+    /// `kill` returns `Ok`, and a child that never confirms exit returns
+    /// `Err` — keeping the host tracked for the next sweep.
+    #[derive(Debug)]
+    enum FakeChildState {
+        AlreadyExited,
+        ExitsAfterKill,
+        NeverExits,
+    }
+
+    #[derive(Debug)]
+    struct FakeChild {
+        state: FakeChildState,
+        kill_called: bool,
+        kill_fails: bool,
+    }
+
+    impl portable_pty::ChildKiller for FakeChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            if self.kill_fails {
+                return Err(std::io::Error::other("kill refused"));
+            }
+            self.kill_called = true;
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeChild {
+                state: FakeChildState::NeverExits,
+                kill_called: false,
+                kill_fails: self.kill_fails,
+            })
+        }
+    }
+
+    impl portable_pty::Child for FakeChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            match &self.state {
+                FakeChildState::AlreadyExited => {
+                    Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+                }
+                FakeChildState::ExitsAfterKill => {
+                    if self.kill_called {
+                        Ok(Some(portable_pty::ExitStatus::with_exit_code(1)))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                FakeChildState::NeverExits => Ok(None),
+            }
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(1))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[test]
+    fn terminate_child_tree_confirms_exit_before_ok() {
+        // Already exited: no kill needed, Ok immediately.
+        let mut exited = FakeChild {
+            state: FakeChildState::AlreadyExited,
+            kill_called: false,
+            kill_fails: false,
+        };
+        assert!(terminate_child_tree(&mut exited, None).is_ok());
+
+        // Exits after the kill signal: Ok only once try_wait confirms.
+        let mut after_kill = FakeChild {
+            state: FakeChildState::ExitsAfterKill,
+            kill_called: false,
+            kill_fails: false,
+        };
+        assert!(terminate_child_tree(&mut after_kill, None).is_ok());
+        assert!(after_kill.kill_called, "the child must have been signalled");
+    }
+
+    #[test]
+    fn terminate_child_tree_errors_when_exit_is_not_confirmed() {
+        // Kill refused and the child still running: explicit Err naming the
+        // cause — never a best-effort Ok.
+        let mut refused = FakeChild {
+            state: FakeChildState::NeverExits,
+            kill_called: false,
+            kill_fails: true,
+        };
+        let err = terminate_child_tree(&mut refused, None).unwrap_err();
+        assert!(
+            err.contains("child is still running"),
+            "unconfirmed child must fail honestly: {err}"
+        );
+
+        // Kill succeeded but the child never confirms exit within the bounded
+        // poll window: Err, so the supervisor keeps the host tracked.
+        let mut never = FakeChild {
+            state: FakeChildState::NeverExits,
+            kill_called: false,
+            kill_fails: false,
+        };
+        let err = terminate_child_tree(&mut never, None).unwrap_err();
+        assert!(
+            err.contains("did not confirm exit"),
+            "bounded-poll timeout must fail honestly: {err}"
+        );
+    }
+
     struct FailingWriter {
         fail_flush: bool,
     }
@@ -1122,6 +2058,9 @@ mod tests {
     fn live_host_echo_roundtrip() {
         #[cfg(windows)]
         let cmd = PtyCommand {
+            // This unattended command deliberately has no terminal emulator
+            // replying to cursor-position queries. A ConPTY backend that uses
+            // PSEUDOCONSOLE_INHERIT_CURSOR stalls here after emitting ESC[6n.
             program: "cmd.exe".into(),
             args: vec!["/Q".into(), "/C".into(), "echo LIVE_HOST_MARKER_OK".into()],
             cwd: None,
@@ -1221,26 +2160,51 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropping_session_kills_child_before_it_can_continue() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("child-survived");
+        // `exec sleep` replaces the shell so there is no next command that can
+        // run if a descendant is torn down first. Assert the recorded PID is
+        // gone instead of waiting out a sleep window (that window is what
+        // made a failed Drop look like "child continued").
         let command = PtyCommand {
             program: "/bin/sh".into(),
-            args: vec![
-                "-c".into(),
-                format!("sleep 1; printf survived > {}", marker.display()),
-            ],
+            args: vec!["-c".into(), "exec sleep 3600".into()],
             cwd: None,
             env: vec![],
         };
 
         let session = spawn_portable(&command, PtySize::default()).expect("spawn PTY child");
+        let pid = session
+            .handle
+            .pid
+            .expect("spawned PTY child must expose a pid");
         drop(session);
-        std::thread::sleep(Duration::from_millis(1_300));
 
-        assert!(
-            !marker.exists(),
-            "child continued running after session drop"
-        );
+        let mut gone = false;
+        for _ in 0..80 {
+            if !unix_pid_is_live(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "child pid {pid} still live after session drop");
+    }
+
+    #[cfg(unix)]
+    fn unix_pid_is_live(pid: u32) -> bool {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.code() == Some(1) => false,
+            Ok(output) if output.status.success() => {
+                let state = String::from_utf8_lossy(&output.stdout);
+                let state = state.trim();
+                !state.starts_with('Z') && !state.chars().skip(1).any(|flag| flag == 'E')
+            }
+            _ => true,
+        }
     }
 
     #[test]
@@ -1269,5 +2233,316 @@ mod tests {
         assert!(host.write_frame(b"x").is_err());
         assert!(host.write_frame(&vec![b'x'; 64 * 1024 + 1]).is_err());
         host.terminate().unwrap();
+    }
+
+    /// Structured child that writes to both streams and exits with `code`.
+    fn structured_exit_command(code: i32) -> PtyCommand {
+        if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    format!("echo out & echo err 1>&2 & exit /b {code}"),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!("printf out; printf err >&2; exit {code}"),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        }
+    }
+
+    /// Poll until the structured host reports terminal state, bounded so a
+    /// regression fails the test instead of hanging it.
+    fn await_structured_exit(host: &StructuredProcessHost) -> bool {
+        for _ in 0..200 {
+            if host.is_exited() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    #[test]
+    fn structured_child_publishes_eof_and_a_real_exit_code() {
+        for expected in [0_u32, 3_u32] {
+            let mut host = StructuredProcessHost::spawn(
+                &structured_exit_command(i32::try_from(expected).unwrap()),
+                PtySize::default(),
+            )
+            .unwrap();
+            assert!(
+                await_structured_exit(&host),
+                "structured host never reported exit for code {expected}"
+            );
+
+            let (out, _, out_exited, out_code, _) = host.drain_stdout(4096).unwrap();
+            let (err, _, err_exited, err_code, _) = host.drain_stderr(4096).unwrap();
+            // Final bytes are buffered before completion becomes visible.
+            assert!(String::from_utf8_lossy(&out).contains("out"));
+            assert!(String::from_utf8_lossy(&err).contains("err"));
+            assert!(out_exited && err_exited, "both drains must report exit");
+            assert_eq!(out_code, Some(expected));
+            assert_eq!(err_code, Some(expected));
+            host.terminate().unwrap();
+        }
+    }
+
+    #[test]
+    fn one_stream_closing_early_does_not_publish_exit() {
+        // stdout closes immediately; stderr writes only after a delay. Exit
+        // must not be visible while the second stream still has bytes coming.
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    "ping -n 2 127.0.0.1 >nul & echo late 1>&2".into(),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exec 1>&-; sleep 1; printf late >&2".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !host.is_exited(),
+            "early stdout EOF must not publish structured completion"
+        );
+
+        assert!(await_structured_exit(&host));
+        let (err, _, exited, _, _) = host.drain_stderr(4096).unwrap();
+        assert!(exited);
+        assert!(
+            String::from_utf8_lossy(&err).contains("late"),
+            "late stderr bytes must survive the EOF barrier"
+        );
+        host.terminate().unwrap();
+    }
+
+    /// #152 review: no bytes may appear after terminal state is published.
+    ///
+    /// Deterministic by construction: a writer races the cutoff continuously,
+    /// so an unsealed window is observable rather than timing-dependent. This
+    /// is the same critical section `seal_streams` uses.
+    #[test]
+    fn a_sealed_stream_never_accepts_bytes_after_exit_is_published() {
+        let ring = Arc::new(Mutex::new(ByteRing::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let ring = Arc::clone(&ring);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Ok(mut ring) = ring.lock() {
+                        ring.push(b"spam");
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Publish completion and seal together, as a forced cutoff does.
+        {
+            let mut ring = ring.lock().unwrap();
+            ring.truncated = true;
+            ring.sealed = true;
+            ring.exited = true;
+        }
+        // Drain everything that legitimately arrived before the seal.
+        let remaining = {
+            let mut ring = ring.lock().unwrap();
+            ring.drain(LIVE_OUTPUT_RING_BYTES).2
+        };
+        assert_eq!(remaining, 0, "ring must be fully drained after the seal");
+
+        // The writer is still racing; nothing may land from here on.
+        std::thread::sleep(Duration::from_millis(100));
+        let (after, _, remaining_after) = {
+            let mut ring = ring.lock().unwrap();
+            ring.drain(LIVE_OUTPUT_RING_BYTES)
+        };
+        stop.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+        assert!(
+            after.is_empty() && remaining_after == 0,
+            "{} bytes appeared after exit was published",
+            after.len()
+        );
+    }
+
+    /// Terminate always leaves the session terminal, whichever path it took.
+    ///
+    /// Which path that is depends on the platform: a shell that execs its
+    /// command leaves no descendant holding the pipes, so the readers publish
+    /// EOF themselves and no seal is needed. That difference is not part of the
+    /// contract — being terminal afterwards is.
+    #[test]
+    fn terminate_always_publishes_a_terminal_state() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        host.terminate().unwrap();
+
+        for ring in [&host.stdout, &host.stderr] {
+            assert!(
+                ring.lock().unwrap().exited,
+                "terminate must publish completion on every platform"
+            );
+        }
+        assert!(host.is_exited());
+    }
+
+    /// The forced-cutoff publication itself: while the child is alive the
+    /// readers are necessarily parked, so sealing must publish completion,
+    /// refuse further appends, and disclose the bytes it cut off. Deterministic
+    /// on every platform because it does not depend on how the kill propagates.
+    #[test]
+    fn sealing_publishes_completion_and_discloses_the_cutoff() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // The child is live, so neither reader can have reached EOF.
+        for ring in [&host.stdout, &host.stderr] {
+            assert!(
+                !ring.lock().unwrap().exited,
+                "a live child's readers must not have published EOF yet"
+            );
+        }
+
+        host.seal_streams();
+
+        for ring in [&host.stdout, &host.stderr] {
+            let ring = ring.lock().unwrap();
+            assert!(ring.exited, "a forced cutoff must publish completion");
+            assert!(
+                ring.sealed,
+                "a forced cutoff must seal the stream so no append can follow"
+            );
+            assert!(
+                ring.truncated,
+                "a forced cutoff loses untransferred bytes and must disclose it"
+            );
+        }
+        let _ = host.terminate();
+    }
+
+    /// A termination that failed proves nothing about the child or its
+    /// readers, so it must not publish EOF — the host stays non-terminal and
+    /// the supervisor can retry.
+    #[test]
+    fn failed_termination_does_not_publish_eof() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let error = host
+            .terminate_with(|_| Err("injected kill failure".into()))
+            .unwrap_err();
+        assert_eq!(error, "injected kill failure");
+        assert!(
+            !host.is_exited(),
+            "a failed termination must not report a terminal session"
+        );
+        for ring in [&host.stdout, &host.stderr] {
+            let ring = ring.lock().unwrap();
+            assert!(!ring.exited, "a failed termination must not publish EOF");
+            assert!(
+                !ring.sealed,
+                "a failed termination must not seal the stream"
+            );
+        }
+
+        // The real termination still works afterwards.
+        host.terminate().unwrap();
+        assert!(await_structured_exit(&host));
+    }
+
+    #[test]
+    fn forced_termination_publishes_a_terminal_state() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!host.is_exited(), "a live child must not report exit");
+
+        host.terminate().unwrap();
+        assert!(await_structured_exit(&host));
+        assert!(
+            host.exit_code().is_some(),
+            "a terminated child must still carry a terminal exit code"
+        );
     }
 }

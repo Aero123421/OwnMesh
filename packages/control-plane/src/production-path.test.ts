@@ -1044,7 +1044,7 @@ test("production-path negatives: expired authorize and device-verification trans
     // Expired device verification transaction
     await store.putDeviceCode({
       device_code: "dcode_expired_vtx",
-      user_code: "EXPD-CODE",
+      user_code: "XPDF-CDFG",
       client_id: CLIENT,
       scope: "ownmesh.read",
       verification_uri: `${ISSUER}/oauth/device`,
@@ -1057,7 +1057,7 @@ test("production-path negatives: expired authorize and device-verification trans
     await store.putDeviceVerificationTransaction({
       id: vtxId,
       csrf_hash: await sha256Hex(csrfDev),
-      user_code: "EXPD-CODE",
+      user_code: "XPDF-CDFG",
       principal_id: PRINCIPAL_ID,
       client_id: CLIENT,
       scope: "ownmesh.read",
@@ -1116,7 +1116,7 @@ test("production-path: AUTH_PROVIDER unknown tenant fails closed (401/403) on au
     assert.equal(authorizeBody.error, "unknown_tenant");
 
     const deviceRes = await worker.fetch(
-      new Request(`${ISSUER}/oauth/device?user_code=ABCD-EFGH`),
+      new Request(`${ISSUER}/oauth/device?user_code=BCDF-JKLM`),
       e,
       ctx,
     );
@@ -1546,7 +1546,7 @@ test("production-path: synchronous MCP uses a bounded authoritative fast path", 
     ));
     const timeoutElapsed = Date.now() - timeoutStarted;
     assert.equal(timeout.status, "pending");
-    assert.equal(timeout.phase, "delivered");
+    assert.equal(timeout.phase, "dispatched");
     assert.ok(timeoutElapsed >= MCP_SYNC_WAIT_MS - 100, `waited only ${timeoutElapsed}ms`);
     assert.ok(timeoutElapsed < MCP_SYNC_WAIT_MS + 1_000, `waited ${timeoutElapsed}ms`);
     assert.ok(await store.getMcpOperation(String(timeout.operation_id)));
@@ -1967,13 +1967,14 @@ test("production-path: worker /approve is implemented (auth required, not 501)",
       "self_approval_forbidden",
     );
 
-    // Independent human browser auth, missing operation_id → 400 (handler is live).
+    // Independent human browser auth, no operation_id → pending inbox (handler is live).
     const authNoOp = await worker.fetch(
       new Request(`${ISSUER}/approve`),
       env(store),
       ctx,
     );
-    assert.equal(authNoOp.status, 400);
+    assert.equal(authNoOp.status, 200);
+    assert.match(await authNoOp.text(), /Review pending operations/);
     assert.notEqual(authNoOp.status, 501);
   });
 });

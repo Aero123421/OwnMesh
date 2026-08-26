@@ -34,6 +34,7 @@ MINISIGN_BIN="${OWNMESH_MINISIGN:-}"
 BOOTSTRAP_MINISIGN="${OWNMESH_BOOTSTRAP_MINISIGN:-auto}"
 PATH_PROFILE_UPDATED=0
 PATH_PROFILE=""
+SERVICE_WAS_RUNNING=0
 
 REQUIRED_BINARIES="ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker"
 
@@ -603,6 +604,72 @@ ACTUAL="$(sha256_file "$ARCHIVE" | tr 'A-F' 'a-f')"
 
 safe_extract "$ARCHIVE" "$EXTRACT_DIR"
 
+# Unix permits replacing a running executable, so the old daemon can otherwise
+# survive the install and report the previous version indefinitely. Detect only
+# the exact installed ownmeshd image; never select a process by name alone.
+
+# Normalized install-dir pathname, captured before any binary is replaced so a
+# later unlink cannot change what the comparison is made against.
+DAEMON_PATH="$INSTALL_DIR/ownmeshd"
+DAEMON_PATH_CANON="$DAEMON_PATH"
+if install_dir_canon="$(cd "$INSTALL_DIR" 2>/dev/null && pwd -P)"; then
+  DAEMON_PATH_CANON="$install_dir_canon/ownmeshd"
+fi
+
+# Linux appends " (deleted)" to /proc/<pid>/exe once the executable's pathname
+# has been unlinked or replaced while the process still maps the old inode —
+# exactly the stale daemon an upgrade must restart. The suffix is stripped only
+# to compare the remaining pathname against the install-dir daemon; a process is
+# never selected by its name.
+proc_exe_is_install_daemon() {
+  candidate="$1"
+  [ -n "$candidate" ] || return 1
+  case "$candidate" in
+    *" (deleted)") candidate="${candidate% (deleted)}" ;;
+  esac
+  [ "$candidate" = "$DAEMON_PATH" ] || [ "$candidate" = "$DAEMON_PATH_CANON" ]
+}
+
+if [ -d /proc ]; then
+  for exe in /proc/[0-9]*/exe; do
+    if proc_exe_is_install_daemon "$(readlink "$exe" 2>/dev/null || true)"; then
+      SERVICE_WAS_RUNNING=1
+      break
+    fi
+  done
+elif command_exists pgrep; then
+  for pid in $(pgrep -x ownmeshd 2>/dev/null || true); do
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command_line" in
+      "$DAEMON_PATH"|"$DAEMON_PATH"\ *|"$DAEMON_PATH_CANON"|"$DAEMON_PATH_CANON"\ *)
+        SERVICE_WAS_RUNNING=1
+        break
+        ;;
+    esac
+  done
+fi
+
+# The installed user unit is a second, name-independent witness: it is OwnMesh's
+# own descriptor rather than a process that happens to be called "ownmeshd".
+# Consult it when /proc pathname matching found nothing, which also covers hosts
+# where the exe link is not readable.
+if [ "$SERVICE_WAS_RUNNING" -eq 0 ] && command_exists systemctl; then
+  unit_pid="$(systemctl --user show -p MainPID --value ownmesh-ownmeshd.service 2>/dev/null || true)"
+  case "$unit_pid" in
+    ''|0|*[!0-9]*) ;;
+    *)
+      if proc_exe_is_install_daemon "$(readlink "/proc/$unit_pid/exe" 2>/dev/null || true)"; then
+        SERVICE_WAS_RUNNING=1
+      elif [ ! -r "/proc/$unit_pid/exe" ]; then
+        # The unit's main process is alive but its image path is not
+        # observable. The unit identity is authoritative here, and an
+        # unnecessary restart of our own service is safe.
+        SERVICE_WAS_RUNNING=1
+      fi
+      ;;
+  esac
+fi
+
 # Backup existing binaries, then atomic replace per binary.
 mkdir -p "$INSTALL_DIR"
 BACKUP_DIR="$(mktemp -d "$INSTALL_DIR/.ownmesh-backup.XXXXXX")" ||
@@ -678,12 +745,42 @@ for bin in $REQUIRED_BINARIES; do
     fail "failed to install $bin; previous binaries restored"
   fi
 done
-rm -rf "$BACKUP_DIR"
 
 maybe_add_to_path
 
-INSTALLED_VERSION="$("$INSTALL_DIR/ownmesh" --version 2>/dev/null)" ||
-  fail "installed binary did not start (--version smoke failed)"
+if ! INSTALLED_VERSION="$("$INSTALL_DIR/ownmesh" --version 2>/dev/null)"; then
+  if rollback_install; then
+    "$INSTALL_DIR/ownmesh" service start >/dev/null 2>&1 || true
+    rm -rf "$BACKUP_DIR"
+    fail "installed binary did not start; previous binaries restored"
+  fi
+  KEEP_BACKUP=1
+  fail "installed binary did not start and rollback failed (backup left at $BACKUP_DIR)"
+fi
+if [ "$SERVICE_WAS_RUNNING" -eq 1 ]; then
+  if ! "$INSTALL_DIR/ownmesh" service restart >/dev/null 2>&1; then
+    if rollback_install; then
+      "$INSTALL_DIR/ownmesh" service start >/dev/null 2>&1 || true
+      rm -rf "$BACKUP_DIR"
+      fail "updated service did not restart; previous binaries restored"
+    fi
+    KEEP_BACKUP=1
+    fail "updated service did not restart and rollback failed (backup left at $BACKUP_DIR)"
+  fi
+  expected_version="${INSTALLED_VERSION##* }"
+  status_json="$("$INSTALL_DIR/ownmesh" --json status 2>/dev/null || true)"
+  if ! printf '%s' "$status_json" | grep -Fq "\"version\":\"$expected_version\""; then
+    "$INSTALL_DIR/ownmesh" service stop >/dev/null 2>&1 || true
+    if rollback_install; then
+      "$INSTALL_DIR/ownmesh" service start >/dev/null 2>&1 || true
+      rm -rf "$BACKUP_DIR"
+      fail "updated daemon health check failed; previous binaries restored"
+    fi
+    KEEP_BACKUP=1
+    fail "updated daemon health check failed and rollback failed (backup left at $BACKUP_DIR)"
+  fi
+fi
+rm -rf "$BACKUP_DIR"
 say "Installed $INSTALLED_VERSION to $INSTALL_DIR/ownmesh"
 for bin in $REQUIRED_BINARIES; do
   say "  - $INSTALL_DIR/$bin"

@@ -7,9 +7,10 @@ use flate2::Compression;
 use minisign::{sign, KeyPair};
 use ownmesh_update::{
     apply_binaries, binary_file_name, binary_file_name_for, download_and_verify,
-    extract_required_binaries, refuse_downgrade, sha256_hex, validate_url_host, ArchiveKind,
-    FetchKind, FetchRequest, HttpTransport, MapTransport, ReleaseMeta, SelectedRelease, TrustRoot,
-    UpdateChannel, UpdateEngine, UpdateError, REQUIRED_BINARIES,
+    extract_required_binaries, finalize_apply, recover_interrupted_apply, refuse_downgrade,
+    rollback_apply, sha256_hex, validate_url_host, ArchiveKind, FetchKind, FetchRequest,
+    HttpTransport, MapTransport, ReleaseMeta, SelectedRelease, TrustRoot, UpdateChannel,
+    UpdateEngine, UpdateError, REQUIRED_BINARIES,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -280,6 +281,97 @@ fn rollback_and_partial_set_refused() {
     assert_eq!(
         fs::read_to_string(install.join(binary_file_name("ownmesh-broker"))).unwrap(),
         "new-ownmesh-broker"
+    );
+}
+
+#[test]
+fn interrupted_apply_recovers_all_five_binaries_and_finalize_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    fs::create_dir_all(&install).unwrap();
+    let mut next = BTreeMap::new();
+    for base in REQUIRED_BINARIES {
+        let name = binary_file_name(base);
+        fs::write(install.join(&name), format!("old-{base}")).unwrap();
+        next.insert(name, format!("new-{base}").into_bytes());
+    }
+
+    let _report = apply_binaries(&install, &next, "1.2.11").unwrap();
+    assert!(recover_interrupted_apply(&install).unwrap());
+    for base in REQUIRED_BINARIES {
+        assert_eq!(
+            fs::read_to_string(install.join(binary_file_name(base))).unwrap(),
+            format!("old-{base}")
+        );
+    }
+    assert!(!recover_interrupted_apply(&install).unwrap());
+
+    let report = apply_binaries(&install, &next, "1.2.11").unwrap();
+    finalize_apply(&report).unwrap();
+    assert!(!recover_interrupted_apply(&install).unwrap());
+    for base in REQUIRED_BINARIES {
+        assert_eq!(
+            fs::read_to_string(install.join(binary_file_name(base))).unwrap(),
+            format!("new-{base}")
+        );
+    }
+
+    let report = apply_binaries(&install, &next, "1.2.12").unwrap();
+    rollback_apply(&report).unwrap();
+    assert!(!recover_interrupted_apply(&install).unwrap());
+}
+
+#[test]
+fn interrupted_first_install_removes_every_new_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    let mut next = BTreeMap::new();
+    for base in REQUIRED_BINARIES {
+        next.insert(binary_file_name(base), format!("new-{base}").into_bytes());
+    }
+
+    let report = apply_binaries(&install, &next, "1.2.11").unwrap();
+    assert!(report.backup_dir.as_ref().is_some_and(|path| path.is_dir()));
+    assert!(recover_interrupted_apply(&install).unwrap());
+    for base in REQUIRED_BINARIES {
+        assert!(!install.join(binary_file_name(base)).exists());
+    }
+    assert!(!recover_interrupted_apply(&install).unwrap());
+}
+
+#[test]
+fn unsafe_version_label_is_refused_before_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    let mut bins = BTreeMap::new();
+    for base in REQUIRED_BINARIES {
+        bins.insert(binary_file_name(base), b"new".to_vec());
+    }
+    let error = apply_binaries(&install, &bins, "../escape").unwrap_err();
+    assert!(matches!(error, UpdateError::Install(_)));
+    assert!(!install.join(".ownmesh-staging-../escape").exists());
+}
+
+#[test]
+fn corrupted_rollback_backup_is_refused_without_overwriting_new_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    fs::create_dir_all(&install).unwrap();
+    let mut bins = BTreeMap::new();
+    for base in REQUIRED_BINARIES {
+        let name = binary_file_name(base);
+        fs::write(install.join(&name), format!("old-{base}")).unwrap();
+        bins.insert(name, format!("new-{base}").into_bytes());
+    }
+    let report = apply_binaries(&install, &bins, "1.2.11").unwrap();
+    let backup = report.backup_dir.as_ref().unwrap();
+    fs::write(backup.join(binary_file_name("ownmesh")), b"tampered").unwrap();
+
+    let error = recover_interrupted_apply(&install).unwrap_err();
+    assert!(matches!(error, UpdateError::Install(_)));
+    assert_eq!(
+        fs::read_to_string(install.join(binary_file_name("ownmesh"))).unwrap(),
+        "new-ownmesh"
     );
 }
 
