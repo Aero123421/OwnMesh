@@ -977,6 +977,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "content": marker,
                         "async": True,
@@ -1003,6 +1004,7 @@ def main() -> int:
                     "ownmesh_fs_read",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "async": True,
                         "idempotency_key": f"idem_read_{marker}",
@@ -1032,6 +1034,7 @@ def main() -> int:
                     "ownmesh_command_run",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "program": program,
                         "args": args,
                         "env": {"OWNMESH_E2_ENV": env_marker},
@@ -1083,6 +1086,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "content": marker,
                         "async": True,
@@ -1120,6 +1124,7 @@ def main() -> int:
                     "ownmesh_command_run",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "program": long_program,
                         "args": long_args,
                         "async": True,
@@ -1164,6 +1169,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "content": f"mismatched-action-{marker}",
                         "async": True,
@@ -1192,6 +1198,7 @@ def main() -> int:
                     "ownmesh_fs_read",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": binary_name,
                         "offset": 0,
                         "max_bytes": 4,
@@ -1236,6 +1243,7 @@ def main() -> int:
                         "ownmesh_fs_read",
                         {
                             "device_id": device_id,
+                            "workspace_id": "ws_default",
                             "path": big_name,
                             "offset": offset,
                             "max_bytes": want,
@@ -1296,6 +1304,7 @@ def main() -> int:
                     "ownmesh_fs_list",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": ".",
                         "async": True,
                         "idempotency_key": f"idem_list_{marker}",
@@ -1316,6 +1325,7 @@ def main() -> int:
                     "ownmesh_fs_stat",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-list-a.txt",
                         "async": True,
                         "idempotency_key": f"idem_stat_{marker}",
@@ -1338,6 +1348,7 @@ def main() -> int:
                     "ownmesh_fs_delete",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-list-b.txt",
                         "async": True,
                         "idempotency_key": f"idem_del_{marker}",
@@ -1361,6 +1372,7 @@ def main() -> int:
                     "ownmesh_fs_patch",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": patch_path,
                         "content": f"after-patch-{marker}",
                         "expected_sha256": expected_hash,
@@ -1383,6 +1395,7 @@ def main() -> int:
                     "ownmesh_fs_patch",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": patch_path,
                         "content": "should-not-apply",
                         "expected_sha256": expected_hash,
@@ -1411,6 +1424,7 @@ def main() -> int:
                     "ownmesh_command_shell",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "command": shell_cmd,
                         "async": True,
                         "idempotency_key": f"idem_shell_{marker}",
@@ -2630,6 +2644,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": ask_name,
                         "content": f"approved-{marker}",
                         "async": True,
@@ -2759,6 +2774,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": delegated_name,
                         "content": f"delegated-{marker}",
                         "async": True,
@@ -3017,6 +3033,7 @@ def main() -> int:
                         "name": "ownmesh_fs_write",
                         "arguments": {
                             "device_id": device_id,
+                            "workspace_id": "ws_default",
                             "path": "no-key.txt",
                             "content": "x",
                             "async": True,
