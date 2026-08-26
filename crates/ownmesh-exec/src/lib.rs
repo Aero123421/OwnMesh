@@ -417,6 +417,20 @@ fn current_link_target(path: &Path) -> ExecResult<Option<String>> {
     Ok(None)
 }
 
+/// Device/inode identity of a path, without hashing its contents.
+///
+/// Recognizes the same file reached through a different path, symlink, or
+/// hard link — the identity check [`pin_executable`] performs, minus the
+/// full-content digest, for callers that only need "is this the same file?".
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be opened or inspected.
+pub fn file_identity(path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    let file = File::open(path)?;
+    open_file_identity(&file)
+}
+
 /// Capture device/inode/content digest for a structured executable path.
 ///
 /// # Errors

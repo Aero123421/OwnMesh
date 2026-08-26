@@ -29,7 +29,14 @@ import {
   verifyInternalContext,
 } from "./util.ts";
 import { createStore, type ControlPlaneStore, type McpOperationRecord, type WorkspaceRecord } from "./store.ts";
-import { normalizeSystemDiagnosis } from "./mcp.ts";
+import {
+  authorityInvalidationError,
+  authorityInvalidationSummary,
+  boundAuthorityInvalidationReason,
+  boundPrincipalAuthority,
+  boundPrincipalAuthorityCurrent,
+  normalizeSystemDiagnosis,
+} from "./mcp.ts";
 import {
   annotatePolicyObservation,
   annotateWorkspaceList,
@@ -527,12 +534,6 @@ function readyWorkspaceRegistry(
   return { workspaces, enforce_workspace: raw.enforce_workspace };
 }
 
-type PrincipalCredentialBinding = {
-  principal_id: string;
-  tenant_id: string;
-  generation: number;
-};
-
 type WorkspaceAuthorityResult =
   | "ok"
   | "binding_mismatch"
@@ -558,24 +559,6 @@ function workspaceAuthorityBinding(
     action.workspace_version < 1
   ) return null;
   return { workspace_id: action.workspace_id, version: action.workspace_version };
-}
-
-/** Extract only a complete, server-bound credential epoch from an operation. */
-function principalCredentialBinding(payload: Record<string, unknown>): PrincipalCredentialBinding | null {
-  const authorization = payload.authorization;
-  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
-  const bound = (authorization as Record<string, unknown>).bound_action;
-  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
-  const action = bound as Record<string, unknown>;
-  const principalId = action.principal_id;
-  const tenantId = action.tenant_id;
-  const generation = action.principal_credential_generation;
-  if (
-    typeof principalId !== "string" || principalId.trim() === "" ||
-    typeof tenantId !== "string" || tenantId.trim() === "" ||
-    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
-  ) return null;
-  return { principal_id: principalId, tenant_id: tenantId, generation };
 }
 
 type SessionIngressGuard = {
@@ -2358,16 +2341,18 @@ export class DeviceRoom {
     expected?: { principal_id: string; tenant_id: string },
   ): Promise<"ok" | "binding_mismatch" | "credential_generation_mismatch" | "storage_unavailable"> {
     if (!this.env.DB) return "storage_unavailable";
-    const binding = principalCredentialBinding(payload);
+    const binding = boundPrincipalAuthority(payload);
     if (!binding) return "binding_mismatch";
     if (
       expected &&
       (binding.principal_id !== expected.principal_id || binding.tenant_id !== expected.tenant_id)
     ) return "binding_mismatch";
     try {
+      // #162: one shared decision with the Worker-side gates in mcp.ts.
+      // Authority is removed by revocation and refresh-family reuse, not by
+      // reissuing a token.
       const current = await createStore(this.env).getPrincipal(binding.principal_id);
-      if (!current || current.tenant_id !== binding.tenant_id) return "credential_generation_mismatch";
-      return current.credential_generation === binding.generation
+      return boundPrincipalAuthorityCurrent(binding, current)
         ? "ok"
         : "credential_generation_mismatch";
     } catch {
@@ -2466,20 +2451,16 @@ export class DeviceRoom {
       const check = await this.credentialGenerationCurrent(pending.payload);
       if (check === "ok") continue;
       if (check === "storage_unavailable") throw new Error("storage_unavailable");
+      // #162: same bounded reason and retry contract as the Worker-side gates.
+      const reason = await boundAuthorityInvalidationReason(store, pending.payload);
       this.router.pending.delete(pending.correlation_id);
       removed = true;
       await store.updateMcpOperation(
         operationId,
         {
           status: "failed",
-          summary: "operation authorization invalidated before device delivery",
-          data: {
-            error: {
-              code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-              message: "principal credential rotated or was revoked before device delivery",
-              retryable: false,
-            },
-          },
+          summary: authorityInvalidationSummary(reason, "delivery"),
+          data: { error: authorityInvalidationError(reason, "delivery") },
           approval_required: false,
         },
         ["pending", "running", "approval_required", "cancel_requested"],
