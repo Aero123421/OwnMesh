@@ -148,20 +148,32 @@ def wait_for_health(issuer: str, process: subprocess.Popen[bytes]) -> None:
     raise RuntimeError("timed out waiting for local workerd health")
 
 
+def loopback_failure_logs(log_path: Path) -> str:
+    daemon = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    wrangler_path = log_path.parent / "wrangler.log"
+    wrangler = (
+        wrangler_path.read_text(encoding="utf-8", errors="replace")
+        if wrangler_path.exists()
+        else ""
+    )
+    return f"ownmeshd:\n{daemon[-4000:]}\nworkerd:\n{wrangler[-4000:]}"
+
+
 def wait_for_ready(process: subprocess.Popen[bytes], log_path: Path) -> dict[str, object]:
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            text = log_path.read_text(encoding="utf-8", errors="replace")
-            raise RuntimeError(f"ownmeshd exited before ready ({process.returncode})\n{text[-4000:]}")
+            raise RuntimeError(
+                f"ownmeshd exited before ready ({process.returncode})\n"
+                f"{loopback_failure_logs(log_path)}"
+            )
         text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
         if "Agent WebSocket authenticated and ready" in text:
             state_path = log_path.parent / "state" / "agent-transport-state.json"
             # State is JSON UTF-8; never decode with the Windows ANSI code page.
             return json.loads(state_path.read_text(encoding="utf-8"))
         time.sleep(0.2)
-    text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    raise RuntimeError(f"timed out waiting for ownmeshd ready\n{text[-4000:]}")
+    raise RuntimeError(f"timed out waiting for ownmeshd ready\n{loopback_failure_logs(log_path)}")
 
 
 def stop_process(process: subprocess.Popen[bytes] | None) -> None:
@@ -663,33 +675,37 @@ def main() -> int:
             if not isinstance(devices, list) or not any(d.get("id") == device_id for d in devices if isinstance(d, dict)):
                 raise RuntimeError(f"device {device_id} missing from list_devices: {listed}")
 
-            # E4 cloud custody bootstrap for the two device-local roots used by
-            # this real-path proof. MCP owns tenant/device/principal/version;
-            # ownmeshd canonicalizes and upserts the corresponding local root.
-            for rpc_id, workspace_id, workspace_path in (
-                (96, "ws_default", workspace_dir),
-                (97, "ws_alt", workspace_alt),
-            ):
-                ws_sc = structured(
-                    mcp_call(
-                        issuer,
-                        access_token,
-                        "ownmesh_workspace_add",
-                        {
-                            "device_id": device_id,
-                            "id": workspace_id,
-                            "path": str(workspace_path.resolve()),
-                            "async": True,
-                            "idempotency_key": f"idem_workspace_bootstrap_{workspace_id}_{marker}",
-                        },
-                        rpc_id=rpc_id,
+            # The ready handshake publishes the full device-local registry and
+            # durably activates these roots before the Agent is exposed as
+            # ready. Re-adding them through MCP is a real ID conflict, not an
+            # idempotent bootstrap. Prove the authoritative handshake state by
+            # routing a list through the live device instead.
+            bootstrap_list = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_workspace_list",
+                    {
+                        "device_id": device_id,
+                        "async": True,
+                        "idempotency_key": f"idem_workspace_bootstrap_list_{marker}",
+                    },
+                    rpc_id=96,
+                )
+            )
+            bootstrap_done = wait_operation(
+                issuer,
+                access_token,
+                str(bootstrap_list.get("operation_id") or ""),
+                want={"completed"},
+            )
+            bootstrap_dump = json.dumps(bootstrap_done)
+            for workspace_id in ("ws_default", "ws_alt"):
+                if workspace_id not in bootstrap_dump:
+                    raise RuntimeError(
+                        f"ready handshake omitted {workspace_id} from workspace custody: "
+                        f"{bootstrap_done}"
                     )
-                )
-                ws_done = wait_operation(
-                    issuer, access_token, str(ws_sc.get("operation_id") or ""), want={"completed"}
-                )
-                if workspace_id not in json.dumps(ws_done):
-                    raise RuntimeError(f"workspace custody bootstrap failed: {ws_done}")
             # Explicit E4 collaboration grant: tenant membership alone is not a
             # workspace grant. The second principal used for E5 handoff gets
             # only the default-root membership, never implicit device-wide ACL.
