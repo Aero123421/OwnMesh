@@ -1893,6 +1893,16 @@ fn authoritative_terminal_correlations(payload: &Value) -> Result<Vec<String>, S
     Ok(validated)
 }
 
+fn validate_workspace_registry_ack(payload: &Value) -> Result<(), String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "workspace.registry.ack payload must be an object".to_owned())?;
+    if object.len() != 1 || object.get("ok") != Some(&Value::Bool(true)) {
+        return Err("workspace.registry.ack requires exactly {\"ok\":true}".into());
+    }
+    Ok(())
+}
+
 fn dispatch_outcome_unknown_reply(operation_id: &ownmesh_domain::OperationId) -> Value {
     json!({
         "operation_contract": OPERATION_CONTRACT_V1,
@@ -2194,6 +2204,7 @@ async fn handle_live_frame(
     };
     match envelope.message_type.as_str() {
         "pong" => Ok(()),
+        "workspace.registry.ack" => validate_workspace_registry_ack(&envelope.payload),
         "ping" => {
             send_envelope(
                 socket,
@@ -3026,6 +3037,11 @@ fn map_request_to_method(
     // Optional recovery/admin approval decision notification from the control plane.
     // Local policy remains authoritative; this is not a ChatGPT attestation.
     if request.capability == "approval.decision" || action == "approval.decision" {
+        // The workspace/version already participated in exact-action verification,
+        // while the deferred request is bound again by its original payload hash.
+        // Do not leak the routing-only workspace field into the strict runtime
+        // approval schema (`deny_unknown_fields`).
+        args.remove("workspace_id");
         return Ok(("__approval_decision__", Value::Object(args)));
     }
 
@@ -5069,7 +5085,6 @@ mod tests {
 
         let server_device = device.clone();
         let notify_for_server = Arc::clone(&registry_notify);
-        let _ = server_device;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             // The test client connects with plain connect_async and drives
@@ -5108,6 +5123,36 @@ mod tests {
                         .is_some_and(|g: &str| g.starts_with("wsg_"))),
                 "full snapshot must include the default workspace generation: {workspaces:?}"
             );
+            // A durable registry acknowledgement is a live-session control
+            // message, not a reconnect boundary. The Agent must accept it and
+            // continue serving subsequent frames on the same socket.
+            send_test_envelope(
+                &mut socket,
+                &server_device,
+                1,
+                "workspace.registry.ack",
+                json!({ "ok": true }),
+                None,
+            )
+            .await;
+            send_test_envelope(
+                &mut socket,
+                &server_device,
+                2,
+                "ping",
+                json!({ "probe": "after_registry_ack" }),
+                Some("corr_registry_ack_probe"),
+            )
+            .await;
+            let pong =
+                tokio::time::timeout(Duration::from_secs(5), receive_test_envelope(&mut socket))
+                    .await
+                    .expect("Agent must remain connected after workspace.registry.ack");
+            assert_eq!(pong.message_type, "pong");
+            assert_eq!(
+                pong.correlation_id.as_deref(),
+                Some("corr_registry_ack_probe")
+            );
             socket.send(Message::Close(None)).await.unwrap();
         });
 
@@ -5128,6 +5173,19 @@ mod tests {
             .await
             .expect("server task must finish")
             .unwrap();
+    }
+
+    #[test]
+    fn workspace_registry_ack_requires_exact_success_payload() {
+        assert!(validate_workspace_registry_ack(&json!({ "ok": true })).is_ok());
+        for invalid in [
+            json!({ "ok": false }),
+            json!({ "ok": true, "extra": true }),
+            json!({}),
+            json!(true),
+        ] {
+            assert!(validate_workspace_registry_ack(&invalid).is_err());
+        }
     }
 
     #[tokio::test]
@@ -6332,6 +6390,43 @@ mod tests {
             &"ab".repeat(32),
         );
         assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+    }
+
+    #[test]
+    fn approval_decision_binding_requires_and_accepts_workspace_version() {
+        let device = DeviceId::parse("dev_apr_workspace").unwrap();
+        let (mut request, expires) = sample_bound_approval_decision(
+            device.as_str(),
+            "op_target_write",
+            "approve",
+            &"ef".repeat(32),
+        );
+        request.workspace_id = Some(ownmesh_domain::WorkspaceId::parse("ws_default").unwrap());
+        let bound = request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap();
+        bound.insert("workspace_id".into(), json!("ws_default"));
+        refresh_bound_hash(&mut request);
+        let err = verify_exact_action_binding(&device, &request, Some(&expires)).unwrap_err();
+        assert!(err.contains("workspace_version"), "{err}");
+
+        request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_version".into(), json!(7));
+        refresh_bound_hash(&mut request);
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+        let (method, params) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, "__approval_decision__");
+        assert!(params.get("workspace_id").is_none());
     }
 
     #[test]

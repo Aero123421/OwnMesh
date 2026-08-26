@@ -403,6 +403,13 @@ export type DeferredDispatch = {
   client_session_id?: string;
 };
 
+/** workspace.registry ACK staged until D1 + room-state persistence succeeds. */
+export type DeferredWorkspaceRegistryAck = {
+  session_id: string;
+  frame: string;
+  workspace_count: number;
+};
+
 export type HandleMessageResult = {
   ok: boolean;
   error?: string;
@@ -449,6 +456,8 @@ export type HandleMessageResult = {
     enforce_workspace: boolean;
     workspaces: Array<{ id: string; generation: string }>;
   };
+  /** Send only after workspace_registry_sync and room seq state are durable. */
+  deferred_workspace_registry_ack?: DeferredWorkspaceRegistryAck;
 };
 
 const MAX_AGENT_VERSION_LENGTH = 128;
@@ -1482,19 +1491,20 @@ export class DeviceRoomRouter {
           );
           return { ok: false, error: "invalid_workspace_registry" };
         }
+        // Reserve the outbound sequence now, but do not expose success until
+        // DeviceRoom has durably committed both the D1 snapshot and this room
+        // sequence. ADR 0014 requires storage failure to tear down with no ACK.
         const ack = this.nextEnvelope("workspace.registry.ack", { ok: true }, msg.correlation_id);
-        this.sendToSession(sessionId, JSON.stringify(ack));
-        void this.audit.append({
-          kind: "device.ready",
-          summary: "agent workspace registry refresh",
-          device_id: this.deviceId,
-          meta: { workspace_count: refreshRegistry.workspaces.length },
-        });
         return {
           ok: true,
           workspace_registry_sync: {
             enforce_workspace: refreshRegistry.enforce_workspace,
             workspaces: refreshRegistry.workspaces,
+          },
+          deferred_workspace_registry_ack: {
+            session_id: sessionId,
+            frame: JSON.stringify(ack),
+            workspace_count: refreshRegistry.workspaces.length,
           },
         };
       }
@@ -1506,6 +1516,21 @@ export class DeviceRoomRouter {
       default:
         return { ok: false, error: "unsupported_message_type" };
     }
+  }
+
+  /** Deliver a workspace registry ACK only after its durable barriers pass. */
+  finalizeWorkspaceRegistryAck(deferred: DeferredWorkspaceRegistryAck): boolean {
+    const delivered = this.sendToSession(deferred.session_id, deferred.frame);
+    void this.audit.append({
+      kind: "device.ready",
+      summary: "agent workspace registry refresh",
+      device_id: this.deviceId,
+      meta: {
+        workspace_count: deferred.workspace_count,
+        ack_delivered: delivered,
+      },
+    });
+    return delivered;
   }
 
   /**
@@ -1934,6 +1959,9 @@ export class DeviceRoomHarness {
     if (result.ok && result.deferred_dispatch) {
       this.router.finalizeDeferredDispatch(result.deferred_dispatch);
     }
+    if (result.ok && result.deferred_workspace_registry_ack) {
+      this.router.finalizeWorkspaceRegistryAck(result.deferred_workspace_registry_ack);
+    }
     return result;
   }
 
@@ -1945,6 +1973,9 @@ export class DeviceRoomHarness {
     }
     if (result.ok && result.deferred_dispatch) {
       this.router.finalizeDeferredDispatch(result.deferred_dispatch);
+    }
+    if (result.ok && result.deferred_workspace_registry_ack) {
+      this.router.finalizeWorkspaceRegistryAck(result.deferred_workspace_registry_ack);
     }
     return result;
   }
@@ -2679,7 +2710,17 @@ export class DeviceRoom {
           : correlationId;
       try {
         const store = createStore(this.env);
-        const operation = await store.getMcpOperation(operationId);
+        // approval.decision uses a fresh notification operation id that is not
+        // stored in D1. Its authorization, however, is deliberately bound to
+        // the original approval_required operation. Revalidate that target at
+        // this final delivery boundary so a workspace remap cannot make an old
+        // approval execute against a new local root.
+        const approvalDecision = approvalDecisionBindingFromPayload(body.payload);
+        const authorityOperationId = approvalDecision?.target_operation_id || operationId;
+        const operation = await store.getMcpOperation(authorityOperationId);
+        if (approvalDecision && !operation) {
+          return json({ error: "binding_mismatch" }, { status: 403 });
+        }
         if (operation) {
           if (
             operation.device_id !== this.deviceId ||
@@ -2705,7 +2746,7 @@ export class DeviceRoom {
               status: "rejected",
               detail: {
                 code: "OWNMESH_E_OPERATION_DISPATCH_FENCED",
-                operation_id: operationId,
+                operation_id: authorityOperationId,
                 operation_status: operation.status,
               },
             });
@@ -2714,7 +2755,7 @@ export class DeviceRoom {
           if (workspaceCheck === "storage_unavailable") throw new Error("storage_unavailable");
           if (workspaceCheck !== "ok") {
             await store.updateMcpOperation(
-              operationId,
+              authorityOperationId,
               {
                 status: "failed",
                 summary: "workspace authority changed before device delivery",
@@ -2738,7 +2779,7 @@ export class DeviceRoom {
               status: "rejected",
               detail: {
                 code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
-                operation_id: operationId,
+                operation_id: authorityOperationId,
               },
             });
           }
@@ -3382,6 +3423,13 @@ export class DeviceRoom {
           return;
         }
       }
+    }
+
+    // ADR 0014: acknowledge a live registry refresh only after both the D1
+    // snapshot above and the room-state barrier (including outbound seq) are
+    // durable. Every failure path before here returns without an ACK.
+    if (result.ok && result.deferred_workspace_registry_ack) {
+      this.router.finalizeWorkspaceRegistryAck(result.deferred_workspace_registry_ack);
     }
 
     // Close decision stays in the DO; router remains pure/testable.

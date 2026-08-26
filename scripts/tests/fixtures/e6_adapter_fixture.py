@@ -16,6 +16,7 @@ import time
 PROFILE = os.environ.get("E6_PROFILE", "")
 ARGS = sys.argv[1:]
 ACP = {"kimi-code", "opencode", "qwen-code", "hermes-agent", "qoder"}
+DELAYED_COMPLETION_SECONDS = 5.0
 
 
 def fail(message: str) -> None:
@@ -61,7 +62,10 @@ def codex() -> None:
     emit({"id": 2, "result": {"thread": {"id": "native_codex"}}})
     turn = read()
     require(turn.get("id") == 3 and turn.get("method") == "turn/start" and "jsonrpc" not in turn, "turn start")
-    time.sleep(3.2)
+    # Longer than ownmeshd's three-second structured-bootstrap deadline. A
+    # successful session.open therefore proves that open-ready does not wait
+    # for the turn response, without depending on runner startup speed.
+    time.sleep(DELAYED_COMPLETION_SECONDS)
     emit({"id": 3, "error": {"code": -32001, "message": "delayed fixture error"}})
     emit({"type": "message", "text": "codex-delayed-output", "native_session_id": "native_codex"})
     time.sleep(60)
@@ -99,7 +103,7 @@ def acp() -> None:
         emit({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": native}})
     prompt = read()
     require(prompt.get("jsonrpc") == "2.0" and prompt.get("id") == 3 and prompt.get("method") == "session/prompt", "ACP prompt")
-    time.sleep(3.2 if PROFILE == "kimi-code" else 0.05)
+    time.sleep(DELAYED_COMPLETION_SECONDS if PROFILE == "kimi-code" else 0.05)
     emit({"type": "message", "text": f"{PROFILE}-output", "native_session_id": native})
     emit({"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}})
     time.sleep(60)

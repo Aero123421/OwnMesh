@@ -32,6 +32,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE = ROOT / "packages" / "control-plane"
 E6_FIXTURE = ROOT / "scripts" / "tests" / "fixtures" / "e6_adapter_fixture.py"
+OPERATION_NAMES: dict[str, str] = {}
 
 
 def install_e6_profile_fixtures(directory: Path) -> None:
@@ -148,20 +149,36 @@ def wait_for_health(issuer: str, process: subprocess.Popen[bytes]) -> None:
     raise RuntimeError("timed out waiting for local workerd health")
 
 
+def loopback_failure_logs(log_path: Path) -> str:
+    daemon_logs: list[str] = []
+    for candidate in sorted(log_path.parent.glob("ownmeshd*.log")):
+        daemon = candidate.read_text(encoding="utf-8", errors="replace")
+        daemon_logs.append(f"{candidate.name}:\n{daemon[-4000:]}")
+    wrangler_path = log_path.parent / "wrangler.log"
+    wrangler = (
+        wrangler_path.read_text(encoding="utf-8", errors="replace")
+        if wrangler_path.exists()
+        else ""
+    )
+    daemon_output = "\n\n".join(daemon_logs)
+    return f"{daemon_output}\nworkerd:\n{wrangler[-4000:]}"
+
+
 def wait_for_ready(process: subprocess.Popen[bytes], log_path: Path) -> dict[str, object]:
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            text = log_path.read_text(encoding="utf-8", errors="replace")
-            raise RuntimeError(f"ownmeshd exited before ready ({process.returncode})\n{text[-4000:]}")
+            raise RuntimeError(
+                f"ownmeshd exited before ready ({process.returncode})\n"
+                f"{loopback_failure_logs(log_path)}"
+            )
         text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
         if "Agent WebSocket authenticated and ready" in text:
             state_path = log_path.parent / "state" / "agent-transport-state.json"
             # State is JSON UTF-8; never decode with the Windows ANSI code page.
             return json.loads(state_path.read_text(encoding="utf-8"))
         time.sleep(0.2)
-    text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    raise RuntimeError(f"timed out waiting for ownmeshd ready\n{text[-4000:]}")
+    raise RuntimeError(f"timed out waiting for ownmeshd ready\n{loopback_failure_logs(log_path)}")
 
 
 def stop_process(process: subprocess.Popen[bytes] | None) -> None:
@@ -293,6 +310,9 @@ def mcp_call(issuer: str, token: str, name: str, arguments: dict[str, object], r
     result = body.get("result")
     if not isinstance(result, dict):
         raise RuntimeError(f"mcp {name} missing result: {body}")
+    operation_id = find_value(result, "operation_id")
+    if name != "ownmesh_get_operation" and isinstance(operation_id, str):
+        OPERATION_NAMES[operation_id] = name
     return result
 
 
@@ -387,9 +407,15 @@ def wait_operation(issuer: str, token: str, operation_id: str, *, want: set[str]
         if status in want:
             return sc
         if status in {"failed", "denied", "cancelled", "device_offline"} and status not in want:
-            raise RuntimeError(f"operation {operation_id} terminal failure: {sc}")
+            operation_name = OPERATION_NAMES.get(operation_id, "unknown")
+            raise RuntimeError(
+                f"operation {operation_id} ({operation_name}) terminal failure: {sc}"
+            )
         time.sleep(0.25)
-    raise RuntimeError(f"timed out waiting for {operation_id} in {want}; last={last}")
+    operation_name = OPERATION_NAMES.get(operation_id, "unknown")
+    raise RuntimeError(
+        f"timed out waiting for {operation_id} ({operation_name}) in {want}; last={last}"
+    )
 
 
 def main() -> int:
@@ -509,6 +535,7 @@ def main() -> int:
             }
         )
         base_env["PATH"] = str(fixture_bin_dir) + os.pathsep + base_env.get("PATH", "")
+        log_path = temp / "ownmeshd-0.log"
 
         try:
             run_checked(
@@ -643,7 +670,6 @@ def main() -> int:
             wait_for_health(issuer, wrangler_process)
 
             binary = ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
-            log_path = temp / "ownmeshd-0.log"
             daemon_process = start_daemon(binary, base_env, log_path)
             state0 = wait_for_ready(daemon_process, log_path)
 
@@ -663,33 +689,37 @@ def main() -> int:
             if not isinstance(devices, list) or not any(d.get("id") == device_id for d in devices if isinstance(d, dict)):
                 raise RuntimeError(f"device {device_id} missing from list_devices: {listed}")
 
-            # E4 cloud custody bootstrap for the two device-local roots used by
-            # this real-path proof. MCP owns tenant/device/principal/version;
-            # ownmeshd canonicalizes and upserts the corresponding local root.
-            for rpc_id, workspace_id, workspace_path in (
-                (96, "ws_default", workspace_dir),
-                (97, "ws_alt", workspace_alt),
-            ):
-                ws_sc = structured(
-                    mcp_call(
-                        issuer,
-                        access_token,
-                        "ownmesh_workspace_add",
-                        {
-                            "device_id": device_id,
-                            "id": workspace_id,
-                            "path": str(workspace_path.resolve()),
-                            "async": True,
-                            "idempotency_key": f"idem_workspace_bootstrap_{workspace_id}_{marker}",
-                        },
-                        rpc_id=rpc_id,
+            # The ready handshake publishes the full device-local registry and
+            # durably activates these roots before the Agent is exposed as
+            # ready. Re-adding them through MCP is a real ID conflict, not an
+            # idempotent bootstrap. Prove the authoritative handshake state by
+            # routing a list through the live device instead.
+            bootstrap_list = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_workspace_list",
+                    {
+                        "device_id": device_id,
+                        "async": True,
+                        "idempotency_key": f"idem_workspace_bootstrap_list_{marker}",
+                    },
+                    rpc_id=96,
+                )
+            )
+            bootstrap_done = wait_operation(
+                issuer,
+                access_token,
+                str(bootstrap_list.get("operation_id") or ""),
+                want={"completed"},
+            )
+            bootstrap_dump = json.dumps(bootstrap_done)
+            for workspace_id in ("ws_default", "ws_alt"):
+                if workspace_id not in bootstrap_dump:
+                    raise RuntimeError(
+                        f"ready handshake omitted {workspace_id} from workspace custody: "
+                        f"{bootstrap_done}"
                     )
-                )
-                ws_done = wait_operation(
-                    issuer, access_token, str(ws_sc.get("operation_id") or ""), want={"completed"}
-                )
-                if workspace_id not in json.dumps(ws_done):
-                    raise RuntimeError(f"workspace custody bootstrap failed: {ws_done}")
             # Explicit E4 collaboration grant: tenant membership alone is not a
             # workspace grant. The second principal used for E5 handoff gets
             # only the default-root membership, never implicit device-wide ACL.
@@ -703,7 +733,7 @@ def main() -> int:
                     "--persist-to",
                     str(persist),
                     "--command",
-                    "INSERT OR IGNORE INTO workspace_members (workspace_id,principal_id,created_at) VALUES ('ws_default','prin_other','2026-08-08T00:00:00.000Z');",
+                    f"INSERT OR IGNORE INTO device_workspace_members (device_id,workspace_id,principal_id,created_at) VALUES ({device_id!r},'ws_default','prin_other','2026-08-08T00:00:00.000Z');",
                 ),
                 cwd=CONTROL_PLANE,
                 env=base_env,
@@ -741,7 +771,6 @@ def main() -> int:
 
             e6_sessions: dict[str, tuple[str, str, int]] = {}
             for offset, profile_id in enumerate(profile_ids):
-                started = time.monotonic()
                 opened = structured(
                     mcp_call(
                         issuer,
@@ -763,8 +792,6 @@ def main() -> int:
                 opened_done = wait_operation(
                     issuer, access_token, str(opened.get("operation_id") or ""), want={"completed"}
                 )
-                if profile_id == "codex" and time.monotonic() - started >= 3.15:
-                    raise RuntimeError("E6 Codex open waited for delayed turn completion")
                 session_id = session_id_from_operation(opened_done)
                 lease_id = find_value(opened_done, "lease_id")
                 controller_epoch = find_value(opened_done, "controller_epoch")
@@ -964,6 +991,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "content": marker,
                         "async": True,
@@ -990,6 +1018,7 @@ def main() -> int:
                     "ownmesh_fs_read",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "async": True,
                         "idempotency_key": f"idem_read_{marker}",
@@ -1019,6 +1048,7 @@ def main() -> int:
                     "ownmesh_command_run",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "program": program,
                         "args": args,
                         "env": {"OWNMESH_E2_ENV": env_marker},
@@ -1070,6 +1100,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "content": marker,
                         "async": True,
@@ -1107,6 +1138,7 @@ def main() -> int:
                     "ownmesh_command_run",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "program": long_program,
                         "args": long_args,
                         "async": True,
@@ -1151,6 +1183,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-marker.txt",
                         "content": f"mismatched-action-{marker}",
                         "async": True,
@@ -1179,6 +1212,7 @@ def main() -> int:
                     "ownmesh_fs_read",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": binary_name,
                         "offset": 0,
                         "max_bytes": 4,
@@ -1223,6 +1257,7 @@ def main() -> int:
                         "ownmesh_fs_read",
                         {
                             "device_id": device_id,
+                            "workspace_id": "ws_default",
                             "path": big_name,
                             "offset": offset,
                             "max_bytes": want,
@@ -1283,6 +1318,7 @@ def main() -> int:
                     "ownmesh_fs_list",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": ".",
                         "async": True,
                         "idempotency_key": f"idem_list_{marker}",
@@ -1303,6 +1339,7 @@ def main() -> int:
                     "ownmesh_fs_stat",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-list-a.txt",
                         "async": True,
                         "idempotency_key": f"idem_stat_{marker}",
@@ -1325,6 +1362,7 @@ def main() -> int:
                     "ownmesh_fs_delete",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": "e2-list-b.txt",
                         "async": True,
                         "idempotency_key": f"idem_del_{marker}",
@@ -1348,6 +1386,7 @@ def main() -> int:
                     "ownmesh_fs_patch",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": patch_path,
                         "content": f"after-patch-{marker}",
                         "expected_sha256": expected_hash,
@@ -1370,6 +1409,7 @@ def main() -> int:
                     "ownmesh_fs_patch",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": patch_path,
                         "content": "should-not-apply",
                         "expected_sha256": expected_hash,
@@ -1398,6 +1438,7 @@ def main() -> int:
                     "ownmesh_command_shell",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "command": shell_cmd,
                         "async": True,
                         "idempotency_key": f"idem_shell_{marker}",
@@ -1504,10 +1545,14 @@ def main() -> int:
             import sys as _sys
             if _sys.platform.startswith("win"):
                 ses_program = "cmd.exe"
-                ses_args = ["/Q", "/C", f"echo E5_LIVE_PTY_{marker}"]
+                ses_args = [
+                    "/Q",
+                    "/C",
+                    f"echo E5_LIVE_PTY_{marker} & ping -n 301 127.0.0.1 >nul",
+                ]
             else:
                 ses_program = "/bin/sh"
-                ses_args = ["-c", f"printf 'E5_LIVE_PTY_{marker}\\n'"]
+                ses_args = ["-c", f"printf 'E5_LIVE_PTY_{marker}\\n'; sleep 300"]
             ses_sc = structured(
                 mcp_call(
                     issuer,
@@ -1565,31 +1610,33 @@ def main() -> int:
             # E5: replay must surface real process output from the live PTY host.
             import time as _time
             live_marker = f"E5_LIVE_PTY_{marker}"
-            saw_live = live_marker in ses_dump or live_marker.encode() in sidecar_bytes(ses_done)
-            if not saw_live:
-                for attempt in range(12):
-                    rep_sc = structured(
-                        mcp_call(
-                            issuer,
-                            access_token,
-                            "ownmesh_session_replay",
-                            {
-                                "device_id": device_id,
-                                "session_id": ses_id,
-                                "workspace_id": "ws_default",
-                                "from_seq": 1,
-                                "async": True,
-                                "idempotency_key": f"idem_ses_rep_{marker}_{attempt}",
-                            },
-                            rpc_id=40 + attempt,
-                        )
+            saw_live = False
+            for attempt in range(12):
+                rep_sc = structured(
+                    mcp_call(
+                        issuer,
+                        access_token,
+                        "ownmesh_session_replay",
+                        {
+                            "device_id": device_id,
+                            "session_id": ses_id,
+                            "workspace_id": "ws_default",
+                            "from_seq": 1,
+                            "sidecar_cursor": 0,
+                            "max_bytes": 1024,
+                            "raw_sidecar": True,
+                            "async": True,
+                            "idempotency_key": f"idem_ses_rep_{marker}_{attempt}",
+                        },
+                        rpc_id=40 + attempt,
                     )
-                    rep_op = str(rep_sc.get("operation_id") or "")
-                    rep_done = wait_operation(issuer, access_token, rep_op, want={"completed"})
-                    if live_marker in json.dumps(rep_done) or live_marker.encode() in sidecar_bytes(rep_done):
-                        saw_live = True
-                        break
-                    _time.sleep(0.25)
+                )
+                rep_op = str(rep_sc.get("operation_id") or "")
+                rep_done = wait_operation(issuer, access_token, rep_op, want={"completed"})
+                if live_marker.encode() in sidecar_bytes(rep_done):
+                    saw_live = True
+                    break
+                _time.sleep(0.25)
             if not saw_live:
                 raise RuntimeError(
                     f"live PTY session must produce real process output containing {live_marker}"
@@ -1630,6 +1677,9 @@ def main() -> int:
                         "workspace_id": "ws_default",
                         "from_seq": 1,
                         "max_chunks": 1,
+                        "sidecar_cursor": 0,
+                        "max_bytes": 1024,
+                        "raw_sidecar": True,
                         "async": True,
                         "idempotency_key": f"idem_ses_other_replay_{marker}",
                     },
@@ -1639,8 +1689,7 @@ def main() -> int:
             other_rep_done = wait_operation(
                 issuer, access_token_other, str(other_rep_sc.get("operation_id") or ""), want={"completed"}
             )
-            other_rep_dump = json.dumps(other_rep_done)
-            if live_marker not in other_rep_dump and live_marker.encode() not in sidecar_bytes(other_rep_done):
+            if live_marker.encode() not in sidecar_bytes(other_rep_done):
                 raise RuntimeError(f"observer replay must expose live process output: {other_rep_done}")
 
             # Second session for observer lease checks (interactive shell).
@@ -1966,6 +2015,7 @@ def main() -> int:
                         "from_seq": 1,
                         "sidecar_cursor": 0,
                         "max_bytes": 1024,
+                        "raw_sidecar": True,
                         "async": True,
                         "idempotency_key": f"idem_ses_restart_replay_{marker}",
                     },
@@ -2617,6 +2667,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": ask_name,
                         "content": f"approved-{marker}",
                         "async": True,
@@ -2746,6 +2797,7 @@ def main() -> int:
                     "ownmesh_fs_write",
                     {
                         "device_id": device_id,
+                        "workspace_id": "ws_default",
                         "path": delegated_name,
                         "content": f"delegated-{marker}",
                         "async": True,
@@ -2829,7 +2881,8 @@ def main() -> int:
             review_id = find_value(review_done, "review_id")
             if not isinstance(review_id, str) or not review_id.startswith("rev_"):
                 raise RuntimeError(f"review.start missing durable receipt: {review_done}")
-            if find_value(review_done, "phase") != "failed":
+            review_receipt = review_done.get("data")
+            if not isinstance(review_receipt, dict) or review_receipt.get("phase") != "failed":
                 raise RuntimeError(f"review must retain failed test result separately: {review_done}")
             if run_checked([git, "rev-parse", "HEAD"], cwd=review_root, env=base_env, capture=True) != head_before_review:
                 raise RuntimeError("review implicitly changed Git HEAD/ref")
@@ -2976,7 +3029,12 @@ def main() -> int:
             cancel_page = wait_operation(issuer, access_token, str(cancel_page_started.get("operation_id") or ""), want={"completed"})
             cancel_page_data = cancel_page.get("data") if isinstance(cancel_page.get("data"), dict) else {}
             _, cancel_bytes = review_chunk_bytes(cancel_page_data)
-            if find_value(cancelled_done, "phase") != "cancelled" or b"process tree termination requested" not in cancel_bytes:
+            cancelled_receipt = cancelled_done.get("data")
+            if (
+                not isinstance(cancelled_receipt, dict)
+                or cancelled_receipt.get("phase") != "cancelled"
+                or b"process tree termination requested" not in cancel_bytes
+            ):
                 raise RuntimeError(f"review cancellation did not terminate active process tree: {cancelled_done}")
 
             # Restore full_user_access for any later local inspection (cleanup path).
@@ -3004,6 +3062,7 @@ def main() -> int:
                         "name": "ownmesh_fs_write",
                         "arguments": {
                             "device_id": device_id,
+                            "workspace_id": "ws_default",
                             "path": "no-key.txt",
                             "content": "x",
                             "async": True,
@@ -3032,6 +3091,10 @@ def main() -> int:
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )
             return 0
+        except Exception as error:
+            raise RuntimeError(
+                f"{error}\n{loopback_failure_logs(log_path)}"
+            ) from error
         finally:
             stop_process(daemon_process)
             stop_session_sidecars(state_dir)

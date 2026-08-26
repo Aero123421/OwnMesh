@@ -1101,8 +1101,11 @@ fn open_owner_only_rw(path: &Path, create: bool) -> IpcResult<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::io::{FromRawFd, IntoRawFd};
-        // Prefer O_NOFOLLOW so a racing symlink cannot be opened.
-        let mut flags = rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW;
+        // Prefer O_NOFOLLOW so a racing symlink cannot be opened. The registry
+        // lock is daemon-owned and must close across exec; otherwise a detached
+        // session sidecar can inherit it and prevent a clean daemon restart.
+        let mut flags =
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
         if create {
             flags |= rustix::fs::OFlags::CREATE;
         }
@@ -2573,6 +2576,23 @@ mod tests {
         assert!(error.to_string().contains("already owned"), "{error}");
         drop(first);
         CredentialRegistry::open(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_lock_is_not_inherited_across_exec() {
+        let dir = tempdir().unwrap();
+        let registry = CredentialRegistry::open(dir.path()).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        drop(registry);
+
+        let reopened = CredentialRegistry::open(dir.path());
+        let _ = child.kill();
+        let _ = child.wait();
+        reopened.expect("an exec child must not keep the daemon registry lock alive");
     }
 
     #[test]

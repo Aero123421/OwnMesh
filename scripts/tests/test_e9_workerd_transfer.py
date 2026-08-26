@@ -86,9 +86,7 @@ def daemon_env(
     (config / "config.toml").write_text(
         "\n".join([
             "schema_version = 1", 'active_instance = "local"', "",
-            "[service_socket]",
-            f'path = "pipe:ownmesh-e9-{device_id}"' if os.name == "nt" else f'path = "ownmesh-e9-{device_id}.sock"',
-            "", "[[instances]]", 'id = "local"', f'base_url = "{issuer}"', "",
+            "[[instances]]", 'id = "local"', f'base_url = "{issuer}"', "",
         ]),
         encoding="utf-8",
     )
@@ -116,14 +114,37 @@ def public_call(issuer: str, token: str, name: str, args: dict[str, object], rpc
     return structured(mcp_call(issuer, token, name, args, rpc_id=rpc))
 
 
-def add_workspace(issuer: str, token: str, device: str, workspace: str, path: Path, marker: str, rpc: int) -> None:
-    started = public_call(issuer, token, "ownmesh_workspace_add", {
-        "device_id": device, "id": workspace, "path": str(path.resolve()), "async": True,
-        "idempotency_key": f"e9-workspace-{marker}-{device}",
+def assert_workspace_ready(
+    issuer: str,
+    token: str,
+    device: str,
+    workspace: str,
+    path: Path,
+    marker: str,
+    rpc: int,
+) -> None:
+    # The ready handshake publishes and activates the pre-seeded device-local
+    # registry before exposing the Agent as ready. Re-adding the same id through
+    # MCP is therefore a real conflict. Route a list through the live Agent and
+    # verify both the authoritative root and Control Plane activation instead.
+    started = public_call(issuer, token, "ownmesh_workspace_list", {
+        "device_id": device, "async": True,
+        "idempotency_key": f"e9-workspace-list-{marker}-{device}",
     }, rpc)
     done = wait_operation(issuer, token, op_id(started), want={"completed"}, timeout_s=45)
-    if workspace not in json.dumps(done):
-        raise RuntimeError(f"workspace custody add did not return {workspace}: {done}")
+    data = done.get("data")
+    workspaces = data.get("workspaces") if isinstance(data, dict) else None
+    expected_root = str(path.resolve())
+    matches = [
+        row
+        for row in workspaces if isinstance(row, dict) and row.get("id") == workspace
+    ] if isinstance(workspaces, list) else []
+    if len(matches) != 1 or matches[0].get("root") != expected_root:
+        raise RuntimeError(
+            f"ready handshake omitted authoritative workspace {workspace} at {expected_root}: {done}"
+        )
+    if matches[0].get("activation_state") != "active":
+        raise RuntimeError(f"workspace {workspace} was not activated before ready: {done}")
 
 
 def advance_until_terminal(issuer: str, token: str, transfer_id: str, marker: str) -> dict[str, object]:
@@ -441,9 +462,9 @@ def main() -> int:
     with RetryingTemporaryDirectory(prefix="ownmesh-e9-workerd-") as raw:
         temp = Path(raw)
         persist = temp / "wrangler-state"
-        # The Windows daemon pipe name is bounded.  Put the differentiating
-        # component early enough that path normalization cannot truncate both
-        # Agent endpoints to the same name.
+        # Separate runtime roots feed the production default endpoint resolver:
+        # Windows hashes each root into a distinct bounded pipe name, while Unix
+        # relocates an overlong default socket to its owner-scoped short path.
         source_root, destination_root = temp / "s", temp / "d"
         source_env = daemon_env(root=source_root, issuer=issuer, device_id=device_source, credential=credential_source,
                                 service=f"dev.ownmesh.loopback-test.e9.source.{marker}", password=password)
@@ -486,8 +507,8 @@ def main() -> int:
             source_process = start_daemon(binary, source_env, source_log); destination_process = start_daemon(binary, destination_env, destination_log)
             wait_agent(source_process, source_log, source_root / "state"); wait_agent(destination_process, destination_log, destination_root / "state")
             source_ws, destination_ws = f"ws_{device_source}", f"ws_{device_destination}"
-            add_workspace(issuer, access, device_source, source_ws, source_root / "state" / "workspace", marker, 10)
-            add_workspace(issuer, access, device_destination, destination_ws, destination_root / "state" / "workspace", marker, 11)
+            assert_workspace_ready(issuer, access, device_source, source_ws, source_root / "state" / "workspace", marker, 10)
+            assert_workspace_ready(issuer, access, device_destination, destination_ws, destination_root / "state" / "workspace", marker, 11)
             content = hashlib.shake_256((marker + "-primary").encode()).digest(196_864) + b"\x00E9\xff\x00tail"  # 196,873 bytes: >=3 64-KiB chunks
             source_file = source_root / "state" / "workspace" / "input.bin"; source_file.write_bytes(content)
             planned = public_call(issuer, access, "ownmesh_transfer_plan", {"source_device_id": device_source, "destination_device_id": device_destination, "source_workspace_id": source_ws, "destination_workspace_id": destination_ws, "source_path": "input.bin", "destination_path": "output.bin", "idempotency_key": f"e9-plan-{marker}"}, 20)
@@ -533,10 +554,12 @@ def main() -> int:
             advance_until_state(
                 issuer, access, resume_transfer_id, marker + "-resume", {"destination_preflight"}
             )
-            resume_started = public_call(issuer, access, "ownmesh_transfer_send", {
-                "transfer_id": resume_transfer_id,
-                "idempotency_key": f"e9-send-{marker}-resume",
-            }, 30)
+            # A public send may return after dispatching the source-boundary
+            # revalidation while the transfer still reports destination_preflight.
+            # Wait on the public state machine instead of assuming runner timing.
+            resume_started = advance_until_state(
+                issuer, access, resume_transfer_id, marker + "-resume", {"sending"}
+            )
             started_state, started_meta = transfer_state(resume_started)
             if started_state != "sending" or started_meta.get("epoch") != 1 or started_meta.get("fence") != 1:
                 raise RuntimeError(f"restart transfer did not enter first sending generation: {resume_started}")
@@ -623,10 +646,9 @@ def main() -> int:
             advance_until_state(
                 issuer, access, cancel_transfer_id, marker + "-cancel", {"destination_preflight"}
             )
-            public_call(issuer, access, "ownmesh_transfer_send", {
-                "transfer_id": cancel_transfer_id,
-                "idempotency_key": f"e9-send-{marker}-cancel",
-            }, 32)
+            advance_until_state(
+                issuer, access, cancel_transfer_id, marker + "-cancel", {"sending"}
+            )
             cancel_plan_id = local_plan_id_for_destination(
                 destination_root / "state", "cancel-output.bin", required_local_suffix=".json"
             )

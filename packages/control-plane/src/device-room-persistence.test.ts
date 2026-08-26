@@ -467,6 +467,7 @@ function mockSocket(att: SessionAttachment | null = null): MockSocket {
 function mockDOState(opts?: {
   sockets?: MockSocket[];
   storage?: Map<string, unknown>;
+  onStoragePut?: (key: string, value: unknown) => void;
 }): DurableObjectState {
   const map = opts?.storage || new Map<string, unknown>();
   const sockets = opts?.sockets || [];
@@ -476,6 +477,7 @@ function mockDOState(opts?: {
       get: async (key: string) => map.get(key),
       put: async (key: string, value: unknown) => {
         map.set(key, structuredClone(value));
+        opts?.onStoragePut?.(key, value);
       },
       delete: async (key: string) => map.delete(key),
       list: async () => new Map(map),
@@ -627,6 +629,15 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
   const deviceId = "dev_ws_registry_sync01";
   const { adapter, store } = openSqliteAdapter();
   const { token } = await seedActiveDevice(store, deviceId);
+  const events: string[] = [];
+  const trackedAdapter: SqlDatabase = {
+    prepare: (query) => adapter.prepare(query),
+    async batch<T>(statements: SqlStatement[]): Promise<T[]> {
+      const result = await adapter.batch!<T>(statements);
+      events.push("d1");
+      return result;
+    },
+  };
   const authHash = await sha256Hex(token);
   const sessionId = "ags_ws_registry_sync";
   const socket = mockSocket({
@@ -639,8 +650,13 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
     auth_hash: authHash,
     lastSeq: 0,
   });
-  const room = new DeviceRoom(mockDOState({ sockets: [socket] }), {
-    DB: adapter as unknown as D1Database,
+  const room = new DeviceRoom(mockDOState({
+    sockets: [socket],
+    onStoragePut: (key) => {
+      if (key === ROOM_STATE_STORAGE_KEY) events.push("room");
+    },
+  }), {
+    DB: trackedAdapter as unknown as D1Database,
   });
   await room.ready;
 
@@ -654,6 +670,13 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
     })),
   );
   assert.equal(room.router.sessions.get(sessionId)?.phase, "ready");
+  events.length = 0;
+  const originalSend = socket.send.bind(socket);
+  socket.send = (data: string) => {
+    const envelope = JSON.parse(data) as DeviceEnvelope;
+    if (envelope.type === "workspace.registry.ack") events.push("ack");
+    originalSend(data);
+  };
 
   // Device-local workspace_add while the session stays live.
   const generationA = `wsg_${"a".repeat(32)}`;
@@ -673,11 +696,70 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
     .map((s) => JSON.parse(s) as DeviceEnvelope)
     .filter((e) => e.type === "workspace.registry.ack");
   assert.equal(acks.length, 1, "an accepted refresh is acknowledged");
+  const ackIndex = events.indexOf("ack");
+  assert.ok(events.indexOf("d1") >= 0, `D1 snapshot must be written: ${events.join(",")}`);
+  assert.ok(events.indexOf("d1") < ackIndex, `D1 must precede ACK: ${events.join(",")}`);
+  assert.ok(
+    events.lastIndexOf("room", ackIndex) < ackIndex && events.lastIndexOf("room", ackIndex) >= 0,
+    `room sequence state must precede ACK: ${events.join(",")}`,
+  );
 
   // The observed generations are durable — the workspace is operable.
   const repo = await store.getWorkspace(deviceId, "ws_repo");
   assert.ok(repo);
   assert.equal(repo.local_generation, generationB);
+});
+
+test("workspace.registry storage failure closes without ACK (#146)", async () => {
+  const deviceId = "dev_ws_registry_fail01";
+  const base = openSqliteAdapter();
+  const { token } = await seedActiveDevice(base.store, deviceId);
+  const failingAdapter: SqlDatabase = {
+    prepare: (query) => base.adapter.prepare(query),
+    async batch<T>(_statements: SqlStatement[]): Promise<T[]> {
+      throw new Error("injected workspace registry D1 failure");
+    },
+  };
+  const sessionId = "ags_ws_registry_fail";
+  const socket = mockSocket({
+    role: "agent",
+    device_id: deviceId,
+    session_id: sessionId,
+    connected_at: Date.now(),
+    phase: "proven",
+    auth_hash: await sha256Hex(token),
+    lastSeq: 0,
+  });
+  const room = new DeviceRoom(mockDOState({ sockets: [socket] }), {
+    DB: failingAdapter as unknown as D1Database,
+  });
+  await room.ready;
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "ready", deviceId, {
+      agent_version: "1.2.21",
+      protocol_version: PROTOCOL,
+      remote_routing_enabled: true,
+    })),
+  );
+  socket.sent.length = 0;
+
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "workspace.registry", deviceId, {
+      enforce_workspace: true,
+      workspaces: [
+        { id: "ws_default", generation: `wsg_${"c".repeat(32)}` },
+      ],
+    }, undefined, { seq: 2 })),
+  );
+
+  const acks = socket.sent
+    .map((raw) => JSON.parse(raw) as DeviceEnvelope)
+    .filter((envelope) => envelope.type === "workspace.registry.ack");
+  assert.equal(acks.length, 0, "a failed D1 snapshot must never be acknowledged");
+  assert.equal(socket.closed?.code, 1013);
+  assert.equal(room.isStorageBroken, true);
 });
 
 test("workspace.registry rejects non-ready sessions and invalid payloads (#146)", async () => {
@@ -1681,6 +1763,149 @@ test("first generation observation terminally invalidates a pre-generation pendi
   assert.equal(sends, 0);
   assert.equal(room.router.pending.has(operationId), false);
   const failed = await store.getMcpOperation(operationId);
+  assert.equal(failed?.status, "failed");
+  assert.equal(
+    ((failed?.data.error as { code?: string } | undefined)?.code),
+    "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+  );
+});
+
+test("approval decision refuses a target whose workspace generation changed", async () => {
+  const { adapter, store } = openSqliteAdapter();
+  const deviceId = "dev_workspace_remap_approval_01";
+  await seedActiveDevice(store, deviceId);
+  const now = new Date().toISOString();
+  await store.putWorkspace({
+    workspace_id: "ws_default",
+    tenant_id: DEFAULT_TENANT,
+    device_id: deviceId,
+    owner_principal_id: "prin_dev",
+    version: 1,
+    active: true,
+    created_at: now,
+    updated_at: now,
+  });
+  const principal = await store.getPrincipal("prin_dev");
+  assert.ok(principal);
+  const targetOperationId = "op_workspace_remap_approval_target_01";
+  const targetAction = {
+    capability: "fs.write",
+    action: "fs.write",
+    tool: "ownmesh_fs_write",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    principal_credential_generation: principal.credential_generation,
+    principal_revocation_epoch: principal.revocation_epoch,
+    workspace_id: "ws_default",
+    workspace_version: 1,
+    facts: { path: "approved.txt" },
+  };
+  await store.putMcpOperation({
+    operation_id: targetOperationId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "approval_required",
+    summary: "awaiting approval",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: true,
+    warnings: [],
+    correlation_id: targetOperationId,
+    workspace_id: "ws_default",
+    action: targetAction,
+    policy_authority: "ownmesh_device",
+    created_at: now,
+    updated_at: now,
+  });
+
+  // The same id now denotes a newly observed local root. The decision remains
+  // bound to version 1 and must never reach the Agent.
+  await store.syncDeviceWorkspaces(deviceId, [{
+    id: "ws_default",
+    generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }]);
+  assert.equal((await store.getWorkspace(deviceId, "ws_default"))?.version, 2);
+
+  const room = new DeviceRoom(mockDOState(), {
+    DB: adapter as unknown as D1Database,
+    SESSION_SECRET,
+  });
+  await room.ready;
+  room.deviceId = deviceId;
+  room.router.deviceId = deviceId;
+  room.router.registerSession({
+    role: "agent", device_id: deviceId, session_id: "ags_workspace_remap_approval",
+    connected_at: Date.now(), phase: "ready", remote_routing_enabled: true,
+  });
+  let sends = 0;
+  room.router.sendToSession = () => {
+    sends += 1;
+    return true;
+  };
+
+  const decisionOperationId = "op_workspace_remap_approval_decision_01";
+  const approvalId = "apr_workspace_remap_01";
+  const transactionId = "aob_workspace_remap_01";
+  const decisionAction = {
+    capability: "approval.decision",
+    action: "approval.decision",
+    tool: "ownmesh_approval_decision",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    principal_credential_generation: principal.credential_generation,
+    principal_revocation_epoch: principal.revocation_epoch,
+    workspace_id: "ws_default",
+    workspace_version: 1,
+    operation_id: decisionOperationId,
+    outbox_id: transactionId,
+    facts: {
+      target_operation_id: targetOperationId,
+      decision: "approve",
+      approval_id: approvalId,
+    },
+  };
+  const body = {
+    type: "approval.decision",
+    correlation_id: decisionOperationId,
+    payload: {
+      operation_id: decisionOperationId,
+      capability: "approval.decision",
+      workspace_id: "ws_default",
+      authorization: { bound_action: decisionAction },
+      arguments: {
+        target_operation_id: targetOperationId,
+        decision: "approve",
+        approval_id: approvalId,
+      },
+    },
+  };
+  const { headers, bodyText } = await operationHeaders(deviceId, body, {
+    correlation_id: decisionOperationId,
+  });
+  const response = await room.fetch(
+    new Request(`https://device-room/operation?device_id=${deviceId}`, {
+      method: "POST",
+      headers,
+      body: bodyText,
+    }),
+  );
+  const result = (await response.json()) as {
+    status?: string;
+    detail?: { code?: string; operation_id?: string };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(result.status, "rejected");
+  assert.equal(result.detail?.code, "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED");
+  assert.equal(result.detail?.operation_id, targetOperationId);
+  assert.equal(sends, 0);
+  assert.equal(room.router.pending.has(decisionOperationId), false);
+  const failed = await store.getMcpOperation(targetOperationId);
   assert.equal(failed?.status, "failed");
   assert.equal(
     ((failed?.data.error as { code?: string } | undefined)?.code),
