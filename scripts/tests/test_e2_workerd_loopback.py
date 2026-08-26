@@ -1531,10 +1531,14 @@ def main() -> int:
             import sys as _sys
             if _sys.platform.startswith("win"):
                 ses_program = "cmd.exe"
-                ses_args = ["/Q", "/C", f"echo E5_LIVE_PTY_{marker}"]
+                ses_args = [
+                    "/Q",
+                    "/C",
+                    f"echo E5_LIVE_PTY_{marker} & ping -n 301 127.0.0.1 >nul",
+                ]
             else:
                 ses_program = "/bin/sh"
-                ses_args = ["-c", f"printf 'E5_LIVE_PTY_{marker}\\n'"]
+                ses_args = ["-c", f"printf 'E5_LIVE_PTY_{marker}\\n'; sleep 300"]
             ses_sc = structured(
                 mcp_call(
                     issuer,
