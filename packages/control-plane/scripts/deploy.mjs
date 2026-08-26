@@ -183,6 +183,13 @@ async function verifyDeployedBuild(origin) {
  * Computed in a child Node with type stripping enabled rather than from a
  * generated file, so there is no second copy to fall out of sync with
  * `PUBLISHED_MCP_TOOLS`.
+ *
+ * `--experimental-strip-types` requires Node >= 22.6, which is why the
+ * workspace `engines.node` states that rather than a bare `>=22`: on 22.0-22.5
+ * the flag is unrecognized, the child exits non-zero, and the caller refuses
+ * to verify — turning a working deploy into a hard failure. The child's stderr
+ * is propagated so that shows up as the real reason rather than a bare
+ * "could not compute".
  */
 async function readLocalCatalogRevision() {
   const entry = fileURLToPath(new URL("../src/mcp.ts", import.meta.url));

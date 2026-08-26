@@ -359,6 +359,15 @@ test("idempotency retry survives a routine refresh and still dies on revocation"
     1,
     "the old operation is never rebound to the new epoch",
   );
+
+  // Recovery is a *fresh* request under the current authority, never a retry of
+  // the old binding: a new key mints a distinct operation bound to the new
+  // epoch, and that one does dispatch.
+  const fresh = await call("idem_rotation_fresh", 4, rotated.token.access_token);
+  const freshId = String(fresh.operation_id);
+  assert.notEqual(freshId, firstId, "a fresh key must not converge on the terminated operation");
+  assert.equal(routed, 3);
+  assert.equal((await store.getMcpOperation(freshId))?.action?.principal_revocation_epoch, 2);
 });
 
 test("idempotency retry cannot redeliver an outbox after cancel_requested wins", async () => {

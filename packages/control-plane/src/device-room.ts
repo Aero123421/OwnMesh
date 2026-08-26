@@ -534,8 +534,6 @@ function readyWorkspaceRegistry(
   return { workspaces, enforce_workspace: raw.enforce_workspace };
 }
 
-
-
 type WorkspaceAuthorityResult =
   | "ok"
   | "binding_mismatch"
@@ -562,9 +560,6 @@ function workspaceAuthorityBinding(
   ) return null;
   return { workspace_id: action.workspace_id, version: action.workspace_version };
 }
-
-/** Extract only a complete, server-bound credential epoch from an operation. */
-
 
 type SessionIngressGuard = {
   lastSeq: number;
