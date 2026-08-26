@@ -13,7 +13,7 @@ use ownmesh_domain::ExitCode;
 use ownmesh_identity::{
     CredentialStoreDiagnosticSnapshot, SecretPurpose, CREDENTIAL_STORE_DIAGNOSTIC_FILE,
 };
-use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
+use ownmesh_ipc::{methods, ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,15 +57,18 @@ pub fn collect_doctor_report(
                 if args.check_network && !args.offline {
                     input.control_plane.probed = true;
                     match probe_control_plane_health(&url) {
-                        Ok(status) if (200..300).contains(&status) => {
+                        Ok(probe) if (200..300).contains(&probe.status) => {
                             input.control_plane.reachable = Some(true);
-                            input.control_plane.http_status = Some(status);
+                            input.control_plane.http_status = Some(probe.status);
+                            input.control_plane.reported_version = probe.version;
                         }
-                        Ok(status) => {
+                        Ok(probe) => {
                             input.control_plane.reachable = Some(false);
-                            input.control_plane.http_status = Some(status);
-                            input.control_plane.message =
-                                Some(format!("control plane /health returned HTTP {status}"));
+                            input.control_plane.http_status = Some(probe.status);
+                            input.control_plane.message = Some(format!(
+                                "control plane /health returned HTTP {}",
+                                probe.status
+                            ));
                         }
                         Err(msg) => {
                             input.control_plane.reachable = Some(false);
@@ -472,16 +475,34 @@ fn observe_daemon(paths: &OwnMeshPaths) -> DaemonObservation {
                 return Err(format!("client credential error: {err}"));
             }
         };
-        match client.status().await {
-            Ok(status) => Ok(status),
-            Err(err) => Err(err.to_string()),
-        }
+        let status = match client.status().await {
+            Ok(status) => status,
+            Err(err) => return Err(err.to_string()),
+        };
+        // #141: observe the live Agent route through the daemon. A missing or
+        // unsupported method (older daemon) stays `None` so the check is
+        // omitted instead of guessed.
+        let agent_route = match client.call(methods::ROUTE_STATUS, None).await {
+            Ok(value) => value
+                .get("route")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .filter(|route| {
+                    matches!(
+                        route.as_str(),
+                        "online" | "offline" | "disabled" | "unknown"
+                    )
+                }),
+            Err(_) => None,
+        };
+        Ok((status, agent_route))
     });
 
     match reachable {
-        Ok(status) => {
+        Ok((status, agent_route)) => {
             obs.reachable = true;
             obs.pid = (status.pid != 0).then_some(status.pid);
+            obs.agent_route = agent_route;
         }
         Err(msg) => {
             obs.reachable = false;
@@ -712,11 +733,19 @@ fn observe_profile_discovery() -> ownmesh_diagnostics::ProfileDiscoveryObservati
                 full_dirs.push(dir.clone());
             }
         }
-        // Existing user-local bin dirs that are absent from PATH.
+        // Existing user-local bin dirs that are absent from PATH. Home is
+        // collapsed to `~` so the disclosure matches the resolver's own
+        // labels (#145).
+        let home_path = std::path::PathBuf::from(&home);
         for dir in &user_dirs {
             if dir.is_dir() && !system_dirs.contains(dir) {
-                obs.existing_dirs_not_searched
-                    .push(dir.display().to_string());
+                let label = match dir.strip_prefix(&home_path) {
+                    Ok(stripped) if !stripped.as_os_str().is_empty() => {
+                        format!("~/{}", stripped.display())
+                    }
+                    _ => dir.display().to_string(),
+                };
+                obs.existing_dirs_not_searched.push(label);
             }
         }
         // Official profiles that resolve only through the full search.
@@ -757,6 +786,7 @@ fn observe_service() -> ServiceObservation {
             unit_path: None,
             message: Some(err),
             hardening: None,
+            linger: None,
         },
     }
 }
@@ -769,6 +799,7 @@ fn service_obs_from_snapshot(snap: &ServiceStatusSnapshot) -> ServiceObservation
         running: snap.running,
         unit_path: snap.unit_path.clone(),
         message: snap.message.clone(),
+        linger: snap.linger,
         hardening: snap.hardening.as_ref().map(|h| {
             ownmesh_diagnostics::ServiceHardeningObservation {
                 no_new_privileges: h.no_new_privileges,
@@ -807,8 +838,16 @@ fn merge_daemon_service_status(daemon: &DaemonObservation, service: &mut Service
     }
 }
 
+/// Bounded `/health` probe result. `version` is parsed from JSON and sanitized.
+pub struct ControlPlaneHealthProbe {
+    pub status: u16,
+    pub version: Option<String>,
+}
+
+const HEALTH_BODY_MAX_BYTES: usize = 16_384;
+
 /// Probe `{base}/health` without sending credentials.
-pub fn probe_control_plane_health(base_url: &str) -> Result<u16, String> {
+pub fn probe_control_plane_health(base_url: &str) -> Result<ControlPlaneHealthProbe, String> {
     let base = base_url.trim().trim_end_matches('/');
     let url = format!("{base}/health");
     let client = reqwest::blocking::Client::builder()
@@ -821,7 +860,34 @@ pub fn probe_control_plane_health(base_url: &str) -> Result<u16, String> {
         .header("accept", "application/json")
         .send()
         .map_err(|e| format!("control plane unreachable: {e}"))?;
-    Ok(resp.status().as_u16())
+    let status = resp.status().as_u16();
+    let version = if (200..300).contains(&status) {
+        match resp.bytes() {
+            Ok(bytes) if bytes.len() <= HEALTH_BODY_MAX_BYTES => {
+                parse_control_plane_health_version(std::str::from_utf8(&bytes).unwrap_or(""))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Ok(ControlPlaneHealthProbe { status, version })
+}
+
+fn parse_control_plane_health_version(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let version = value.get("version")?.as_str()?.trim();
+    if version.is_empty() || version.len() > 32 {
+        return None;
+    }
+    let stripped = version.strip_prefix('v').unwrap_or(version);
+    if !stripped
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
+        return None;
+    }
+    Some(stripped.to_string())
 }
 
 fn emit_report(cli: &Cli, report: &DoctorReport) {
@@ -1023,6 +1089,24 @@ mod tests {
     }
 
     #[test]
+    fn health_version_parser_accepts_semver_and_rejects_junk() {
+        assert_eq!(
+            parse_control_plane_health_version(r#"{"version":"1.2.18"}"#).as_deref(),
+            Some("1.2.18")
+        );
+        assert_eq!(
+            parse_control_plane_health_version(r#"{"version":"v1.2.18"}"#).as_deref(),
+            Some("1.2.18")
+        );
+        assert_eq!(
+            parse_control_plane_health_version(r#"{"version":" https://evil.example "}"#),
+            None
+        );
+        assert_eq!(parse_control_plane_health_version("not-json"), None);
+        assert_eq!(parse_control_plane_health_version("{}"), None);
+    }
+
+    #[test]
     fn offline_can_override_an_aliased_network_probe() {
         let cli = Cli::try_parse_from(["ownmesh", "doctor", "--check-network", "--offline"])
             .expect("offline override must be accepted by clap");
@@ -1088,6 +1172,7 @@ mod tests {
             reachable: true,
             pid: Some(42),
             message: None,
+            agent_route: None,
         };
         let mut unknown = ServiceObservation {
             platform: "test".into(),
@@ -1097,6 +1182,7 @@ mod tests {
             unit_path: None,
             message: None,
             hardening: None,
+            linger: None,
         };
         merge_daemon_service_status(&daemon, &mut unknown);
         assert_eq!(unknown.running, Some(true));

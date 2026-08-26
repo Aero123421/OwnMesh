@@ -119,6 +119,10 @@ pub enum ErrorCode {
     JournalCapacity,
     #[serde(rename = "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED")]
     TransitionRecoveryRequired,
+    /// A requested execution would run an OwnMesh binary that re-enters this
+    /// daemon's IPC, which deadlocks the runtime it is executing under (#160).
+    #[serde(rename = "OWNMESH_E_SELF_REENTRANT_EXEC")]
+    SelfReentrantExec,
 
     // exit 8
     #[serde(rename = "OWNMESH_E_PROFILE_UNAVAILABLE")]
@@ -156,6 +160,7 @@ impl ErrorCode {
             Self::SessionNotController => "OWNMESH_E_SESSION_NOT_CONTROLLER",
             Self::JournalCapacity => "OWNMESH_E_JOURNAL_CAPACITY",
             Self::TransitionRecoveryRequired => "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED",
+            Self::SelfReentrantExec => "OWNMESH_E_SELF_REENTRANT_EXEC",
             Self::ProfileUnavailable => "OWNMESH_E_PROFILE_UNAVAILABLE",
             Self::ExecutableFormat => "OWNMESH_E_EXECUTABLE_FORMAT",
             Self::Internal => "OWNMESH_E_INTERNAL",
@@ -189,6 +194,7 @@ impl ErrorCode {
             "OWNMESH_E_SESSION_NOT_CONTROLLER" => Ok(Self::SessionNotController),
             "OWNMESH_E_JOURNAL_CAPACITY" => Ok(Self::JournalCapacity),
             "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED" => Ok(Self::TransitionRecoveryRequired),
+            "OWNMESH_E_SELF_REENTRANT_EXEC" => Ok(Self::SelfReentrantExec),
             "OWNMESH_E_PROFILE_UNAVAILABLE" => Ok(Self::ProfileUnavailable),
             "OWNMESH_E_EXECUTABLE_FORMAT" => Ok(Self::ExecutableFormat),
             "OWNMESH_E_INTERNAL" => Ok(Self::Internal),
@@ -220,7 +226,8 @@ impl ErrorCode {
             | Self::ControllerConflict
             | Self::SessionNotController
             | Self::JournalCapacity
-            | Self::TransitionRecoveryRequired => ExitCode::Conflict,
+            | Self::TransitionRecoveryRequired
+            | Self::SelfReentrantExec => ExitCode::Conflict,
             Self::ProfileUnavailable | Self::ExecutableFormat => ExitCode::ProfileUnavailable,
             Self::Internal => ExitCode::Internal,
         }

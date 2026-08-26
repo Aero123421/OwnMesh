@@ -29,7 +29,14 @@ import {
   verifyInternalContext,
 } from "./util.ts";
 import { createStore, type ControlPlaneStore, type McpOperationRecord, type WorkspaceRecord } from "./store.ts";
-import { normalizeSystemDiagnosis } from "./mcp.ts";
+import {
+  authorityInvalidationError,
+  authorityInvalidationSummary,
+  boundAuthorityInvalidationReason,
+  boundPrincipalAuthority,
+  boundPrincipalAuthorityCurrent,
+  normalizeSystemDiagnosis,
+} from "./mcp.ts";
 import {
   annotatePolicyObservation,
   annotateWorkspaceList,
@@ -433,6 +440,15 @@ export type HandleMessageResult = {
     workspaces?: Array<{ id: string; generation: string }>;
     enforce_workspace?: boolean;
   };
+  /**
+   * #146: incremental workspace-registry refresh from a live ready agent.
+   * DeviceRoom must persist the full registry snapshot via
+   * store.syncDeviceWorkspaces before the agent may rely on it.
+   */
+  workspace_registry_sync?: {
+    enforce_workspace: boolean;
+    workspaces: Array<{ id: string; generation: string }>;
+  };
 };
 
 const MAX_AGENT_VERSION_LENGTH = 128;
@@ -518,12 +534,6 @@ function readyWorkspaceRegistry(
   return { workspaces, enforce_workspace: raw.enforce_workspace };
 }
 
-type PrincipalCredentialBinding = {
-  principal_id: string;
-  tenant_id: string;
-  generation: number;
-};
-
 type WorkspaceAuthorityResult =
   | "ok"
   | "binding_mismatch"
@@ -549,24 +559,6 @@ function workspaceAuthorityBinding(
     action.workspace_version < 1
   ) return null;
   return { workspace_id: action.workspace_id, version: action.workspace_version };
-}
-
-/** Extract only a complete, server-bound credential epoch from an operation. */
-function principalCredentialBinding(payload: Record<string, unknown>): PrincipalCredentialBinding | null {
-  const authorization = payload.authorization;
-  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
-  const bound = (authorization as Record<string, unknown>).bound_action;
-  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
-  const action = bound as Record<string, unknown>;
-  const principalId = action.principal_id;
-  const tenantId = action.tenant_id;
-  const generation = action.principal_credential_generation;
-  if (
-    typeof principalId !== "string" || principalId.trim() === "" ||
-    typeof tenantId !== "string" || tenantId.trim() === "" ||
-    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
-  ) return null;
-  return { principal_id: principalId, tenant_id: tenantId, generation };
 }
 
 type SessionIngressGuard = {
@@ -1467,6 +1459,45 @@ export class DeviceRoomRouter {
         });
         return { ok: true };
       }
+      case "workspace.registry": {
+        // #146: incremental registry refresh from a live ready agent. The
+        // payload is the same shape as ready.workspace_registry and is
+        // validated by the same allowlist; activation stays fail-closed in
+        // workspace-activation until these generations are observed.
+        if (att.role !== "agent" || att.phase !== "ready") return { ok: false, error: "invalid_state" };
+        const refreshRegistry = readyWorkspaceRegistry(msg.payload);
+        // Unlike `ready`, a legacy ids-only advertisement cannot prove which
+        // local root a generation denotes, so a refresh without concrete
+        // generations is rejected.
+        if (
+          refreshRegistry == null ||
+          !Array.isArray(refreshRegistry.workspaces) ||
+          refreshRegistry.workspaces.length < 1
+        ) {
+          this.sendError(
+            sessionId,
+            "OWNMESH_E_BAD_ENVELOPE",
+            "invalid workspace registry",
+            msg.correlation_id,
+          );
+          return { ok: false, error: "invalid_workspace_registry" };
+        }
+        const ack = this.nextEnvelope("workspace.registry.ack", { ok: true }, msg.correlation_id);
+        this.sendToSession(sessionId, JSON.stringify(ack));
+        void this.audit.append({
+          kind: "device.ready",
+          summary: "agent workspace registry refresh",
+          device_id: this.deviceId,
+          meta: { workspace_count: refreshRegistry.workspaces.length },
+        });
+        return {
+          ok: true,
+          workspace_registry_sync: {
+            enforce_workspace: refreshRegistry.enforce_workspace,
+            workspaces: refreshRegistry.workspaces,
+          },
+        };
+      }
       case "ping": {
         const pong = this.nextEnvelope("pong", { t: Date.now() }, msg.correlation_id);
         this.sendToSession(sessionId, JSON.stringify(pong));
@@ -2310,16 +2341,18 @@ export class DeviceRoom {
     expected?: { principal_id: string; tenant_id: string },
   ): Promise<"ok" | "binding_mismatch" | "credential_generation_mismatch" | "storage_unavailable"> {
     if (!this.env.DB) return "storage_unavailable";
-    const binding = principalCredentialBinding(payload);
+    const binding = boundPrincipalAuthority(payload);
     if (!binding) return "binding_mismatch";
     if (
       expected &&
       (binding.principal_id !== expected.principal_id || binding.tenant_id !== expected.tenant_id)
     ) return "binding_mismatch";
     try {
+      // #162: one shared decision with the Worker-side gates in mcp.ts.
+      // Authority is removed by revocation and refresh-family reuse, not by
+      // reissuing a token.
       const current = await createStore(this.env).getPrincipal(binding.principal_id);
-      if (!current || current.tenant_id !== binding.tenant_id) return "credential_generation_mismatch";
-      return current.credential_generation === binding.generation
+      return boundPrincipalAuthorityCurrent(binding, current)
         ? "ok"
         : "credential_generation_mismatch";
     } catch {
@@ -2418,20 +2451,16 @@ export class DeviceRoom {
       const check = await this.credentialGenerationCurrent(pending.payload);
       if (check === "ok") continue;
       if (check === "storage_unavailable") throw new Error("storage_unavailable");
+      // #162: same bounded reason and retry contract as the Worker-side gates.
+      const reason = await boundAuthorityInvalidationReason(store, pending.payload);
       this.router.pending.delete(pending.correlation_id);
       removed = true;
       await store.updateMcpOperation(
         operationId,
         {
           status: "failed",
-          summary: "operation authorization invalidated before device delivery",
-          data: {
-            error: {
-              code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-              message: "principal credential rotated or was revoked before device delivery",
-              retryable: false,
-            },
-          },
+          summary: authorityInvalidationSummary(reason, "delivery"),
+          data: { error: authorityInvalidationError(reason, "delivery") },
           approval_required: false,
         },
         ["pending", "running", "approval_required", "cancel_requested"],
@@ -3163,6 +3192,8 @@ export class DeviceRoom {
         preview?.type === "operation.event" ||
         preview?.type === "operation.progress" ||
         preview?.type === "proof" ||
+        // #146: a registry refresh mutates durable device state.
+        preview?.type === "workspace.registry" ||
         preview?.type === "ready";
     } catch {
       /* handleMessage will reject malformed JSON */
@@ -3220,6 +3251,27 @@ export class DeviceRoom {
       } catch {
         // A concurrent revoke or D1 failure means this connection no longer
         // has an authoritative identity. Do not leave a ready socket live.
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+    }
+
+    // #146: persist the incremental registry refresh. Fail-closed on storage
+    // errors so the agent cannot assume a generation the store never saw.
+    if (result.ok && result.workspace_registry_sync) {
+      if (!this.env.DB) {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+      try {
+        const store = createStore(this.env);
+        await store.syncDeviceWorkspaces(
+          this.deviceId,
+          result.workspace_registry_sync.workspaces,
+        );
+      } catch {
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;

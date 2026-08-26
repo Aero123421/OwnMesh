@@ -2,7 +2,89 @@
 
 use crate::error::{ConfigError, ConfigResult};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Explicit layout overrides supplied as typed process arguments.
+///
+/// A service descriptor binds a daemon to the exact directories validated at
+/// install time. On Windows a Scheduled Task action cannot carry environment
+/// variables safely, so the same binding is expressed as `ownmeshd run`
+/// arguments and installed here before any layout is resolved (#148).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathOverrides {
+    /// Overrides `OWNMESH_CONFIG_DIR` and the platform default.
+    pub config_dir: Option<PathBuf>,
+    /// Overrides `OWNMESH_STATE_DIR` and the platform default.
+    pub state_dir: Option<PathBuf>,
+    /// Overrides `OWNMESH_RUNTIME_DIR` and the platform default.
+    pub runtime_dir: Option<PathBuf>,
+}
+
+impl PathOverrides {
+    /// True when no override was supplied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.config_dir.is_none() && self.state_dir.is_none() && self.runtime_dir.is_none()
+    }
+
+    fn validate(&self) -> ConfigResult<()> {
+        for (name, value) in [
+            ("--config-dir", self.config_dir.as_deref()),
+            ("--state-dir", self.state_dir.as_deref()),
+            ("--runtime-dir", self.runtime_dir.as_deref()),
+        ] {
+            let Some(path) = value else { continue };
+            if path.as_os_str().is_empty() {
+                return Err(ConfigError::Other(format!("{name} must not be empty")));
+            }
+            if !path.is_absolute() {
+                return Err(ConfigError::Other(format!(
+                    "{name} must be an absolute path: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+static PATH_OVERRIDES: OnceLock<PathOverrides> = OnceLock::new();
+
+/// Install process-wide layout overrides, highest precedence.
+///
+/// Typed arguments outrank the environment deliberately: the descriptor that
+/// launched this process named these directories, and a stray `OWNMESH_*`
+/// variable in the launched context must not silently split one installation
+/// into two state trees.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] for a relative or empty override, or when a
+/// different set of overrides was already installed in this process.
+pub fn install_path_overrides(overrides: &PathOverrides) -> ConfigResult<()> {
+    overrides.validate()?;
+    match PATH_OVERRIDES.set(overrides.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if PATH_OVERRIDES.get() == Some(overrides) => Ok(()),
+        Err(_) => Err(ConfigError::Other(
+            "conflicting OwnMesh path overrides were already installed in this process".into(),
+        )),
+    }
+}
+
+/// Overrides installed for this process, if any.
+#[must_use]
+pub fn path_overrides() -> Option<&'static PathOverrides> {
+    PATH_OVERRIDES.get()
+}
+
+fn override_path(select: fn(&PathOverrides) -> Option<&Path>) -> Option<PathBuf> {
+    PATH_OVERRIDES
+        .get()
+        .and_then(select)
+        .map(std::borrow::ToOwned::to_owned)
+}
 
 /// Resolved `OwnMesh` filesystem layout for the current user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,19 +102,26 @@ pub struct OwnMeshPaths {
 impl OwnMeshPaths {
     /// Resolve default paths for the current platform and environment.
     ///
-    /// Environment overrides:
-    /// - `OWNMESH_CONFIG_DIR`
-    /// - `OWNMESH_STATE_DIR`
-    /// - `OWNMESH_RUNTIME_DIR`
-    /// - `OWNMESH_CACHE_DIR`
+    /// Precedence, highest first:
+    /// 1. process overrides from [`install_path_overrides`] (typed arguments
+    ///    supplied by the service descriptor that launched this process);
+    /// 2. environment overrides `OWNMESH_CONFIG_DIR`, `OWNMESH_STATE_DIR`,
+    ///    `OWNMESH_RUNTIME_DIR`, `OWNMESH_CACHE_DIR`;
+    /// 3. the platform default layout.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when the home / profile directory cannot be determined.
     pub fn discover() -> ConfigResult<Self> {
-        let config_dir = env_path("OWNMESH_CONFIG_DIR").unwrap_or(default_config_dir()?);
-        let state_dir = env_path("OWNMESH_STATE_DIR").unwrap_or(default_state_dir()?);
-        let runtime_dir = env_path("OWNMESH_RUNTIME_DIR").unwrap_or(default_runtime_dir()?);
+        let config_dir = override_path(|o| o.config_dir.as_deref())
+            .or_else(|| env_path("OWNMESH_CONFIG_DIR"))
+            .unwrap_or(default_config_dir()?);
+        let state_dir = override_path(|o| o.state_dir.as_deref())
+            .or_else(|| env_path("OWNMESH_STATE_DIR"))
+            .unwrap_or(default_state_dir()?);
+        let runtime_dir = override_path(|o| o.runtime_dir.as_deref())
+            .or_else(|| env_path("OWNMESH_RUNTIME_DIR"))
+            .unwrap_or(default_runtime_dir()?);
         let cache_dir = env_path("OWNMESH_CACHE_DIR").unwrap_or(default_cache_dir()?);
         Ok(Self {
             config_dir,

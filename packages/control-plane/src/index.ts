@@ -35,7 +35,15 @@ import {
   protectedResourceMetadata,
   type AuthenticatedPrincipal,
 } from "./oauth.ts";
-import { handleApprove, handleMcp, MCP_SYNC_WAIT_MS, MCP_TOOLS, parseMcpMaxTimeoutMs } from "./mcp.ts";
+import {
+  handleApprove,
+  handleMcp,
+  MCP_SYNC_WAIT_MS,
+  MCP_TOOLS,
+  mcpCatalogRevision,
+  parseMcpMaxTimeoutMs,
+  PUBLISHED_MCP_TOOLS,
+} from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
 import {
   handleChatGptConnector,
@@ -600,6 +608,13 @@ export default {
         status: "ok",
         liveness: true,
         storage: env.DB ? "d1" : "unavailable",
+        // #158: the deployed catalog generation, so a deploy can verify that
+        // the Worker now serving traffic is the release it just published and
+        // an operator can compare a client snapshot without a bearer token.
+        mcp_catalog: {
+          revision: await mcpCatalogRevision(),
+          tools: PUBLISHED_MCP_TOOLS.length,
+        },
       });
     }
 
@@ -654,7 +669,10 @@ export default {
       }));
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") {
-      return json(protectedResourceMetadata(issuer));
+      return json(protectedResourceMetadata(issuer, issuer));
+    }
+    if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+      return json(protectedResourceMetadata(`${issuer}/mcp`, issuer));
     }
 
     let store: ControlPlaneStore;

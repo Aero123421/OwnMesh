@@ -269,6 +269,10 @@ pub struct DaemonObservation {
     /// Observed only from a successful local IPC `daemon.status` response.
     pub pid: Option<u32>,
     pub message: Option<String>,
+    /// Live Agent-route presence from `daemon.route_status` (#141):
+    /// `online` / `offline` / `disabled` / `unknown`. `None` when the daemon
+    /// is unreachable or the method is unsupported (older daemon).
+    pub agent_route: Option<String>,
 }
 
 /// Control-plane observation (URL may be shown; no tokens).
@@ -280,7 +284,47 @@ pub struct ControlPlaneObservation {
     pub probed: bool,
     pub reachable: Option<bool>,
     pub http_status: Option<u16>,
+    /// `/health` `version` field when a probe parsed it. Never a URL or secret.
+    pub reported_version: Option<String>,
     pub message: Option<String>,
+}
+
+enum ControlPlaneVersionStatus {
+    Match(String),
+    Mismatch { cli: String, control_plane: String },
+    Omitted,
+}
+
+fn normalize_release_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    if stripped.is_empty() || stripped.len() > 32 {
+        return None;
+    }
+    if !stripped
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+fn control_plane_version_status(cli: &str, reported: Option<&str>) -> ControlPlaneVersionStatus {
+    let Some(control_plane) = reported.and_then(normalize_release_version) else {
+        return ControlPlaneVersionStatus::Omitted;
+    };
+    let Some(cli_version) = normalize_release_version(cli) else {
+        return ControlPlaneVersionStatus::Omitted;
+    };
+    if cli_version == control_plane {
+        ControlPlaneVersionStatus::Match(control_plane)
+    } else {
+        ControlPlaneVersionStatus::Mismatch {
+            cli: cli_version,
+            control_plane,
+        }
+    }
 }
 
 /// Policy / privacy / update defaults observation.
@@ -309,6 +353,11 @@ pub struct ServiceObservation {
     pub message: Option<String>,
     /// Effective service hardening disclosure (Linux systemd --user units).
     pub hardening: Option<ServiceHardeningObservation>,
+    /// Linux only: `loginctl show-user` linger state (#143). `Some(false)`
+    /// means the user manager (and this service) stops at GUI logout, so the
+    /// ChatGPT route lasts only as long as the desktop session. `None` when
+    /// not Linux or undetectable — never a keychain read.
+    pub linger: Option<bool>,
 }
 
 /// Effective hardening of an installed systemd --user unit as observed
@@ -655,6 +704,32 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         );
     }
 
+    // Live Agent route (#141): what the daemon's transport observes right now.
+    // A green /health or local IPC must not hide an offline ChatGPT route.
+    // `None` (daemon unreachable, or an older daemon without the method) omits
+    // the row instead of guessing; `unknown` is an honest pass with a note.
+    match input.daemon.agent_route.as_deref() {
+        Some("online") => checks.push(DoctorCheck::pass(
+            "daemon.agent_route",
+            "Agent WebSocket route to the control plane is connected",
+        )),
+        Some("offline") => checks.push(DoctorCheck::fail(
+            "daemon.agent_route",
+            "the daemon is running but its Agent WebSocket route to the control plane is \
+             not connected; MCP clients such as ChatGPT will report this device offline. \
+             Check connectivity (including IPv6 blackhole/hung reconnect), then inspect \
+             `ownmeshd` logs for reconnect activity",
+        )),
+        Some("disabled") => checks.push(DoctorCheck::pass(
+            "daemon.agent_route",
+            "remote Agent routing is disabled (no enrolled device credential); this \
+             device intentionally has no ChatGPT route",
+        )),
+        // `unknown` or an older daemon without the method: omit rather than
+        // guess.
+        _ => {}
+    }
+
     // Control plane
     if !input.control_plane.configured {
         checks.push(DoctorCheck::warn(
@@ -668,20 +743,53 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         );
         if input.control_plane.probed {
             match input.control_plane.reachable {
-                Some(true) => checks.push(
-                    DoctorCheck::pass(
-                        "control_plane.health",
-                        format!(
-                            "control plane /health ok{}",
-                            input
-                                .control_plane
-                                .http_status
-                                .map(|s| format!(" (HTTP {s})"))
-                                .unwrap_or_default()
-                        ),
-                    )
-                    .with_detail(input.control_plane.url.clone().unwrap_or_default()),
-                ),
+                Some(true) => {
+                    let version_note = input
+                        .control_plane
+                        .reported_version
+                        .as_deref()
+                        .map(|version| format!(", version {version}"))
+                        .unwrap_or_default();
+                    checks.push(
+                        DoctorCheck::pass(
+                            "control_plane.health",
+                            format!(
+                                "control plane /health ok{}{version_note}",
+                                input
+                                    .control_plane
+                                    .http_status
+                                    .map(|s| format!(" (HTTP {s})"))
+                                    .unwrap_or_default()
+                            ),
+                        )
+                        .with_detail(input.control_plane.url.clone().unwrap_or_default()),
+                    );
+                    match control_plane_version_status(
+                        input.binary.cli_version.as_str(),
+                        input.control_plane.reported_version.as_deref(),
+                    ) {
+                        ControlPlaneVersionStatus::Match(version) => {
+                            checks.push(DoctorCheck::pass(
+                                "control_plane.version",
+                                format!("control plane version matches CLI ({version})"),
+                            ));
+                        }
+                        ControlPlaneVersionStatus::Mismatch { cli, control_plane } => {
+                            checks.push(DoctorCheck::warn(
+                                "control_plane.version",
+                                format!(
+                                    "control plane version {control_plane} does not match CLI {cli}; redeploy the Worker"
+                                ),
+                            ));
+                        }
+                        ControlPlaneVersionStatus::Omitted => {
+                            checks.push(DoctorCheck::warn(
+                                "control_plane.version",
+                                "control plane /health omitted version; cannot compare with CLI",
+                            ));
+                        }
+                    }
+                }
                 // A failed opt-in probe must be observable through the process
                 // exit status. The default doctor run does not probe at all.
                 Some(false) => checks.push(DoctorCheck::fail(
@@ -898,11 +1006,39 @@ ProtectProc=invisible); re-run `ownmesh service install` to restore the supporte
                 "effective unit hardening makes parts of the user/workspace hierarchy read-only; this can conflict with registered workspaces",
             ));
         } else {
+            // #144: a fully-baselined unit still ships RestrictNamespaces=yes,
+            // which blocks containers/sandbox tools/unshare. Keep the pass but
+            // disclose the availability impact and the operator drop-in.
+            let namespace_note = if h.restrict_namespaces {
+                " Programs that create Linux namespaces (containers, sandbox tools, \
+                 unshare) are blocked by RestrictNamespaces=yes; a local drop-in setting \
+                 `RestrictNamespaces=no` allows them for this device"
+            } else {
+                ""
+            };
             checks.push(DoctorCheck::pass(
                 "service.hardening",
-                "effective unit hardening baseline applied",
+                format!("effective unit hardening baseline applied.{namespace_note}"),
             ));
         }
+    }
+
+    // #143: Linux user services live only as long as the OS login session
+    // unless the operator enables lingering. OwnMesh never enables it
+    // silently — doctor discloses instead.
+    match input.service.linger {
+        Some(false) => checks.push(DoctorCheck::warn(
+            "service.linger",
+            "lingering is disabled (Linger=no): on this Linux desktop the user service — \
+             and with it the ChatGPT route — stops at GUI logout and starts only after you \
+             log in again. For an always-on device, enable it yourself once with \
+             `loginctl enable-linger $USER` (OwnMesh never enables it automatically)",
+        )),
+        Some(true) => checks.push(DoctorCheck::pass(
+            "service.linger",
+            "user manager lingers (Linger=yes): the service survives logout and starts at boot",
+        )),
+        None => {}
     }
 
     // Durable journals (P0-A/P0-B): a pending/expired transition record or
@@ -1730,6 +1866,70 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.id == "privacy.telemetry" && c.status == CheckStatus::Pass));
+    }
+
+    #[test]
+    fn control_plane_version_match_is_pass() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.18".into();
+        input.control_plane.configured = true;
+        input.control_plane.probed = true;
+        input.control_plane.reachable = Some(true);
+        input.control_plane.http_status = Some(200);
+        input.control_plane.reported_version = Some("v1.2.18".into());
+        let report = run_doctor(&input);
+        let version = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.version")
+            .expect("version check");
+        assert_eq!(version.status, CheckStatus::Pass, "{version:?}");
+        assert!(version.message.contains("1.2.18"), "{version:?}");
+    }
+
+    #[test]
+    fn control_plane_version_mismatch_is_warn() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.18".into();
+        input.control_plane.configured = true;
+        input.control_plane.probed = true;
+        input.control_plane.reachable = Some(true);
+        input.control_plane.http_status = Some(200);
+        input.control_plane.reported_version = Some("1.2.11".into());
+        let report = run_doctor(&input);
+        let health = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.health")
+            .expect("health check");
+        let version = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.version")
+            .expect("version check");
+        assert_eq!(health.status, CheckStatus::Pass, "{health:?}");
+        assert_eq!(version.status, CheckStatus::Warn, "{version:?}");
+        assert!(version.message.contains("1.2.11"), "{version:?}");
+        assert!(version.message.contains("1.2.18"), "{version:?}");
+        assert_eq!(report.outcome, DoctorOutcome::Warn);
+    }
+
+    #[test]
+    fn control_plane_version_omitted_is_warn() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.18".into();
+        input.control_plane.configured = true;
+        input.control_plane.probed = true;
+        input.control_plane.reachable = Some(true);
+        input.control_plane.http_status = Some(200);
+        let report = run_doctor(&input);
+        let version = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.version")
+            .expect("version check");
+        assert_eq!(version.status, CheckStatus::Warn, "{version:?}");
+        assert!(version.message.contains("omitted version"), "{version:?}");
     }
 
     #[test]
