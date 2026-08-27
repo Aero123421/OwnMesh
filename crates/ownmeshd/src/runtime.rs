@@ -57,7 +57,8 @@ use ownmesh_exec::{
     classify_from_request_in_dir, pin_executable, prepare_executable,
     prepare_executable_with_interpreter, resolve_executable_invocation_path,
     resolve_executable_path, run_prepared_command_cancellable, verify_executable_pin, CommandKind,
-    ExecutablePin, IdempotencyJournal, RunRequest, RunResult, HARD_MAX_TIMEOUT_MS,
+    ExecutablePin, IdempotencyJournal, PreparedExecutable, RunRequest, RunResult,
+    HARD_MAX_TIMEOUT_MS,
 };
 use ownmesh_fs::{
     git_diff, git_head_oid, git_status, looks_sensitive, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
@@ -720,6 +721,15 @@ pub struct DaemonRuntime {
     /// Server-derived credential generation bound into the exact remote action.
     /// Missing is intentionally not synthesized or hashed.
     active_remote_principal_credential_generation: Option<u64>,
+    /// #160: set by [`dispatch_off_lock`] for the duration of one admission
+    /// pass. Only that caller owns the runtime mutex and can release it around
+    /// a child, so only it may take a captured plan. Any other holder of
+    /// `&mut DaemonRuntime` — daemon recovery paths, tests — has no mutex to
+    /// release and keeps executing inline exactly as before.
+    off_lock_execution_claimed: bool,
+    /// Execution captured during the current admission pass, drained by
+    /// [`dispatch_off_lock`] after it releases the mutex.
+    off_lock_execution: Option<OffLockExecution>,
     /// Owner-only immutable plans and receiver progress.  The sender itself is
     /// intentionally ephemeral; after a restart the authenticated caller must
     /// reopen it at the durable receiver cursor.
@@ -759,6 +769,160 @@ impl Drop for DetachedCommandGuard {
     fn drop(&mut self) {
         DETACHED_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Concurrent commands executed with the runtime mutex released (#160).
+///
+/// That mutex used to serialize child execution to exactly one command at a
+/// time — the same property that let one self-reentrant child stall every
+/// later request for the device. Releasing it removes that accidental
+/// ceiling, so an explicit fail-closed one replaces it rather than leaving
+/// child spawning unbounded.
+const MAX_OFF_LOCK_EXECUTIONS: usize = 8;
+static OFF_LOCK_EXECUTIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct OffLockExecutionGuard;
+
+impl Drop for OffLockExecutionGuard {
+    fn drop(&mut self) {
+        OFF_LOCK_EXECUTIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn acquire_off_lock_execution_slot() -> IpcResult<OffLockExecutionGuard> {
+    loop {
+        let n = OFF_LOCK_EXECUTIONS_IN_FLIGHT.load(Ordering::SeqCst);
+        if n >= MAX_OFF_LOCK_EXECUTIONS {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "concurrent command cap reached ({MAX_OFF_LOCK_EXECUTIONS}); wait for an \
+in-flight command to finish or cancel one"
+                ),
+            });
+        }
+        if OFF_LOCK_EXECUTIONS_IN_FLIGHT
+            .compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Ok(OffLockExecutionGuard);
+        }
+    }
+}
+
+/// Commit step for an operation whose execution was moved off the runtime
+/// mutex. Applied in push order — innermost admission layer first — once the
+/// mutex has been reacquired.
+///
+/// `Sync` matters as much as `Send` here: `DaemonRuntime` owns this box, and
+/// several handlers hold `&DaemonRuntime` across an await inside the
+/// `Send` IPC handler future.
+type OffLockFinalizer =
+    Box<dyn FnOnce(&mut DaemonRuntime, IpcResult<Value>) -> IpcResult<Value> + Send + Sync>;
+
+/// An immutable, authority-bound command plan captured under the runtime
+/// mutex so the child can be spawned and awaited with the guard released
+/// (#160).
+///
+/// Everything the spawn needs — the prepared executable image, the sanitized
+/// request, the cancel receiver, and the concurrency reservations — is owned
+/// by this value. It borrows no runtime state, which is what makes releasing
+/// the mutex around it sound.
+struct OffLockCommandPlan {
+    request: RunRequest,
+    prepared: PreparedExecutable,
+    cancel: Option<watch::Receiver<bool>>,
+    workspace_id: Option<String>,
+    detach: bool,
+    _detached_slot: Option<DetachedCommandGuard>,
+    _execution_slot: OffLockExecutionGuard,
+}
+
+/// Everything [`DaemonRuntime::finish_approved_operation`] needs to commit an
+/// approved operation, captured before execution starts so the same commit
+/// runs whether the child ran inline or with the runtime mutex released
+/// (#160).
+struct ApprovedOperationCommit {
+    operation_id: String,
+    approval_id: String,
+    capability: String,
+    approver: String,
+    idem_key: Option<String>,
+    granted_scope: Option<Value>,
+    is_approval_bridge: bool,
+    executing_approvals: HashMap<String, ApprovalRecord>,
+    executing_op_journal: HashMap<String, Value>,
+}
+
+/// A captured plan plus the finalizers that commit its outcome.
+pub struct OffLockExecution {
+    plan: OffLockCommandPlan,
+    finalizers: Vec<OffLockFinalizer>,
+}
+
+/// Control value returned by every admission layer that handed its execution
+/// to an [`OffLockExecution`].
+///
+/// [`dispatch_off_lock`] is the only caller that sets
+/// `off_lock_execution_claimed`, and it always replaces this value with the
+/// real outcome, so it cannot reach a client. Any other holder of
+/// `&mut DaemonRuntime` has no mutex to release and never defers.
+fn off_lock_execution_deferred() -> IpcError {
+    IpcError::Remote {
+        code: app_error::INTERNAL,
+        message: "internal: command execution was deferred off the runtime lock but never resumed"
+            .into(),
+    }
+}
+
+/// Spawn and await the child with the runtime mutex released (#160).
+async fn run_off_lock_command_plan(plan: OffLockCommandPlan) -> IpcResult<Value> {
+    let OffLockCommandPlan {
+        request,
+        prepared,
+        cancel,
+        workspace_id,
+        detach,
+        _detached_slot,
+        _execution_slot,
+    } = plan;
+    let result = Box::pin(run_prepared_command_cancellable(
+        &request, prepared, None, cancel,
+    ))
+    .await
+    .map_err(exec_error_to_ipc)?;
+    command_result_value(result, workspace_id.as_ref(), detach)
+}
+
+fn exec_error_to_ipc(error: ownmesh_exec::ExecError) -> IpcError {
+    let code = match &error {
+        ownmesh_exec::ExecError::Cancelled => app_error::CONFLICT,
+        ownmesh_exec::ExecError::ExecutableFormat(_) => app_error::EXECUTABLE_FORMAT,
+        _ => app_error::INTERNAL,
+    };
+    IpcError::Remote {
+        code,
+        message: error.to_string(),
+    }
+}
+
+fn command_result_value(
+    result: RunResult,
+    workspace_id: Option<&String>,
+    detach: bool,
+) -> IpcResult<Value> {
+    let mut value = serde_json::to_value(result).map_err(|e| IpcError::Remote {
+        code: app_error::INTERNAL,
+        message: e.to_string(),
+    })?;
+    let object = value
+        .as_object_mut()
+        .expect("command result serializes as an object");
+    object.insert("workspace_id".into(), json!(workspace_id));
+    if detach {
+        object.insert("detached".into(), json!(true));
+    }
+    Ok(value)
 }
 
 fn journal_degraded_error(reason: &str) -> IpcError {
@@ -925,6 +1089,8 @@ impl DaemonRuntime {
             active_remote_device_id: None,
             active_remote_principal: None,
             active_remote_principal_credential_generation: None,
+            off_lock_execution_claimed: false,
+            off_lock_execution: None,
             transfer_store,
             transfer_senders: HashMap::new(),
             transfer_last_chunks: HashMap::new(),
@@ -2313,52 +2479,106 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 // failure instead of being stranded as an eternal in_progress
                 // marker (#142).
                 let executed = self.execute_request(&request).await;
-                let result = match executed {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let (code, message) = match &error {
-                            IpcError::Remote { code, message } => (*code, message.clone()),
-                            _ => (app_error::INTERNAL, error.to_string()),
-                        };
-                        if let Err(reconcile_error) = self.fail_idempotent(
+                // #160: execution left the runtime mutex. The exact-once
+                // marker stays in progress while the child runs, so a
+                // concurrent replay of the same key is refused as uncertain
+                // exactly as it is during an inline run, and this same commit
+                // step runs with the real outcome once the mutex is retaken.
+                if self.off_lock_execution.is_some() {
+                    let journal_key = journal_key.clone();
+                    let deferred_operation_id = operation_id.clone();
+                    let capability = facts.capability.clone();
+                    let reason = verdict.reason.clone();
+                    self.push_off_lock_finalizer(move |runtime, outcome| {
+                        runtime.finish_gated_operation(
                             journal_key.as_ref(),
-                            &operation_id,
-                            code,
-                            &message,
-                        ) {
-                            eprintln!(
-                                "warning: failed to persist terminal failure receipt \
-                                 {operation_id}: {reconcile_error:?}"
-                            );
-                        }
-                        self.append_audit(
-                            "operation.failed",
-                            Some(&facts.capability),
-                            Some(&operation_id),
-                            Some("allow"),
-                            "execution returned a terminal error; journal marker reconciled",
-                        );
-                        return Err(error);
-                    }
-                };
-                let body = json!({
-                    "approval_required": false,
-                    "operation_id": operation_id,
-                    "result": result,
-                    "replayed": false,
-                    "decision": "allow",
-                    "reason": verdict.reason,
-                });
-                self.store_idempotent(journal_key.as_ref(), &body)?;
-                self.append_audit(
-                    "operation.completed",
-                    Some(&facts.capability),
-                    Some(&operation_id),
-                    Some("allow"),
-                    "executed",
-                );
-                Ok(body)
+                            &deferred_operation_id,
+                            &capability,
+                            &reason,
+                            outcome,
+                        )
+                    });
+                    return executed;
+                }
+                self.finish_gated_operation(
+                    journal_key.as_ref(),
+                    &operation_id,
+                    &facts.capability,
+                    &verdict.reason,
+                    executed,
+                )
             }
+        }
+    }
+
+    /// Commit the outcome of an allowed, journal-reserved operation.
+    ///
+    /// This is the tail [`Self::gate_and_run`] used to run inline. It is a
+    /// separate step because a command whose child ran with the runtime mutex
+    /// released reaches exactly this commit once the mutex is reacquired
+    /// (#160): one definition, so the off-lock path cannot drift from the
+    /// inline one.
+    fn finish_gated_operation(
+        &mut self,
+        journal_key: Option<&String>,
+        operation_id: &str,
+        capability: &str,
+        reason: &str,
+        executed: IpcResult<Value>,
+    ) -> IpcResult<Value> {
+        let result = match executed {
+            Ok(result) => result,
+            Err(error) => {
+                let (code, message) = match &error {
+                    IpcError::Remote { code, message } => (*code, message.clone()),
+                    _ => (app_error::INTERNAL, error.to_string()),
+                };
+                if let Err(reconcile_error) =
+                    self.fail_idempotent(journal_key, operation_id, code, &message)
+                {
+                    eprintln!(
+                        "warning: failed to persist terminal failure receipt \
+                         {operation_id}: {reconcile_error:?}"
+                    );
+                }
+                self.append_audit(
+                    "operation.failed",
+                    Some(capability),
+                    Some(operation_id),
+                    Some("allow"),
+                    "execution returned a terminal error; journal marker reconciled",
+                );
+                return Err(error);
+            }
+        };
+        let body = json!({
+            "approval_required": false,
+            "operation_id": operation_id,
+            "result": result,
+            "replayed": false,
+            "decision": "allow",
+            "reason": reason,
+        });
+        self.store_idempotent(journal_key, &body)?;
+        self.append_audit(
+            "operation.completed",
+            Some(capability),
+            Some(operation_id),
+            Some("allow"),
+            "executed",
+        );
+        Ok(body)
+    }
+
+    /// Attach a commit step to the execution captured during this admission
+    /// pass (#160). Finalizers run innermost-first once the runtime mutex is
+    /// reacquired. A no-op when nothing was deferred.
+    fn push_off_lock_finalizer<F>(&mut self, finalizer: F)
+    where
+        F: FnOnce(&mut Self, IpcResult<Value>) -> IpcResult<Value> + Send + Sync + 'static,
+    {
+        if let Some(execution) = self.off_lock_execution.as_mut() {
+            execution.finalizers.push(Box::new(finalizer));
         }
     }
 
@@ -2456,7 +2676,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // later and must never reach spawn either.
         reject_self_reentrant_ownmesh_exec(&p.program, &p.args)?;
 
-        let _detached_guard = if p.detach {
+        let detached_slot = if p.detach {
             Some(acquire_detached_slot()?)
         } else {
             None
@@ -2464,6 +2684,13 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
 
         // Elevated execution has no local fallback.  Only the custody-attested
         // Linux v2 broker path below may spawn with privilege.
+        //
+        // #160: this path still runs under the runtime mutex. Its child is
+        // spawned by the privileged broker rather than by the daemon, but the
+        // daemon's wait on the broker socket is the same class of arbitrary
+        // external wait, so the lock topology is not fixed here yet. It stays
+        // bounded by the intent's own timeout and by policy: elevation
+        // requires an explicit rule plus broker custody attestation.
         if p.elevated {
             let mut result = self.try_broker_elevated(p).await?;
             result
@@ -2507,6 +2734,33 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // transaction. Do not also mutate `exec_journal`, which cannot participate in
         // that transaction's in-memory rollback.
         let cancel = self.active_cancel.clone();
+        // #160: the plan is complete and authority-bound here — nothing below
+        // consults runtime state again — so hand it back to whoever owns the
+        // runtime mutex and let the child be spawned and awaited with that
+        // guard released. Holding it across the wait is what let a child that
+        // re-entered daemon IPC block every later request for the device.
+        //
+        // Only `dispatch_off_lock` claims this. Every other holder of
+        // `&mut DaemonRuntime` has no mutex to release and executes inline
+        // below, unchanged. `use_exec_journal` also stays inline: that journal
+        // is borrowed from `self` for the whole run and cannot leave with the
+        // plan.
+        if self.off_lock_execution_claimed && !use_exec_journal {
+            let execution_slot = acquire_off_lock_execution_slot()?;
+            self.off_lock_execution = Some(OffLockExecution {
+                plan: OffLockCommandPlan {
+                    request: req,
+                    prepared,
+                    cancel,
+                    workspace_id: p.workspace_id.clone(),
+                    detach: p.detach,
+                    _detached_slot: detached_slot,
+                    _execution_slot: execution_slot,
+                },
+                finalizers: Vec::new(),
+            });
+            return Err(off_lock_execution_deferred());
+        }
         let result: RunResult = if use_exec_journal {
             Box::pin(run_prepared_command_cancellable(
                 &req,
@@ -2521,32 +2775,8 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             ))
             .await
         }
-        .map_err(|e| {
-            let code = match &e {
-                ownmesh_exec::ExecError::Cancelled => app_error::CONFLICT,
-                ownmesh_exec::ExecError::ExecutableFormat(_) => app_error::EXECUTABLE_FORMAT,
-                _ => app_error::INTERNAL,
-            };
-            IpcError::Remote {
-                code,
-                message: e.to_string(),
-            }
-        })?;
-        let mut value = serde_json::to_value(result).map_err(|e| IpcError::Remote {
-            code: app_error::INTERNAL,
-            message: e.to_string(),
-        })?;
-        value
-            .as_object_mut()
-            .expect("command result serializes as an object")
-            .insert("workspace_id".into(), json!(p.workspace_id));
-        if p.detach {
-            value
-                .as_object_mut()
-                .expect("command result serializes as an object")
-                .insert("detached".into(), json!(true));
-        }
-        Ok(value)
+        .map_err(exec_error_to_ipc)?;
+        command_result_value(result, p.workspace_id.as_ref(), p.detach)
     }
 
     async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
@@ -4336,20 +4566,67 @@ path or install the tool so detection and execution agree",
         let executing_approvals = self.approvals.clone();
         let executing_op_journal = self.op_journal.clone();
         let is_approval_bridge = matches!(&request, PendingRequest::AdminApprovalBridge(_));
-        let result = match &request {
-            PendingRequest::Exec(p) => self.execute_exec(p, false).await,
-            PendingRequest::AdminApprovalBridge(p) => {
-                self.execute_approval_bridge(p, &approver).await
+        let executed = match &request {
+            PendingRequest::Exec(exec) => self.execute_exec(exec, false).await,
+            PendingRequest::AdminApprovalBridge(bridge) => {
+                self.execute_approval_bridge(bridge, &approver).await
             }
             other => self.execute_request(other).await,
-        }?;
+        };
+        let commit = ApprovedOperationCommit {
+            operation_id,
+            approval_id: p.id,
+            capability,
+            approver,
+            idem_key,
+            granted_scope,
+            is_approval_bridge,
+            executing_approvals,
+            executing_op_journal,
+        };
+        // #160: an approved command's child runs with the runtime mutex
+        // released as well. The approval is already durably `executing` —
+        // the same state an inline run holds while its child is alive — and
+        // the commit below runs once the mutex is reacquired.
+        if self.off_lock_execution.is_some() {
+            self.push_off_lock_finalizer(move |runtime, outcome| {
+                runtime.finish_approved_operation(commit, outcome)
+            });
+            return executed;
+        }
+        self.finish_approved_operation(commit, executed)
+    }
+
+    /// Commit the outcome of an approved, durably `executing` operation.
+    ///
+    /// Factored out of [`Self::handle_approval_approve`] for the same reason
+    /// as [`Self::finish_gated_operation`]: an approved command whose child
+    /// ran with the runtime mutex released reaches exactly this commit once
+    /// the mutex is reacquired (#160).
+    fn finish_approved_operation(
+        &mut self,
+        commit: ApprovedOperationCommit,
+        executed: IpcResult<Value>,
+    ) -> IpcResult<Value> {
+        let ApprovedOperationCommit {
+            operation_id,
+            approval_id,
+            capability,
+            approver,
+            idem_key,
+            granted_scope,
+            is_approval_bridge,
+            executing_approvals,
+            executing_op_journal,
+        } = commit;
+        let result = executed?;
         // A bridge may have durably completed its target approval. Preserve that
         // terminal target state if finalizing the outer bridge later fails.
         let post_execution_approvals = is_approval_bridge.then(|| self.approvals.clone());
         let mut body = json!({
             "approval_required": false,
             "operation_id": operation_id,
-            "approval_id": p.id,
+            "approval_id": approval_id,
             "result": result,
             "replayed": false,
             "decision": "allow",
@@ -4367,7 +4644,7 @@ path or install the tool so detection and execution agree",
             return Err(e);
         }
 
-        if let Some(rec) = self.approvals.get_mut(&p.id) {
+        if let Some(rec) = self.approvals.get_mut(&approval_id) {
             rec.state = "approved".into();
             rec.result = Some(body.clone());
             rec.decided_by_principal = Some(approver);
@@ -4385,7 +4662,7 @@ path or install the tool so detection and execution agree",
             Some(&capability),
             Some(&operation_id),
             Some("allow"),
-            format!("approved {}", p.id),
+            format!("approved {approval_id}"),
         );
         Ok(body)
     }
@@ -7144,13 +7421,113 @@ run `ownmesh doctor` or inspect {} ",
     }
 }
 
+/// Remote exact-action binding facts for one dispatch, or their absence.
+///
+/// The two shapes stay apart deliberately: the bound form also records the
+/// verified remote principal on the runtime, so a local IPC caller must not be
+/// able to acquire that fact by passing `None`s through the same door.
+pub enum RuntimeCallBinding {
+    /// Local IPC: plain [`DaemonRuntime::dispatch`].
+    Local,
+    /// Authenticated Agent channel.
+    Remote {
+        cancel: Option<watch::Receiver<bool>>,
+        operation_id: Option<String>,
+        expires_at_unix: Option<i64>,
+        payload_hash: Option<String>,
+        device_id: Option<String>,
+        principal_credential_generation: Option<u64>,
+    },
+}
+
+/// Dispatch one request without ever holding the runtime mutex across a child
+/// process wait (#160).
+///
+/// Admission — revocation, lockdown, policy, grants, executable custody, the
+/// exact-once journal reservation — runs under the mutex exactly as before.
+/// If admission captured a command plan, the guard is released, the child is
+/// spawned and awaited, and the mutex is reacquired only to run that
+/// operation's own commit step. Every other request keeps its single locked
+/// pass.
+///
+/// The circular wait this removes: the daemon held this mutex while waiting
+/// for a child, and a child that synchronously re-entered daemon IPC waited
+/// for the same mutex. Every later request for the device queued behind it.
+///
+/// This is the only caller that sets `off_lock_execution_claimed`. A holder of
+/// `&mut DaemonRuntime` has no mutex to release and executes inline, so the
+/// deferral is unreachable for it. The flag is cleared on the normal path the
+/// same way `dispatch_cancellable_bound_with_generation` clears its own
+/// per-dispatch fields: a panic mid-dispatch leaves the daemon inconsistent
+/// regardless, and is not compensated here either.
+pub async fn dispatch_off_lock(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    method: &str,
+    params: Option<Value>,
+    client: &ClientIdentity,
+    binding: RuntimeCallBinding,
+) -> IpcResult<Value> {
+    let mut guard = runtime.lock().await;
+    // A captured plan never outlives the locked section that created it, so
+    // anything still here is debris from an earlier panic, not live work.
+    guard.off_lock_execution = None;
+    guard.off_lock_execution_claimed = true;
+    let admitted = match binding {
+        RuntimeCallBinding::Local => guard.dispatch(method, params, client).await,
+        RuntimeCallBinding::Remote {
+            cancel,
+            operation_id,
+            expires_at_unix,
+            payload_hash,
+            device_id,
+            principal_credential_generation,
+        } => {
+            guard
+                .dispatch_cancellable_bound_with_generation(
+                    method,
+                    params,
+                    client,
+                    cancel,
+                    operation_id,
+                    expires_at_unix,
+                    payload_hash,
+                    device_id,
+                    principal_credential_generation,
+                )
+                .await
+        }
+    };
+    guard.off_lock_execution_claimed = false;
+    let Some(execution) = guard.off_lock_execution.take() else {
+        return admitted;
+    };
+    debug_assert!(
+        admitted.is_err(),
+        "a deferred execution must not also produce a completed admission result"
+    );
+    drop(guard);
+    let OffLockExecution { plan, finalizers } = execution;
+    let mut outcome = run_off_lock_command_plan(plan).await;
+    let mut guard = runtime.lock().await;
+    for finalize in finalizers {
+        outcome = finalize(&mut guard, outcome);
+    }
+    outcome
+}
+
 /// Build the IPC method handler backed by shared runtime state.
 pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
     Arc::new(move |method, params, client| {
         let runtime = Arc::clone(&runtime);
         Box::pin(async move {
-            let mut guard = runtime.lock().await;
-            guard.dispatch(&method, params, &client).await
+            dispatch_off_lock(
+                &runtime,
+                &method,
+                params,
+                &client,
+                RuntimeCallBinding::Local,
+            )
+            .await
         })
     })
 }
@@ -15081,5 +15458,259 @@ cleanup cannot leave the legacy large-body copy behind"
             !raw.contains("z".repeat(80 * 1024).as_str()),
             "successful persist must compact the large body away"
         );
+    }
+}
+
+#[cfg(test)]
+mod off_lock_execution_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
+
+    /// A stock executable that stays alive long enough to observe whether the
+    /// runtime mutex is held for a child's whole lifetime. The lock topology
+    /// under test is platform-independent, so every supported platform gets
+    /// the same coverage.
+    fn long_running_command() -> (String, Vec<String>) {
+        #[cfg(unix)]
+        {
+            let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|candidate| candidate.is_file())
+                .expect("a stock sleep executable must exist");
+            (sleep.display().to_string(), vec!["5".to_owned()])
+        }
+        #[cfg(windows)]
+        {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+            // `timeout.exe` refuses a redirected stdin, which is exactly how a
+            // daemon-spawned child is launched. `ping` is the stock way to
+            // hold a console-less child alive for a known interval.
+            let ping = PathBuf::from(format!("{root}\\System32\\PING.EXE"));
+            assert!(
+                ping.is_file(),
+                "a stock ping.exe must exist: {}",
+                ping.display()
+            );
+            (
+                ping.display().to_string(),
+                ["-n", "6", "127.0.0.1"]
+                    .iter()
+                    .map(|arg| (*arg).to_owned())
+                    .collect(),
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            unimplemented!("no stock long-running command for this platform")
+        }
+    }
+
+    fn full_access_runtime() -> (tempfile::TempDir, Arc<Mutex<DaemonRuntime>>) {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        (temp, Arc::new(Mutex::new(runtime)))
+    }
+
+    fn command_params(idempotency_key: &str) -> Value {
+        let (program, args) = long_running_command();
+        json!({
+            "program": program,
+            "args": args,
+            "kind": "structured",
+            "workspace_id": "ws_default",
+            "idempotency_key": idempotency_key,
+        })
+    }
+
+    /// #160: the daemon held one runtime mutex across a child's entire
+    /// lifetime, so a `command_run` whose child re-entered daemon IPC waited
+    /// on the lock its own parent held, and every later filesystem, Git,
+    /// session, and diagnosis request for the device queued behind it until
+    /// the first operation was cancelled by hand.
+    ///
+    /// Admission still runs under the mutex. The child no longer does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_running_command_does_not_hold_the_runtime_lock() {
+        let (_temp, runtime) = full_access_runtime();
+        let client = ClientIdentity::new("offlock-concurrency-test", "test");
+
+        let long_runtime = Arc::clone(&runtime);
+        let long_client = client.clone();
+        let long = tokio::spawn(async move {
+            dispatch_off_lock(
+                &long_runtime,
+                methods::OPS_EXEC,
+                Some(command_params("offlock_long_command")),
+                &long_client,
+                RuntimeCallBinding::Local,
+            )
+            .await
+        });
+
+        // Let admission finish and the child start. The command itself runs
+        // for seconds, so this settle window cannot outlast it.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert!(
+            !long.is_finished(),
+            "the fixture command must still be running for this test to mean anything"
+        );
+        assert!(
+            runtime.try_lock().is_ok(),
+            "the runtime mutex must be free while a command's child is alive"
+        );
+
+        // The acceptance criterion from the issue: while a long `command_run`
+        // is active, an unrelated read-only request completes independently.
+        let started = Instant::now();
+        let listed = dispatch_off_lock(
+            &runtime,
+            methods::OPS_FS_LIST,
+            Some(json!({ "path": ".", "workspace_id": "ws_default" })),
+            &client,
+            RuntimeCallBinding::Local,
+        )
+        .await
+        .expect("an unrelated read must not wait for the running command");
+        let elapsed = started.elapsed();
+        assert_eq!(listed["approval_required"], false);
+        assert!(
+            !long.is_finished(),
+            "the unrelated read must complete while the command is still running"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "unrelated read waited on the command: {elapsed:?}"
+        );
+
+        let completed = long
+            .await
+            .expect("the command task joins")
+            .expect("the command completes normally");
+        assert_eq!(completed["approval_required"], false);
+        assert_eq!(completed["result"]["exit_code"], 0);
+        assert_eq!(completed["replayed"], false);
+    }
+
+    /// Exact-once binding survives the move off the lock. The reservation is
+    /// written before execution and stays in progress while the child runs,
+    /// so a concurrent replay of the same key is refused as uncertain — the
+    /// same answer an inline run gave, never a second execution and never a
+    /// fabricated success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_in_flight_off_lock_command_keeps_its_exact_once_reservation() {
+        let (_temp, runtime) = full_access_runtime();
+        let client = ClientIdentity::new("offlock-idempotency-test", "test");
+
+        let long_runtime = Arc::clone(&runtime);
+        let long_client = client.clone();
+        let long = tokio::spawn(async move {
+            dispatch_off_lock(
+                &long_runtime,
+                methods::OPS_EXEC,
+                Some(command_params("offlock_exactly_once")),
+                &long_client,
+                RuntimeCallBinding::Local,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert!(
+            !long.is_finished(),
+            "the fixture command must still be running"
+        );
+
+        let replay = dispatch_off_lock(
+            &runtime,
+            methods::OPS_EXEC,
+            Some(command_params("offlock_exactly_once")),
+            &client,
+            RuntimeCallBinding::Local,
+        )
+        .await
+        .expect_err("an in-flight reservation must not be replayed as a result");
+        match &replay {
+            IpcError::Remote { code, message } => {
+                assert_eq!(*code, app_error::CONFLICT);
+                assert!(
+                    message.contains("in-progress or uncertain"),
+                    "in-flight replay must stay uncertain: {message}"
+                );
+            }
+            other => panic!("expected a typed in-flight refusal, got {other}"),
+        }
+
+        let completed = long
+            .await
+            .expect("the command task joins")
+            .expect("the command completes normally");
+        assert_eq!(completed["result"]["exit_code"], 0);
+
+        // The finalizer reacquired the mutex and committed the receipt.
+        let mut guard = runtime.lock().await;
+        assert!(
+            guard.off_lock_execution.is_none(),
+            "no captured plan may survive its dispatch"
+        );
+        let stored = guard
+            .dispatch(
+                methods::OPS_EXEC,
+                Some(command_params("offlock_exactly_once")),
+                &client,
+            )
+            .await
+            .expect("the completed receipt replays");
+        assert_eq!(stored["replayed"], true);
+    }
+
+    /// The deferral is unreachable for a caller that already owns
+    /// `&mut DaemonRuntime`: it has no mutex to release, so it executes
+    /// inline and can never observe the internal control error.
+    #[tokio::test]
+    async fn a_direct_mutable_caller_still_executes_inline() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let client = ClientIdentity::new("offlock-inline-test", "test");
+        let (program, args) = long_running_command();
+
+        let completed = runtime
+            .dispatch(
+                methods::OPS_EXEC,
+                Some(json!({
+                    "program": program,
+                    // A short argument keeps this test fast; the point is the
+                    // execution path, not the duration.
+                    "args": args.iter().take(1).cloned().collect::<Vec<_>>(),
+                    "kind": "structured",
+                    "workspace_id": "ws_default",
+                    "idempotency_key": "offlock_inline",
+                })),
+                &client,
+            )
+            .await
+            .expect("a direct mutable caller executes inline");
+        assert_eq!(completed["approval_required"], false);
+        assert!(
+            runtime.off_lock_execution.is_none(),
+            "an unclaimed runtime must never capture a plan"
+        );
+        assert!(!runtime.off_lock_execution_claimed);
     }
 }

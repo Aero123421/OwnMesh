@@ -4,7 +4,7 @@
 //! policy-gated [`DaemonRuntime`]. Without a runtime handle the transport stays
 //! fail-closed (`remote_routing_enabled: false`).
 
-use crate::runtime::DaemonRuntime;
+use crate::runtime::{dispatch_off_lock, DaemonRuntime, RuntimeCallBinding};
 use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
@@ -552,20 +552,22 @@ async fn transfer_runtime_call(
     params: Value,
     cancel: Option<watch::Receiver<bool>>,
 ) -> Result<Value, String> {
-    let mut guard = runtime.lock().await;
-    guard
-        .dispatch_cancellable_bound(
-            method,
-            Some(params),
-            &authority.client,
+    dispatch_off_lock(
+        runtime,
+        method,
+        Some(params),
+        &authority.client,
+        RuntimeCallBinding::Remote {
             cancel,
-            Some(authority.operation_id.clone()),
-            Some(authority.expires_at_unix),
-            Some(authority.payload_hash.clone()),
-            Some(authority.device_id.clone()),
-        )
-        .await
-        .map_err(|error| error.to_string())
+            operation_id: Some(authority.operation_id.clone()),
+            expires_at_unix: Some(authority.expires_at_unix),
+            payload_hash: Some(authority.payload_hash.clone()),
+            device_id: Some(authority.device_id.clone()),
+            principal_credential_generation: None,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 fn b64_standard_encode(bytes: &[u8]) -> String {
@@ -3990,22 +3992,24 @@ async fn dispatch_remote_operation(
         .get("idempotency_key")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let outcome = {
-        let mut guard = runtime.lock().await;
-        guard
-            .dispatch_cancellable_bound_with_generation(
-                mapped.0,
-                Some(mapped.1),
-                &client,
-                cancel_rx,
-                Some(operation_id.clone()),
-                remote_expires_unix,
-                remote_payload_hash.clone(),
-                Some(device_id.as_str().to_owned()),
-                remote_principal_credential_generation,
-            )
-            .await
-    };
+    // #160: admission runs under the runtime mutex; a command's child is
+    // spawned and awaited with that mutex released, so an unrelated operation
+    // for this device is not queued behind it.
+    let outcome = dispatch_off_lock(
+        runtime,
+        mapped.0,
+        Some(mapped.1),
+        &client,
+        RuntimeCallBinding::Remote {
+            cancel: cancel_rx,
+            operation_id: Some(operation_id.clone()),
+            expires_at_unix: remote_expires_unix,
+            payload_hash: remote_payload_hash.clone(),
+            device_id: Some(device_id.as_str().to_owned()),
+            principal_credential_generation: remote_principal_credential_generation,
+        },
+    )
+    .await;
 
     match outcome {
         Ok(body) => {
