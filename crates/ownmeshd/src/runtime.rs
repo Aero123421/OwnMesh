@@ -57,7 +57,8 @@ use ownmesh_exec::{
     classify_from_request_in_dir, pin_executable, prepare_executable,
     prepare_executable_with_interpreter, resolve_executable_invocation_path,
     resolve_executable_path, run_prepared_command_cancellable, verify_executable_pin, CommandKind,
-    ExecutablePin, IdempotencyJournal, RunRequest, RunResult, HARD_MAX_TIMEOUT_MS,
+    ExecutablePin, IdempotencyJournal, PreparedExecutable, RunRequest, RunResult,
+    HARD_MAX_TIMEOUT_MS,
 };
 use ownmesh_fs::{
     git_diff, git_head_oid, git_status, looks_sensitive, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
@@ -110,7 +111,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use structured_adapter::StructuredAdapterDriver;
@@ -752,6 +753,58 @@ const MAX_CACHED_DESTINATION_TRANSFERS: usize = 256;
 /// Concurrent detached `command.run` jobs per daemon. Fail-closed when full.
 const MAX_DETACHED_COMMANDS: usize = 4;
 static DETACHED_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// `command.run` executions that have released the runtime mutex and are
+/// waiting on a child/broker. Diagnose subtracts this from in-progress journal
+/// markers so a live exec is not reported as a stuck receipt (#160).
+static EXTERNAL_EXEC_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Bounded counter of pre-spawn `OWNMESH_E_SELF_REENTRANT_EXEC` refusals.
+/// Never stores argv, paths, or output.
+static SELF_REENTRANT_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+struct ExternalExecGuard;
+
+impl Drop for ExternalExecGuard {
+    fn drop(&mut self) {
+        EXTERNAL_EXEC_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn acquire_external_exec() -> ExternalExecGuard {
+    EXTERNAL_EXEC_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    ExternalExecGuard
+}
+
+/// Policy admission completed; the request is allowed and the exact-once
+/// journal marker (when present) is already reserved.
+struct AllowedWork {
+    journal_key: Option<String>,
+    operation_id: String,
+    capability: String,
+    reason: String,
+    request: PendingRequest,
+}
+
+enum GateOutcome {
+    Reply(Value),
+    Run(Box<AllowedWork>),
+}
+
+/// Authority-bound execution plan captured under the runtime mutex so the
+/// child wait can run without holding it (#160).
+struct AdmittedExec {
+    work: AllowedWork,
+    cancel: Option<watch::Receiver<bool>>,
+    runtime_dir: PathBuf,
+}
+
+enum DispatchOutcome {
+    Done(IpcResult<Value>),
+    Execute(Box<AdmittedExec>),
+}
+
+fn pending_request_releases_runtime_lock(request: &PendingRequest) -> bool {
+    matches!(request, PendingRequest::Exec(params) if !params.elevated)
+}
 
 struct DetachedCommandGuard;
 
@@ -759,6 +812,145 @@ impl Drop for DetachedCommandGuard {
     fn drop(&mut self) {
         DETACHED_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+async fn run_prepared_exec(
+    p: &ExecParams,
+    prepared: PreparedExecutable,
+    kind: CommandKind,
+    exec_journal: Option<&mut IdempotencyJournal>,
+    cancel: Option<watch::Receiver<bool>>,
+) -> IpcResult<Value> {
+    // Spawn mode follows the client request shape (argv vs shell-string).
+    // Policy already used server-side classification in handle_exec.
+    // Hard ceilings are enforced here even if a caller bypasses MCP schema.
+    // Detached commands have no wall-clock kill; cancel still process-tree kills.
+    let timeout_ms = if p.detach {
+        None
+    } else {
+        Some(p.timeout_ms.unwrap_or(30_000).clamp(1, HARD_MAX_TIMEOUT_MS))
+    };
+    // Keep a single durable hop under the control-plane data_json budget
+    // (~256 KiB) after JSON framing. Larger captures require an explicit
+    // smaller max or a future spool cursor — never one giant unbounded JSON.
+    let max_output_bytes = p.max_output_bytes.unwrap_or(128 * 1024).clamp(1, 200_000);
+    let env = sanitize_exec_env(&p.env)?;
+    let req = RunRequest {
+        kind,
+        program: p.program.clone(),
+        args: p.args.clone(),
+        cwd: p.cwd.as_ref().map(PathBuf::from),
+        env,
+        stdin: None,
+        timeout_ms,
+        max_output_bytes,
+        idempotency_key: p.idempotency_key.clone(),
+    };
+    let result: RunResult = Box::pin(run_prepared_command_cancellable(
+        &req,
+        prepared,
+        exec_journal,
+        cancel,
+    ))
+    .await
+    .map_err(|e| {
+        let code = match &e {
+            ownmesh_exec::ExecError::Cancelled => app_error::CONFLICT,
+            ownmesh_exec::ExecError::ExecutableFormat(_) => app_error::EXECUTABLE_FORMAT,
+            _ => app_error::INTERNAL,
+        };
+        IpcError::Remote {
+            code,
+            message: e.to_string(),
+        }
+    })?;
+    let mut value = serde_json::to_value(result).map_err(|e| IpcError::Remote {
+        code: app_error::INTERNAL,
+        message: e.to_string(),
+    })?;
+    value
+        .as_object_mut()
+        .expect("command result serializes as an object")
+        .insert("workspace_id".into(), json!(p.workspace_id));
+    if p.detach {
+        value
+            .as_object_mut()
+            .expect("command result serializes as an object")
+            .insert("detached".into(), json!(true));
+    }
+    Ok(value)
+}
+
+fn prepare_admitted_exec(
+    p: &ExecParams,
+    runtime_dir: &Path,
+) -> IpcResult<(PreparedExecutable, CommandKind)> {
+    let cwd = p.cwd.as_deref().map(Path::new);
+    let kind = CommandKind::parse_requested(p.kind.as_deref());
+    let prepared = match kind {
+        CommandKind::Structured => {
+            let invocation = p.invocation_pin.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: structured invocation pin is missing; request must be re-authorized".into(),
+            })?;
+            let backing = p.executable_pin.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: structured backing pin is missing; request must be re-authorized".into(),
+            })?;
+            prepare_executable_with_interpreter(
+                Path::new(&p.program),
+                invocation,
+                backing,
+                p.shell_pin.as_ref(),
+                Some(runtime_dir),
+            )
+        }
+        CommandKind::RawShell => {
+            let shell = p.shell_pin.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: raw-shell interpreter pin is missing; request must be re-authorized".into(),
+            })?;
+            prepare_executable(
+                Path::new(&shell.path),
+                shell,
+                shell,
+                Some(runtime_dir),
+            )
+        }
+    }
+    .map_err(|_| IpcError::Remote {
+        code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+        message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: invocation identity changed; request must be re-authorized".into(),
+    })?;
+    let current_kind = classify_from_request_in_dir(p.kind.as_deref(), &p.program, &p.args, cwd);
+    let approved_kind = CommandKind::parse_requested(p.policy_kind.as_deref());
+    if current_kind != approved_kind {
+        return Err(IpcError::Remote {
+            code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+            message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: command classification changed; request must be re-authorized".into(),
+        });
+    }
+    if let Err(error) = reject_self_reentrant_ownmesh_exec(&p.program, &p.args) {
+        SELF_REENTRANT_REFUSALS.fetch_add(1, Ordering::SeqCst);
+        return Err(error);
+    }
+    Ok((prepared, kind))
+}
+
+async fn execute_admitted_exec(admitted: &AdmittedExec) -> IpcResult<Value> {
+    let PendingRequest::Exec(params) = &admitted.work.request else {
+        return Err(IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: "unlocked execution is only implemented for command.run".into(),
+        });
+    };
+    let (prepared, kind) = prepare_admitted_exec(params, &admitted.runtime_dir)?;
+    let _detached_guard = if params.detach {
+        Some(acquire_detached_slot()?)
+    } else {
+        None
+    };
+    run_prepared_exec(params, prepared, kind, None, admitted.cancel.clone()).await
 }
 
 fn journal_degraded_error(reason: &str) -> IpcError {
@@ -2155,6 +2347,19 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         request: PendingRequest,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
+        match self.admit_gated(facts, idempotency_key, request, client)? {
+            GateOutcome::Reply(value) => Ok(value),
+            GateOutcome::Run(work) => self.finish_allowed(*work).await,
+        }
+    }
+
+    fn admit_gated(
+        &mut self,
+        facts: OperationFacts,
+        idempotency_key: Option<String>,
+        request: PendingRequest,
+        client: &ClientIdentity,
+    ) -> IpcResult<GateOutcome> {
         let requester_principal = canonicalize_principal_key(client.principal_key());
         // Namespace receipts by principal so one MCP caller cannot replay another's
         // local side-effect journal entry via a colliding idempotency_key.
@@ -2184,7 +2389,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             if let Some(obj) = replayed.as_object_mut() {
                 obj.insert("replayed".into(), json!(true));
             }
-            return Ok(replayed);
+            return Ok(GateOutcome::Reply(replayed));
         }
 
         let mut facts = facts;
@@ -2279,87 +2484,145 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                     Some("ask"),
                     format!("approval {approval_id}"),
                 );
-                Ok(json!({
+                Ok(GateOutcome::Reply(json!({
                     "approval_required": true,
                     "operation_id": operation_id,
                     "approval_id": approval_id,
                     "reason": verdict.reason,
                     "matched_rule_id": verdict.matched_rule_id,
                     "replayed": false,
-                }))
+                })))
             }
             Decision::Allow => {
                 if self.op_journal_degraded.is_some()
                     && pending_request_is_journal_read_only(&request)
                 {
-                    let result = self.execute_request(&request).await?;
-                    return Ok(json!({
-                        "approval_required": false,
-                        "operation_id": operation_id,
-                        "result": result,
-                        "replayed": false,
-                        "decision": "allow",
-                        "reason": verdict.reason,
-                    }));
+                    // Read-only observation while the journal is degraded stays
+                    // inside the lock: it does not wait on a child.
+                    return Ok(GateOutcome::Run(Box::new(AllowedWork {
+                        journal_key: None,
+                        operation_id,
+                        capability: facts.capability,
+                        reason: verdict.reason,
+                        request,
+                    })));
                 }
                 if let Some(reason) = &self.op_journal_degraded {
                     return Err(journal_degraded_error(reason));
                 }
                 self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
-                // A crash between this reserve and a terminal outcome must
-                // keep the exact-once marker (ADR 0010). But a definitive
-                // execution error is itself terminal: reconcile the marker
-                // into a compact failed receipt so the key replays the same
-                // failure instead of being stranded as an eternal in_progress
-                // marker (#142).
-                let executed = self.execute_request(&request).await;
-                let result = match executed {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let (code, message) = match &error {
-                            IpcError::Remote { code, message } => (*code, message.clone()),
-                            _ => (app_error::INTERNAL, error.to_string()),
-                        };
-                        if let Err(reconcile_error) = self.fail_idempotent(
-                            journal_key.as_ref(),
-                            &operation_id,
-                            code,
-                            &message,
-                        ) {
-                            eprintln!(
-                                "warning: failed to persist terminal failure receipt \
-                                 {operation_id}: {reconcile_error:?}"
-                            );
-                        }
-                        self.append_audit(
-                            "operation.failed",
-                            Some(&facts.capability),
-                            Some(&operation_id),
-                            Some("allow"),
-                            "execution returned a terminal error; journal marker reconciled",
-                        );
-                        return Err(error);
-                    }
-                };
-                let body = json!({
-                    "approval_required": false,
-                    "operation_id": operation_id,
-                    "result": result,
-                    "replayed": false,
-                    "decision": "allow",
-                    "reason": verdict.reason,
-                });
-                self.store_idempotent(journal_key.as_ref(), &body)?;
-                self.append_audit(
-                    "operation.completed",
-                    Some(&facts.capability),
-                    Some(&operation_id),
-                    Some("allow"),
-                    "executed",
-                );
-                Ok(body)
+                Ok(GateOutcome::Run(Box::new(AllowedWork {
+                    journal_key,
+                    operation_id,
+                    capability: facts.capability,
+                    reason: verdict.reason,
+                    request,
+                })))
             }
         }
+    }
+
+    async fn finish_allowed(&mut self, work: AllowedWork) -> IpcResult<Value> {
+        if self.op_journal_degraded.is_some()
+            && work.journal_key.is_none()
+            && pending_request_is_journal_read_only(&work.request)
+        {
+            let result = self.execute_request(&work.request).await?;
+            return Ok(json!({
+                "approval_required": false,
+                "operation_id": work.operation_id,
+                "result": result,
+                "replayed": false,
+                "decision": "allow",
+                "reason": work.reason,
+            }));
+        }
+        let executed = self.execute_request(&work.request).await;
+        self.finalize_allowed(work, executed)
+    }
+
+    /// Reacquire-path finalizer: the in-progress marker written at admission
+    /// is the compare-and-swap target. A raced or already-terminal marker is
+    /// left untouched and the outcome is reported as uncertain (#160).
+    fn finalize_allowed(
+        &mut self,
+        work: AllowedWork,
+        executed: IpcResult<Value>,
+    ) -> IpcResult<Value> {
+        if let Some(key) = work.journal_key.as_ref() {
+            match self.op_journal.get(key) {
+                Some(entry)
+                    if op_journal_entry_state(entry) == OpJournalEntryState::InProgress
+                        && entry.get("operation_id").and_then(Value::as_str)
+                            == Some(work.operation_id.as_str()) => {}
+                Some(_) => {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "idempotency key for {} changed before result finalization; \
+outcome is uncertain and must not be retried",
+                            work.operation_id
+                        ),
+                    });
+                }
+                None => {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "idempotency marker for {} is missing at finalization; \
+outcome is uncertain and must not be retried",
+                            work.operation_id
+                        ),
+                    });
+                }
+            }
+        }
+        let result = match executed {
+            Ok(result) => result,
+            Err(error) => {
+                let (code, message) = match &error {
+                    IpcError::Remote { code, message } => (*code, message.clone()),
+                    _ => (app_error::INTERNAL, error.to_string()),
+                };
+                if let Err(reconcile_error) = self.fail_idempotent(
+                    work.journal_key.as_ref(),
+                    &work.operation_id,
+                    code,
+                    &message,
+                ) {
+                    eprintln!(
+                        "warning: failed to persist terminal failure receipt \
+                         {}: {reconcile_error:?}",
+                        work.operation_id
+                    );
+                }
+                self.append_audit(
+                    "operation.failed",
+                    Some(&work.capability),
+                    Some(&work.operation_id),
+                    Some("allow"),
+                    "execution returned a terminal error; journal marker reconciled",
+                );
+                return Err(error);
+            }
+        };
+        let body = json!({
+            "approval_required": false,
+            "operation_id": work.operation_id,
+            "result": result,
+            "replayed": false,
+            "decision": "allow",
+            "reason": work.reason,
+        });
+        self.store_idempotent(work.journal_key.as_ref(), &body)?;
+        self.append_audit(
+            "operation.completed",
+            Some(&work.capability),
+            Some(&work.operation_id),
+            Some("allow"),
+            "executed",
+        );
+        Ok(body)
     }
 
     async fn execute_request(&mut self, request: &PendingRequest) -> IpcResult<Value> {
@@ -2401,61 +2664,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
     }
 
     async fn execute_exec(&mut self, p: &ExecParams, use_exec_journal: bool) -> IpcResult<Value> {
-        let cwd = p.cwd.as_deref().map(Path::new);
-        let kind = CommandKind::parse_requested(p.kind.as_deref());
-        let prepared = match kind {
-            CommandKind::Structured => {
-                let invocation = p.invocation_pin.as_ref().ok_or_else(|| IpcError::Remote {
-                    code: app_error::EXECUTABLE_IDENTITY_DRIFT,
-                    message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: structured invocation pin is missing; request must be re-authorized".into(),
-                })?;
-                let backing = p.executable_pin.as_ref().ok_or_else(|| IpcError::Remote {
-                    code: app_error::EXECUTABLE_IDENTITY_DRIFT,
-                    message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: structured backing pin is missing; request must be re-authorized".into(),
-                })?;
-                prepare_executable_with_interpreter(
-                    Path::new(&p.program),
-                    invocation,
-                    backing,
-                    p.shell_pin.as_ref(),
-                    Some(&self.paths.runtime_dir),
-                )
-            }
-            CommandKind::RawShell => {
-                let shell = p.shell_pin.as_ref().ok_or_else(|| IpcError::Remote {
-                    code: app_error::EXECUTABLE_IDENTITY_DRIFT,
-                    message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: raw-shell interpreter pin is missing; request must be re-authorized".into(),
-                })?;
-                prepare_executable(
-                    Path::new(&shell.path),
-                    shell,
-                    shell,
-                    Some(&self.paths.runtime_dir),
-                )
-            }
-        }
-        .map_err(|_| IpcError::Remote {
-            code: app_error::EXECUTABLE_IDENTITY_DRIFT,
-            message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: invocation identity changed; request must be re-authorized".into(),
-        })?;
-        // Re-classify only after preparation has bound the exact approved
-        // invocation/backing object. Never substitute a canonical backing for
-        // a drifted proxy; any such drift has already returned the typed error.
-        let current_kind =
-            classify_from_request_in_dir(p.kind.as_deref(), &p.program, &p.args, cwd);
-        let approved_kind = CommandKind::parse_requested(p.policy_kind.as_deref());
-        if current_kind != approved_kind {
-            return Err(IpcError::Remote {
-                code: app_error::EXECUTABLE_IDENTITY_DRIFT,
-                message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: command classification changed; request must be re-authorized".into(),
-            });
-        }
-
-        // #160: the authoritative pre-spawn gate. `handle_exec` rejects the
-        // same request at admission, but an approved request executes here
-        // later and must never reach spawn either.
-        reject_self_reentrant_ownmesh_exec(&p.program, &p.args)?;
-
+        let (prepared, kind) = prepare_admitted_exec(p, &self.paths.runtime_dir)?;
         let _detached_guard = if p.detach {
             Some(acquire_detached_slot()?)
         } else {
@@ -2465,6 +2674,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // Elevated execution has no local fallback.  Only the custody-attested
         // Linux v2 broker path below may spawn with privilege.
         if p.elevated {
+            let _ = (prepared, kind);
             let mut result = self.try_broker_elevated(p).await?;
             result
                 .as_object_mut()
@@ -2478,75 +2688,12 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             }
             return Ok(result);
         }
-        // Spawn mode follows the client request shape (argv vs shell-string).
-        // Policy already used server-side classification in handle_exec.
-        // Hard ceilings are enforced here even if a caller bypasses MCP schema.
-        // Detached commands have no wall-clock kill; cancel still process-tree kills.
-        let timeout_ms = if p.detach {
-            None
-        } else {
-            Some(p.timeout_ms.unwrap_or(30_000).clamp(1, HARD_MAX_TIMEOUT_MS))
-        };
-        // Keep a single durable hop under the control-plane data_json budget
-        // (~256 KiB) after JSON framing. Larger captures require an explicit
-        // smaller max or a future spool cursor — never one giant unbounded JSON.
-        let max_output_bytes = p.max_output_bytes.unwrap_or(128 * 1024).clamp(1, 200_000);
-        let env = sanitize_exec_env(&p.env)?;
-        let req = RunRequest {
-            kind,
-            program: p.program.clone(),
-            args: p.args.clone(),
-            cwd: p.cwd.as_ref().map(PathBuf::from),
-            env,
-            stdin: None,
-            timeout_ms,
-            max_output_bytes,
-            idempotency_key: p.idempotency_key.clone(),
-        };
-        // Approved operations are journaled by `op_journal` as part of the approval
-        // transaction. Do not also mutate `exec_journal`, which cannot participate in
-        // that transaction's in-memory rollback.
         let cancel = self.active_cancel.clone();
-        let result: RunResult = if use_exec_journal {
-            Box::pin(run_prepared_command_cancellable(
-                &req,
-                prepared,
-                Some(&mut self.exec_journal),
-                cancel,
-            ))
-            .await
+        if use_exec_journal {
+            run_prepared_exec(p, prepared, kind, Some(&mut self.exec_journal), cancel).await
         } else {
-            Box::pin(run_prepared_command_cancellable(
-                &req, prepared, None, cancel,
-            ))
-            .await
+            run_prepared_exec(p, prepared, kind, None, cancel).await
         }
-        .map_err(|e| {
-            let code = match &e {
-                ownmesh_exec::ExecError::Cancelled => app_error::CONFLICT,
-                ownmesh_exec::ExecError::ExecutableFormat(_) => app_error::EXECUTABLE_FORMAT,
-                _ => app_error::INTERNAL,
-            };
-            IpcError::Remote {
-                code,
-                message: e.to_string(),
-            }
-        })?;
-        let mut value = serde_json::to_value(result).map_err(|e| IpcError::Remote {
-            code: app_error::INTERNAL,
-            message: e.to_string(),
-        })?;
-        value
-            .as_object_mut()
-            .expect("command result serializes as an object")
-            .insert("workspace_id".into(), json!(p.workspace_id));
-        if p.detach {
-            value
-                .as_object_mut()
-                .expect("command result serializes as an object")
-                .insert("detached".into(), json!(true));
-        }
-        Ok(value)
     }
 
     async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
@@ -3037,6 +3184,17 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
+        match self.admit_exec(params, client).await? {
+            GateOutcome::Reply(value) => Ok(value),
+            GateOutcome::Run(work) => self.finish_allowed(*work).await,
+        }
+    }
+
+    async fn admit_exec(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<GateOutcome> {
         let mut p: ExecParams = parse_params(params)?;
         // Never trust client-supplied pins / policy classification.
         p.executable_pin = None;
@@ -3203,7 +3361,10 @@ path or install the tool so detection and execution agree",
         // #160: refuse a self-reentrant OwnMesh invocation before it consumes
         // an idempotency key or an approval, so the caller gets one bounded
         // typed error instead of a device-wide stall.
-        reject_self_reentrant_ownmesh_exec(&p.program, &p.args)?;
+        if let Err(error) = reject_self_reentrant_ownmesh_exec(&p.program, &p.args) {
+            SELF_REENTRANT_REFUSALS.fetch_add(1, Ordering::SeqCst);
+            return Err(error);
+        }
         // Facts carry only server-computed pin identity — never client digests.
         let facts = OperationFacts {
             capability: "command.run".into(),
@@ -3226,8 +3387,7 @@ path or install the tool so detection and execution agree",
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::Exec(Box::new(p)), client)
-            .await
+        self.admit_gated(facts, key, PendingRequest::Exec(Box::new(p)), client)
     }
 
     fn transfer_error(error: TransferError) -> IpcError {
@@ -5343,6 +5503,41 @@ path or install the tool so detection and execution agree",
         remote_device_id: Option<String>,
         remote_principal_credential_generation: Option<u64>,
     ) -> IpcResult<Value> {
+        match self
+            .admit_cancellable_bound_with_generation(
+                method,
+                params,
+                client,
+                cancel,
+                remote_operation_id,
+                remote_expires_at_unix,
+                remote_payload_hash,
+                remote_device_id,
+                remote_principal_credential_generation,
+            )
+            .await
+        {
+            DispatchOutcome::Done(result) => result,
+            DispatchOutcome::Execute(admitted) => {
+                let admitted = *admitted;
+                let executed = execute_admitted_exec(&admitted).await;
+                self.finalize_allowed(admitted.work, executed)
+            }
+        }
+    }
+
+    async fn admit_cancellable_bound_with_generation(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        client: &ClientIdentity,
+        cancel: Option<watch::Receiver<bool>>,
+        remote_operation_id: Option<String>,
+        remote_expires_at_unix: Option<i64>,
+        remote_payload_hash: Option<String>,
+        remote_device_id: Option<String>,
+        remote_principal_credential_generation: Option<u64>,
+    ) -> DispatchOutcome {
         self.active_cancel = cancel;
         self.active_remote_operation_id = remote_operation_id
             .map(|s| s.trim().to_owned())
@@ -5358,7 +5553,26 @@ path or install the tool so detection and execution agree",
             .filter(|value| !value.is_empty());
         self.active_remote_principal_credential_generation =
             remote_principal_credential_generation.filter(|generation| *generation > 0);
-        let outcome = self.dispatch(method, params, client).await;
+        let outcome = if method == methods::OPS_EXEC {
+            match self.admit_exec(params, client).await {
+                Ok(GateOutcome::Reply(value)) => DispatchOutcome::Done(Ok(value)),
+                Ok(GateOutcome::Run(work))
+                    if pending_request_releases_runtime_lock(&work.request) =>
+                {
+                    DispatchOutcome::Execute(Box::new(AdmittedExec {
+                        work: *work,
+                        cancel: self.active_cancel.clone(),
+                        runtime_dir: self.paths.runtime_dir.clone(),
+                    }))
+                }
+                Ok(GateOutcome::Run(work)) => {
+                    DispatchOutcome::Done(self.finish_allowed(*work).await)
+                }
+                Err(error) => DispatchOutcome::Done(Err(error)),
+            }
+        } else {
+            DispatchOutcome::Done(self.dispatch(method, params, client).await)
+        };
         self.active_cancel = None;
         self.active_remote_operation_id = None;
         self.active_remote_expires_at_unix = None;
@@ -7145,14 +7359,69 @@ run `ownmesh doctor` or inspect {} ",
 }
 
 /// Build the IPC method handler backed by shared runtime state.
+///
+/// `command.run` admission runs under the mutex; the child wait runs after
+/// the mutex is released so a child that re-enters daemon IPC cannot deadlock
+/// the device (#160). Other methods still serialize on the mutex.
 pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
     Arc::new(move |method, params, client| {
         let runtime = Arc::clone(&runtime);
         Box::pin(async move {
-            let mut guard = runtime.lock().await;
-            guard.dispatch(&method, params, &client).await
+            dispatch_unlocked(
+                &runtime, &method, params, &client, None, None, None, None, None, None,
+            )
+            .await
         })
     })
+}
+
+pub(super) fn runtime_queue_observation() -> (usize, u64) {
+    (
+        EXTERNAL_EXEC_IN_FLIGHT.load(Ordering::SeqCst),
+        SELF_REENTRANT_REFUSALS.load(Ordering::SeqCst),
+    )
+}
+
+/// Admit under the runtime mutex, run non-elevated `command.run` without it,
+/// then reacquire only to finalize the exact-once journal marker (#160).
+pub async fn dispatch_unlocked(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    method: &str,
+    params: Option<Value>,
+    client: &ClientIdentity,
+    cancel: Option<watch::Receiver<bool>>,
+    remote_operation_id: Option<String>,
+    remote_expires_at_unix: Option<i64>,
+    remote_payload_hash: Option<String>,
+    remote_device_id: Option<String>,
+    remote_principal_credential_generation: Option<u64>,
+) -> IpcResult<Value> {
+    let outcome = {
+        let mut guard = runtime.lock().await;
+        guard
+            .admit_cancellable_bound_with_generation(
+                method,
+                params,
+                client,
+                cancel,
+                remote_operation_id,
+                remote_expires_at_unix,
+                remote_payload_hash,
+                remote_device_id,
+                remote_principal_credential_generation,
+            )
+            .await
+    };
+    match outcome {
+        DispatchOutcome::Done(result) => result,
+        DispatchOutcome::Execute(admitted) => {
+            let _inflight = acquire_external_exec();
+            let admitted = *admitted;
+            let executed = execute_admitted_exec(&admitted).await;
+            let mut guard = runtime.lock().await;
+            guard.finalize_allowed(admitted.work, executed)
+        }
+    }
 }
 
 /// Fail-closed gate for approval decisions at the runtime handler boundary.
@@ -8753,6 +9022,76 @@ mod device_binding_tests {
             }
         ));
         assert!(runtime.sessions.list().is_empty());
+    }
+
+    /// #31: a short-lived child that exits before live attestation must not
+    /// commit `state=running`. Open is a terminal failure and leaves no
+    /// stale running record that would poison later session work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_short_lived_child_cannot_commit_running_at_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        runtime.active_remote_device_id = Some("dev_a".into());
+        let sidecar_root = paths.state_dir.join("session-supervisor");
+        let (supervisor_server, _) =
+            ownmesh_session_host::SupervisorIpcServer::new(&sidecar_root, &paths.runtime_dir)
+                .unwrap();
+        let endpoint = supervisor_server.endpoint().clone();
+        let server = Arc::clone(supervisor_server.server());
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move { server.serve().await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let management =
+            read_management_credential(supervisor_server.credential_state_dir()).unwrap();
+        let supervisor =
+            SupervisorClient::bootstrap(endpoint, paths.runtime_dir.clone(), management)
+                .await
+                .unwrap();
+        runtime.supervisor = Some(supervisor);
+
+        let true_bin = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .expect("true(1) is required for this Unix regression");
+        let remote = ClientIdentity::new("client:remote:tenant:owner", "test");
+        let error = runtime
+            .handle_session_open(
+                Some(json!({
+                    "title": "short-lived",
+                    "program": true_bin,
+                    "workspace_id": "ws_default",
+                })),
+                &remote,
+            )
+            .await
+            .expect_err("a child that exits before live attestation must not succeed as running");
+        match error {
+            IpcError::Remote { code, message } => {
+                assert_eq!(code, app_error::CONFLICT);
+                assert!(
+                    message.contains("did not attest a live child process identity"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected identity conflict, got {other}"),
+        }
+        assert!(
+            runtime
+                .sessions
+                .list()
+                .iter()
+                .all(|session| session.state == ownmesh_session::SessionState::Closed),
+            "open must not leave a running record: {:?}",
+            runtime.sessions.list()
+        );
+
+        server.request_shutdown();
+        server_task.await.unwrap();
     }
 }
 
@@ -11300,6 +11639,72 @@ mod broker_intent_tests {
                 .expect("an unrelated command must remain executable");
             assert_eq!(ok.get("approval_required"), Some(&json!(false)));
         }
+    }
+
+    /// #160: a long `command.run` must release the runtime mutex so an
+    /// unrelated filesystem/diagnosis request can complete before the child
+    /// exits. Holding the mutex across `sleep` is the original device-wide
+    /// stall.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_run_does_not_hold_the_runtime_lock_across_child_wait() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let runtime = Arc::new(Mutex::new(runtime));
+        let client = ClientIdentity::new("exec-unlock-test", "test");
+        let sleep = if Path::new("/bin/sleep").is_file() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        let exec = dispatch_unlocked(
+            &runtime,
+            methods::OPS_EXEC,
+            Some(json!({
+                "program": sleep,
+                "args": ["2"],
+                "kind": "structured",
+                "workspace_id": "ws_default",
+                "timeout_ms": 5_000,
+                "idempotency_key": "unlock_sleep_1",
+            })),
+            &client,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let started = std::time::Instant::now();
+        let listed = dispatch_unlocked(
+            &runtime,
+            methods::OPS_FS_LIST,
+            Some(json!({
+                "path": "",
+                "workspace_id": "ws_default",
+            })),
+            &client,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("filesystem list must not wait for the sleep child");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "unrelated fs.list waited on command.run: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(listed.get("approval_required"), Some(&json!(false)));
+        let exec_result = exec.await.expect("sleep must complete");
+        assert_eq!(exec_result.get("approval_required"), Some(&json!(false)));
     }
 
     #[test]

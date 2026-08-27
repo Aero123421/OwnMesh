@@ -202,6 +202,98 @@
         }
     }
 
+    # Locale-independent last-run result via the Task Scheduler COM API
+    # (numeric LastTaskResult / State). `schtasks /Query /FO LIST /V` text is
+    # localized and cannot be the readiness authority. $null means the probe
+    # could not run; polling continues rather than inventing a failure.
+    #
+    # TASK_STATE_QUEUED = 2, TASK_STATE_RUNNING = 4. A non-zero LastTaskResult
+    # while the instance is still queued/running is the previous run, not this
+    # one. SCHED_S_TASK_RUNNING (0x41301) is also not a terminal failure.
+    function Get-OwnMeshScheduledTaskRun {
+        foreach ($taskName in @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
+            try {
+                $service = New-Object -ComObject Schedule.Service
+                $service.Connect()
+                if ($taskName.Contains("\")) {
+                    $parts = $taskName.Split("\")
+                    $folder = $service.GetFolder("\" + $parts[0])
+                    $task = $folder.GetTask($parts[1])
+                } else {
+                    $folder = $service.GetFolder("\")
+                    $task = $folder.GetTask($taskName)
+                }
+                return @{
+                    State = [int]$task.State
+                    LastTaskResult = [int]$task.LastTaskResult
+                }
+            } catch {
+                # Missing task, COM unavailable, or folder mismatch: try the
+                # next well-known name. Never treat a probe failure as a
+                # terminal task result.
+            }
+        }
+        return $null
+    }
+
+    function Test-OwnMeshScheduledTaskTerminalFailure {
+        param($Run)
+        if ($null -eq $Run) { return $false }
+        $state = [int]$Run.State
+        $result = [int]$Run.LastTaskResult
+        if ($state -eq 2 -or $state -eq 4) { return $false }
+        if ($result -eq 0) { return $false }
+        # 0x00041301 SCHED_S_TASK_RUNNING, 0x00041300 SCHED_S_TASK_READY,
+        # 0x00041303 SCHED_S_TASK_HAS_NOT_RUN, 0x00041306 disabled.
+        if ($result -in @(267008, 267009, 267011, 267014)) { return $false }
+        return $true
+    }
+
+    # Shared with `ownmesh update`: poll authenticated `ownmesh --json status`
+    # until daemon.version matches the installed CLI, or the bounded deadline
+    # elapses. A healthy daemon that needs more than 500 ms (slow disk,
+    # first-run state, AV scan) must succeed. Fail immediately only when the
+    # scheduled task itself reports a terminal action result.
+    function Wait-OwnMeshDaemonReady {
+        param(
+            [Parameter(Mandatory)][string]$OwnMeshPath,
+            [Parameter(Mandatory)][string]$ExpectedVersion,
+            [int]$TimeoutSeconds = 20,
+            [int]$PollMilliseconds = 200
+        )
+        if ($TimeoutSeconds -lt 1) { throw "TimeoutSeconds must be >= 1" }
+        if ($PollMilliseconds -lt 1) { throw "PollMilliseconds must be >= 1" }
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        while ($true) {
+            $run = Get-OwnMeshScheduledTaskRun
+            if (Test-OwnMeshScheduledTaskTerminalFailure -Run $run) {
+                throw ("Scheduled task action failed with last run result {0}" -f [int]$run.LastTaskResult)
+            }
+            $previousEap = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = "Continue"
+                $statusText = (& $OwnMeshPath --json status 2>$null | Out-String)
+                $statusCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousEap
+            }
+            if ($statusCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($statusText)) {
+                try {
+                    $status = $statusText | ConvertFrom-Json
+                    if ($status.daemon.version -eq $ExpectedVersion) {
+                        return
+                    }
+                } catch {
+                    # Partial JSON while the daemon is still coming up.
+                }
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "Updated OwnMesh daemon did not become ready with the expected version"
+            }
+            Start-Sleep -Milliseconds $PollMilliseconds
+        }
+    }
+
     function Stop-InstalledOwnMeshProcesses {
         param(
             [Parameter(Mandatory)][string]$TargetDir,
@@ -797,16 +889,15 @@
                 if ($LASTEXITCODE -ne 0) {
                     throw "Updated OwnMesh service did not restart"
                 }
-                Start-Sleep -Milliseconds 500
-                $statusText = (& $ownmeshPath --json status | Out-String)
-                if ($LASTEXITCODE -ne 0) {
-                    throw "Updated OwnMesh daemon did not become ready"
-                }
-                $status = $statusText | ConvertFrom-Json
                 $expectedVersion = ($installedVersion -split '\s+')[-1]
-                if ($status.daemon.version -ne $expectedVersion) {
-                    throw "Updated OwnMesh daemon version did not match the CLI"
+                $readyTimeout = 20
+                if ($env:OWNMESH_DAEMON_READY_TIMEOUT_SECONDS) {
+                    $readyTimeout = [int]$env:OWNMESH_DAEMON_READY_TIMEOUT_SECONDS
                 }
+                Wait-OwnMeshDaemonReady `
+                    -OwnMeshPath $ownmeshPath `
+                    -ExpectedVersion $expectedVersion `
+                    -TimeoutSeconds $readyTimeout
             }
         } catch {
             $postInstallError = $_.Exception.Message

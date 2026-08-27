@@ -269,6 +269,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
         // but are not searched mean installed CLIs appear not-installed.
         let profile_discovery = profile_discovery_health();
         let credential_store = credential_store_health(&self.paths);
+        let (in_flight_external, self_reentrant_refusals) = super::runtime_queue_observation();
         let mut payload = system_diagnosis_payload(
             &observed_at,
             SystemDiagnosisFacts {
@@ -293,6 +294,8 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 profile_discovery,
                 credential_store,
                 agent_route: self.agent_route_presence(),
+                in_flight_external,
+                self_reentrant_refusals,
             },
         );
         if let Some(object) = payload.as_object_mut() {
@@ -802,7 +805,25 @@ install it or use an explicit path. {}",
                     }
                 };
                 let (child_pid, child_process_birth) = match (status.pid, status.process_birth_id) {
-                    (Some(pid), Some(birth)) if !status.exited => (pid, birth),
+                    (Some(pid), Some(birth)) if !status.exited => {
+                        // #31: supervisor `exited=false` is not enough. A
+                        // zombie keeps its PID and start time, so a birth
+                        // witness still matches while the child is already
+                        // dead. Committing `running` here is how a
+                        // `/bin/true` session poisoned later open/replay/close.
+                        match ownmesh_ipc::running_process_birth_id(pid) {
+                            Ok(Some(observed)) if observed == birth => (pid, birth),
+                            _ => {
+                                let _ = self
+                                    .rollback_persistent_open(&info.id, &binding, "identity")
+                                    .await;
+                                return Err(IpcError::Remote {
+                                    code: app_error::CONFLICT,
+                                    message: "persistent session sidecar did not attest a live child process identity".into(),
+                                });
+                            }
+                        }
+                    }
                     _ => {
                         let _ = self
                             .rollback_persistent_open(&info.id, &binding, "identity")
@@ -3111,6 +3132,11 @@ struct SystemDiagnosisFacts {
     /// condition the control plane reports to MCP clients as
     /// `connection_status`. `None` means not wired (unknown), e.g. unit tests.
     agent_route: Option<&'static str>,
+    /// `command.run` executions waiting outside the runtime mutex (#160).
+    in_flight_external: usize,
+    /// Pre-spawn self-reentrancy refusals since process start. Counter only;
+    /// never argv, paths, or output.
+    self_reentrant_refusals: u64,
 }
 
 fn credential_store_health(
@@ -3278,13 +3304,13 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     // to replay, compact, or evict. They must never be reported healthy, even
     // when the journal is far below capacity.
     //
-    // P0-B review: durable `in_progress` markers are equally actionable. The
-    // daemon is single-op-at-a-time, so by the time a diagnosis runs any
-    // marker still in the journal belongs to an operation that never reached
-    // `store_idempotent` — a failed or crashed run whose outcome is uncertain
-    // and whose key is permanently non-replayable (fail-closed by design).
-    // Reporting that as a plain healthy journal hid the stuck marker behind a
-    // pass result.
+    // P0-B review: durable `in_progress` markers are equally actionable when
+    // they are *not* accounted for by a live unlocked `command.run`. Admission
+    // reserves the marker, then releases the runtime mutex for the child wait
+    // (#160), so a diagnosis can run concurrently and must not treat that live
+    // marker as a stuck receipt. Markers beyond the live in-flight count still
+    // belong to a failed or crashed run whose key is permanently
+    // non-replayable.
     let op_status = if facts.op_journal_degraded {
         "degraded"
     } else if facts.op_journal_entries >= super::MAX_OP_JOURNAL_ENTRIES
@@ -3324,7 +3350,11 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "op_journal_pressure"
     } else if facts.op_journal_uncertain > 0 {
         "op_journal_uncertain"
-    } else if facts.op_journal_in_progress > 0 {
+    } else if facts
+        .op_journal_in_progress
+        .saturating_sub(facts.in_flight_external)
+        > 0
+    {
         "op_journal_in_progress"
     } else if agent_route_status == "fail" {
         "agent_route_offline"
@@ -3403,6 +3433,29 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "nonterminal_count": facts.nonterminal_sessions,
                 "stale_count": facts.stale_sessions,
             },
+            {
+                // #160: bounded runtime-queue observation. Never includes argv,
+                // paths, environment, or user output. `executing` is a live
+                // unlocked command.wait, not a deadlock; `self_reentrant_exec`
+                // records that the pre-spawn guard refused an OwnMesh CLI
+                // re-entry at least once this process.
+                "id": "runtime_queue",
+                "status": if facts.in_flight_external > 0 || facts.self_reentrant_refusals > 0 {
+                    "warn"
+                } else {
+                    "pass"
+                },
+                "state": if facts.in_flight_external > 0 {
+                    "executing"
+                } else if facts.self_reentrant_refusals > 0 {
+                    "self_reentrant_exec"
+                } else {
+                    "idle"
+                },
+                "provenance": "observed",
+                "observed_at": observed_at,
+                "count": facts.in_flight_external,
+            },
         ],
         "journals": {
             "transition": {
@@ -3467,6 +3520,8 @@ mod system_diagnosis_tests {
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
+            in_flight_external: 0,
+            self_reentrant_refusals: 0,
         };
         let value = system_diagnosis_payload("2026-08-25T00:00:00Z", facts);
         assert_eq!(value["schema"], SYSTEM_DIAGNOSIS_CONTRACT);
@@ -3588,6 +3643,8 @@ mod system_diagnosis_tests {
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
+            in_flight_external: 0,
+            self_reentrant_refusals: 0,
         };
         let cases = [
             (healthy_facts(), "healthy", "none"),
@@ -3636,7 +3693,7 @@ mod system_diagnosis_tests {
             let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
             assert_eq!(value["overall"], overall);
             assert_eq!(value["recommendation"], recommendation);
-            assert_eq!(value["checks"].as_array().map(Vec::len), Some(6));
+            assert_eq!(value["checks"].as_array().map(Vec::len), Some(7));
             let serialized = value.to_string();
             for forbidden in [
                 "token",
@@ -3680,6 +3737,8 @@ mod system_diagnosis_tests {
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
+            in_flight_external: 0,
+            self_reentrant_refusals: 0,
         };
 
         // Retained-expired transition records → fail, actionable.
@@ -3788,10 +3847,9 @@ mod system_diagnosis_tests {
 
         // P0-B review: a durable in-progress marker means an operation never
         // reached its completed receipt (failed or crashed after reserving
-        // the key). Its outcome is uncertain and the key is permanently
-        // non-replayable, so it must NOT be reported healthy — the daemon is
-        // single-op-at-a-time, so a diagnosis cannot observe a genuinely
-        // in-flight operation's marker.
+        // the key) *unless* a live unlocked command.run currently accounts
+        // for it (#160). A leftover marker is uncertain and permanently
+        // non-replayable, so it must NOT be reported healthy.
         let value = system_diagnosis_payload(
             "2026-08-13T00:00:00Z",
             SystemDiagnosisFacts {
@@ -3807,6 +3865,19 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["op_journal"]["status"], "warn");
         assert_eq!(value["journals"]["op_journal"]["in_progress"], 1);
         assert_eq!(value["journals"]["op_journal"]["uncertain"], 0);
+        // A live unlocked exec's reserved marker is not a stuck receipt.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: 1,
+                op_journal_in_progress: 1,
+                in_flight_external: 1,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "healthy");
+        assert_eq!(value["checks"][6]["id"], "runtime_queue");
+        assert_eq!(value["checks"][6]["state"], "executing");
         // It stays distinct from the uncertain class.
         let value = system_diagnosis_payload(
             "2026-08-13T00:00:00Z",
@@ -3837,7 +3908,7 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["transition"]["status"], "ok");
         assert_eq!(value["journals"]["op_journal"]["status"], "ok");
         assert_eq!(value["profile_discovery"]["status"], "ok");
-        assert_eq!(value["checks"].as_array().map(Vec::len), Some(6));
+        assert_eq!(value["checks"].as_array().map(Vec::len), Some(7));
     }
 
     /// The health payload must stay a fixed allowlisted surface: no
@@ -3863,6 +3934,8 @@ mod system_diagnosis_tests {
             profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
             credential_store: ("warn", Some("preferred(encrypted-file)".into()), 1),
             agent_route: None,
+            in_flight_external: 0,
+            self_reentrant_refusals: 0,
         };
         let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
         let serialized = value.to_string();

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Device availability
+
+- Non-elevated `command.run` no longer holds the daemon runtime mutex while
+  waiting for the child. Policy admission, pinning, and the exact-once journal
+  reserve still run under the lock; the child wait runs after release; the
+  in-progress marker is the compare-and-swap target at finalization. An
+  unrelated filesystem or diagnosis request can complete while a long command
+  is running, and a shell-wrapped OwnMesh CLI no longer deadlocks the device
+  (#160, [ADR 0015](docs/adr/0015-runtime-lock-released-across-command-wait.md)).
+  The pre-spawn `OWNMESH_E_SELF_REENTRANT_EXEC` guard remains. `system.diagnose`
+  adds a bounded `runtime_queue` check (`idle` / `executing` /
+  `self_reentrant_exec`) without argv, paths, or output, and a live unlocked
+  exec's journal marker is not reported as a stuck receipt.
+- `session.open` will not commit `state=running` unless the OS reports the
+  attested child as still running. A short-lived process that is already a
+  zombie at the attestation barrier is rolled back instead of poisoning later
+  open/replay/close (#31).
+- The Windows portable installer polls authenticated `ownmesh --json status`
+  until `daemon.version` matches the installed CLI, using the same 20 s
+  bounded deadline as `ownmesh update`. A healthy daemon that needs more than
+  500 ms no longer triggers binary rollback. A scheduled-task action that
+  fails with a locale-independent COM last-run result fails immediately
+  (#154).
+
 ## v1.2.23 — Availability, workspace authority, and dependency refresh
 
 v1.2.23 is the first formal release after v1.2.21. The v1.2.22 source train
