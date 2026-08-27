@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.16 · **Last updated:** 2026-08-26
+**Baseline:** v1.2.23 · **Last updated:** 2026-08-27
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -39,6 +39,7 @@ These are the `W-*` waivers. The code exists; the receipt does not.
 | --- | --- | --- |
 | macOS/Windows native broker receipts | `W-E8-RECEIPTS` | Run the privileged lifecycle on real macOS/Windows hosts and publish the transcript, plus the full public MCP → agent → broker route |
 | Automated external ChatGPT exercise | `W-E10-AUTO` | A reproducible harness against a live ChatGPT connector, replacing today's manual compatibility receipt |
+| Nine-profile live compatibility receipts | `W-E6-RECEIPTS`, issue #170 | Exercise each available current vendor CLI on Linux, macOS, and Windows without exporting credentials; publish only bounded non-secret launch/auth/protocol receipts before restoring the E6 completeness claim |
 | Independent security review | `W-EXT-SEC` | An external firm, not the internal checklist |
 | Native signing and packaging | `W-SIGN`, `W-PACKAGING` | Authenticode, Apple notarization, MSI/NSIS, native macOS packages. Portable minisign archives stay the contract until then |
 | Release tag signing | ADR 0001 follow-up | Annotated tags are already required; GPG/SSH tag signing is configured but not yet claimed as enforced |

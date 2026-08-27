@@ -82,9 +82,11 @@ def main() -> int:
     manifest = json.loads(read("release/SUPPORTED_SURFACES.json"))
     surfaces = manifest.get("explicit_unsupported_surfaces", [])
     additional = manifest.get("additional_unsupported", [])
+    evidence_waivers = manifest.get("release_evidence_waivers", [])
     expected = manifest.get("explicit_unsupported_count")
     require(isinstance(surfaces, list), "explicit unsupported surfaces must be an array")
     require(isinstance(additional, list), "additional unsupported surfaces must be an array")
+    require(isinstance(evidence_waivers, list), "release evidence waivers must be an array")
     require(
         all(isinstance(surface, str) and surface for surface in surfaces),
         "explicit unsupported surfaces must be non-empty strings",
@@ -93,23 +95,36 @@ def main() -> int:
         all(isinstance(surface, str) and surface for surface in additional),
         "additional unsupported surfaces must be non-empty strings",
     )
+    require(
+        all(isinstance(waiver, str) and waiver for waiver in evidence_waivers),
+        "release evidence waivers must be non-empty strings",
+    )
     require(len(surfaces) == expected, "surface manifest count does not match its entries")
     require(len(set(surfaces)) == len(surfaces), "surface manifest contains duplicate entries")
     require(len(set(additional)) == len(additional), "additional unsupported list contains duplicates")
     require(
+        len(set(evidence_waivers)) == len(evidence_waivers),
+        "release evidence waiver list contains duplicates",
+    )
+    require(
         set(surfaces).isdisjoint(additional),
         "explicit and additional unsupported lists must not overlap",
     )
-    total_unsupported = len(surfaces) + len(additional)
+    require(
+        set(evidence_waivers).isdisjoint(surfaces)
+        and set(evidence_waivers).isdisjoint(additional),
+        "release evidence waivers must not overlap unsupported surface registries",
+    )
+    total_unsupported = len(surfaces) + len(additional) + len(evidence_waivers)
     require(
         manifest.get("total_unsupported_surfaces") == total_unsupported,
-        "total unsupported count must be derived from both manifest lists",
+        "total unsupported count must include both registries and evidence waivers",
     )
     completeness_claim = manifest.get("completeness_claim")
     require(isinstance(completeness_claim, bool), "completeness_claim must be a boolean")
     require(
         completeness_claim is (total_unsupported == 0),
-        "completeness_claim must be true exactly when no unsupported surfaces remain",
+        "completeness_claim must be true exactly when no unsupported surfaces or evidence waivers remain",
     )
 
     commands = read("crates/ownmesh/src/commands/mod.rs")
@@ -387,7 +402,7 @@ def main() -> int:
         return 1
     print(
         f"release-quality checks passed: gates fail closed; "
-        f"{len(surfaces)} registry-backed / {len(surfaces) + len(additional)} total unsupported surfaces"
+        f"{len(surfaces)} registry-backed / {total_unsupported} total unsupported or evidence-waived surfaces"
     )
     return 0
 

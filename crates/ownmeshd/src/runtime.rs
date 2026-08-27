@@ -81,8 +81,8 @@ use ownmesh_policy::{
     MAX_BOUNDED_TOOL_GRANT_USES, TAG_READS_SENSITIVE_LOCATION, TAG_WRITES_SENSITIVE_LOCATION,
 };
 use ownmesh_profiles::{
-    official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
-    ProfileStatus,
+    official_adapter_spec, parse_adapter_event_page_for_dialect, AdapterDialect, NativeResume,
+    ProfileRegistry, ProfileStatus,
 };
 use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{
@@ -114,7 +114,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use structured_adapter::StructuredAdapterDriver;
+use structured_adapter::{cancel_protocol_frame, latest_codex_turn_id, StructuredAdapterDriver};
 use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
@@ -129,6 +129,7 @@ pub mod session_methods {
     pub const DETACH: &str = "session.detach";
     pub const RELEASE: &str = "session.release";
     pub const GIVE: &str = "session.give";
+    pub const CANCEL: &str = "session.cancel";
     pub const CLOSE: &str = "session.close";
     pub const TERMINATE: &str = "session.terminate";
     pub const REPLAY: &str = "session.replay";
@@ -683,8 +684,8 @@ pub struct DaemonRuntime {
     /// Process-local live PTY hosts keyed by session id (not persisted).
     /// Metadata/leases survive restart; live hosts are re-created only on open.
     live_hosts: HashMap<String, LiveHost>,
-    /// Dedicated local-only proxy for remote/cloud PTY sessions. Local CLI
-    /// compatibility keeps the legacy embedded host path until fully migrated.
+    /// Dedicated local-only proxy for persistent remote PTYs and all official
+    /// structured profile sessions. Interactive local PTYs remain embedded.
     supervisor: Option<SupervisorClient>,
     transition_journal: SessionTransitionJournal,
     /// Bounded health state for transition-journal recovery (P0-A). Records
@@ -1510,7 +1511,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         prompt: Option<&str>,
         native_session_id: Option<&str>,
         cwd: &str,
-    ) -> IpcResult<Option<String>> {
+    ) -> IpcResult<(Option<String>, u64)> {
         let mut driver = StructuredAdapterDriver::new(dialect, prompt, native_session_id, cwd)
             .map_err(|message| IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
@@ -1529,7 +1530,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
                 })?;
         }
         if driver.is_open_ready() {
-            return Ok(driver.native_session_id().map(str::to_owned));
+            return Ok((driver.native_session_id().map(str::to_owned), 0));
         }
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1573,7 +1574,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
                         })?;
                 }
                 if driver.is_open_ready() {
-                    return Ok(driver.native_session_id().map(str::to_owned));
+                    return Ok((driver.native_session_id().map(str::to_owned), cursor));
                 }
             }
         }
@@ -1581,6 +1582,66 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             code: app_error::CONFLICT,
             message: "structured adapter bootstrap timed out".into(),
         })
+    }
+
+    /// Continue servicing only denial-side protocol requests after bootstrap.
+    /// The cursor is monotonic, so each vendor request ID is answered at most
+    /// once by this pump. Binding rotation/controller loss invalidates writes
+    /// and stops the pump fail-closed.
+    fn spawn_fail_closed_adapter_pump(
+        supervisor: SupervisorClient,
+        binding: SupervisorBinding,
+        dialect: AdapterDialect,
+        mut cursor: u64,
+    ) {
+        if matches!(
+            dialect,
+            AdapterDialect::ClaudeStreamJson
+                | AdapterDialect::PiRpc
+                | AdapterDialect::AgyStreamJson
+        ) {
+            return;
+        }
+        drop(tokio::spawn(async move {
+            let mut partial = Vec::new();
+            loop {
+                let page = match supervisor
+                    .drain_stream(&binding, cursor, 64 * 1024, "stdout")
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(_) => return,
+                };
+                cursor = page.next_offset.unwrap_or(page.total_bytes);
+                if page.bytes.is_empty() {
+                    match supervisor.status(&binding).await {
+                        Ok(status) if status.exited => return,
+                        Ok(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            continue;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                partial.extend_from_slice(&page.bytes);
+                if partial.len() > structured_adapter::MAX_STRUCTURED_FRAME_BYTES {
+                    return;
+                }
+                while let Some(end) = partial.iter().position(|byte| *byte == b'\n') {
+                    let record: Vec<_> = partial.drain(..=end).collect();
+                    let response =
+                        match structured_adapter::fail_closed_protocol_frame(dialect, &record) {
+                            Ok(response) => response,
+                            Err(_) => continue,
+                        };
+                    if let Some(response) = response {
+                        if supervisor.write(&binding, response).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }));
     }
 
     fn new_id(prefix: &str) -> String {
@@ -5993,6 +6054,7 @@ path or install the tool so detection and execution agree",
             session_methods::DETACH => self.handle_session_detach(params, client).await,
             session_methods::RELEASE => self.handle_session_release(params, client),
             session_methods::GIVE => self.handle_session_give(params, client).await,
+            session_methods::CANCEL => self.handle_session_cancel(params, client).await,
             session_methods::CLOSE => self.handle_session_close(params, client).await,
             session_methods::TERMINATE => self.handle_session_terminate(params, client).await,
             session_methods::REPLAY => self.handle_session_replay(params, client).await,

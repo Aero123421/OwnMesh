@@ -69,6 +69,26 @@ the daemon. Custody handles remain open and the path pins are revalidated
 immediately before spawn; the approved invocation is still preserved as
 `argv[0]` (#164).
 
+## Official profile adapter correctness
+
+- The nine official coding CLI profiles now use source-backed, dialect-aware
+  structured contracts instead of one generic JSON classifier. Versioned
+  fixtures cover ACP v1, Codex app-server, Claude stream-json, Pi RPC, and Agy
+  stream-json events; malformed, oversized, and future events remain bounded
+  typed adapter errors without hiding later valid output (#170).
+- Detection, version probing, and launch share one deterministic child `PATH`.
+  Unix shebang wrappers are checked before launch, including `/usr/bin/env`
+  interpreters, so a detected npm-style CLI can no longer fail later under the
+  service environment without an actionable dependency status.
+- Binary presence and a parsed version establish only `installed`. Authentication
+  and structured-protocol readiness remain explicit evidence states, and
+  `profile test` cannot turn a version probe into a false compatibility PASS.
+- ACP client filesystem/terminal requests and vendor permission requests fail
+  closed with correlated typed responses; no vendor request is auto-approved.
+  Documented resume and cancellation are dialect-specific. Local and remote
+  structured sessions use the same persistent supervisor path, and
+  `profile start/resume --prompt` never places prompt text in shell syntax.
+
 ## Included v1.2.22 lifecycle and endpoint fixes
 
 Because v1.2.22 was not published, v1.2.23 also includes its complete changes:
@@ -140,3 +160,7 @@ archive membership checks, and GitHub build provenance.
   external security review remain disclosed gaps. This release does not claim
   those receipts, nor does publishing it imply that any operator's Cloudflare
   deployment was updated.
+- The E6 completeness claim remains false under `W-E6-RECEIPTS` until bounded,
+  non-secret live receipts exist for all nine current provider CLIs on Linux,
+  macOS, and Windows. Fixture and implementation coverage is not presented as
+  a substitute for provider authentication or cross-platform evidence (#170).

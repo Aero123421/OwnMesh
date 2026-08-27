@@ -1090,7 +1090,7 @@ OwnMesh 1.0 は次の 9 profile を公式に対応する。
 | `agy` | Antigravity CLI | `agy` |
 | `qwen-code` | Qwen Code | `qwen` |
 | `hermes-agent` | Hermes Agent | `hermes` |
-| `qoder` | Qoder CLI | `qodercli` |
+| `qoder` | Qoder CLI | `qoder`（旧 `qodercli` も検出互換） |
 
 Gemini CLI、Cline、Goose、Kiro CLI、Amp は公式同梱 Profile に含めない。Community profile として追加することは妨げない。
 
@@ -1135,12 +1135,12 @@ ACP を一律必須にはしない。各 CLI の公式安定 interface を優先
 | Codex | `codex app-server` JSON-RPC | `codex exec --json`, PTY |
 | Claude Code | print/SDK `stream-json` | PTY、native resume |
 | Kimi Code | ACP | `--prompt --output-format stream-json`, PTY |
-| OpenCode | headless server API | CLI JSON、PTY |
+| OpenCode | `opencode acp` | CLI JSON、PTY |
 | Pi | `--mode rpc` JSONL | PTY |
 | AGY | 公式 structured mode が利用可能なら使用 | PTY |
 | Qwen Code | ACP/daemon/SDK | headless `-p`, PTY |
 | Hermes Agent | ACP adapter または one-shot CLI | PTY、native resume |
-| Qoder | `qodercli --acp` | SDK/PTY |
+| Qoder | `qoder --acp` | 旧 executable 検出、SDK/PTY |
 
 Adapter は起動時に version と capability を検出し、固定コマンドに過度に依存しない。
 
@@ -1160,6 +1160,13 @@ running
 TUI は「何が足りないか」を説明し、各 CLI の公式ログイン command を attached terminal で開ける。
 
 OwnMesh は各 CLI の API key/token を Cloudflare へコピーしない。
+
+`installed` は、検出した同一 executable と shebang interpreter が deterministic
+child PATH で起動可能かつ対応 version であることだけを示す。auth probe が未定義なら
+authentication は `unknown`、protocol-only receipt がなければ structured protocol は
+`untested` とし、version 出力だけから `authenticated` / `ready` を推測してはならない。
+permission/tool request は OwnMesh の実行権限ではない。operation-bound bridge がない
+request は相関 ID を維持した typed denial とし、自動承認しない。
 
 ## 13.6 Profile definition
 
@@ -1513,6 +1520,7 @@ ownmesh
 │   ├── attach
 │   ├── claim
 │   ├── release
+│   ├── cancel
 │   ├── give
 │   ├── close
 │   └── terminate
@@ -2676,4 +2684,3 @@ ADR が必要な例:
 - Privileged Broker boundary の変更。
 - official profile の追加・削除。
 - telemetry/file relay default の変更。
-

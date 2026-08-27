@@ -3199,6 +3199,12 @@ fn map_request_to_method(
             }
             crate::runtime::session_methods::GIVE
         }
+        ("session.cancel" | "session", "session.cancel" | "ownmesh_session_cancel" | "cancel") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::CANCEL
+        }
         (
             "session.write" | "session",
             "session.write" | "ownmesh_session_write" | "write" | "input",
@@ -6619,7 +6625,7 @@ mod tests {
     }
 
     #[test]
-    fn session_renew_and_detach_map_to_exact_lease_methods() {
+    fn session_renew_detach_and_cancel_map_to_exact_lease_methods() {
         for (action, capability, expected) in [
             (
                 "session.renew",
@@ -6630,6 +6636,11 @@ mod tests {
                 "session.detach",
                 "session.detach",
                 crate::runtime::session_methods::DETACH,
+            ),
+            (
+                "session.cancel",
+                "session.cancel",
+                crate::runtime::session_methods::CANCEL,
             ),
         ] {
             let mut arguments = Map::new();

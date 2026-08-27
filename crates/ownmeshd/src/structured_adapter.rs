@@ -28,7 +28,8 @@ enum DriverPhase {
 /// in a JSON request body and every produced frame is LF terminated.
 #[derive(Debug, Clone)]
 pub struct StructuredAdapterDriver {
-    prompt: String,
+    dialect: AdapterDialect,
+    prompt: Option<String>,
     native_session_id: Option<String>,
     cwd: String,
     phase: DriverPhase,
@@ -42,9 +43,17 @@ impl StructuredAdapterDriver {
         native_session_id: Option<&str>,
         cwd: &str,
     ) -> Result<Self, String> {
-        let prompt = prompt.unwrap_or_default();
-        if prompt.len() > MAX_STRUCTURED_FRAME_BYTES / 2 || prompt.contains('\0') {
+        if prompt.is_some_and(|value| {
+            value.len() > MAX_STRUCTURED_FRAME_BYTES / 2 || value.contains('\0')
+        }) {
             return Err("structured adapter prompt exceeds bounded frame policy".into());
+        }
+        if matches!(
+            dialect,
+            AdapterDialect::ClaudeStreamJson | AdapterDialect::AgyStreamJson
+        ) && prompt.is_none()
+        {
+            return Err("one-shot structured adapter requires an explicit prompt".into());
         }
         if native_session_id
             .is_some_and(|id| id.is_empty() || id.len() > 512 || id.chars().any(char::is_control))
@@ -69,7 +78,8 @@ impl StructuredAdapterDriver {
             }
         };
         Ok(Self {
-            prompt: prompt.into(),
+            dialect,
+            prompt: prompt.map(str::to_owned),
             native_session_id: native_session_id.map(str::to_owned),
             cwd: cwd.into(),
             phase,
@@ -82,9 +92,14 @@ impl StructuredAdapterDriver {
     pub fn start(&self) -> Result<Vec<Vec<u8>>, String> {
         match self.phase {
             DriverPhase::ArgvOnly => Ok(vec![]),
-            DriverPhase::PiPrompted => Ok(vec![frame(json!({
-                "id": "ownmesh-prompt-1", "type": "prompt", "message": self.prompt,
-            }))?]),
+            DriverPhase::PiPrompted => self.prompt.as_ref().map_or_else(
+                || Ok(vec![]),
+                |prompt| {
+                    Ok(vec![frame(json!({
+                        "id": "ownmesh-prompt-1", "type": "prompt", "message": prompt,
+                    }))?])
+                },
+            ),
             // App-server uses JSON-RPC semantics but explicitly omits the
             // `jsonrpc` member on its stdio JSONL wire format.
             DriverPhase::CodexAwaitInitialize => Ok(vec![frame(json!({
@@ -107,26 +122,20 @@ impl StructuredAdapterDriver {
     }
 
     /// Accept precisely one child LF record and return any correlated successor
-    /// requests.  Notifications are retained by the caller's raw spool but do
-    /// not advance state. Unknown permission/approval requests fail closed.
+    /// requests. Notifications are retained by the caller's raw spool but do
+    /// not advance state. Permission/client-capability requests receive a
+    /// correlated, typed fail-closed response and never advance bootstrap.
     pub fn on_record(&mut self, record: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         if record.len() > MAX_STRUCTURED_FRAME_BYTES || !record.ends_with(b"\n") {
             return Err("structured adapter record must be LF terminated and <= 64KiB".into());
         }
         let value: Value = serde_json::from_slice(&record[..record.len() - 1])
             .map_err(|_| "malformed structured adapter JSON record")?;
+        if let Some(response) = fail_closed_protocol_response(self.dialect, &value) {
+            return Ok(vec![frame(response)?]);
+        }
         if value.get("error").is_some() {
             return Err("structured adapter returned a JSON-RPC error".into());
-        }
-        if let Some(method) = value.get("method").and_then(Value::as_str) {
-            if method.contains("permission")
-                || method.contains("approval")
-                || method.starts_with("fs/")
-                || method.starts_with("terminal/")
-                || method.contains("tool")
-            {
-                return Err("structured adapter requested unapproved permission".into());
-            }
         }
         match self.phase {
             DriverPhase::CodexAwaitInitialize if response_id(&value) == Some(1) => {
@@ -146,11 +155,16 @@ impl StructuredAdapterDriver {
                     .or_else(|| extract_string(&value, "threadId"))
                     .ok_or("Codex thread response omitted thread id")?;
                 self.thread_or_session_id = Some(id.clone());
-                self.phase = DriverPhase::CodexAwaitTurn;
-                Ok(vec![frame(json!({
-                    "id":3, "method":"turn/start",
-                    "params":{"threadId":id, "input":[{"type":"text","text":self.prompt}]},
-                }))?])
+                if let Some(prompt) = self.prompt.as_deref() {
+                    self.phase = DriverPhase::CodexAwaitTurn;
+                    Ok(vec![frame(json!({
+                        "id":3, "method":"turn/start",
+                        "params":{"threadId":id, "input":[{"type":"text","text":prompt}]},
+                    }))?])
+                } else {
+                    self.phase = DriverPhase::Complete;
+                    Ok(vec![])
+                }
             }
             DriverPhase::CodexAwaitTurn | DriverPhase::AcpAwaitPrompt
                 if response_id(&value) == Some(3) =>
@@ -205,11 +219,16 @@ impl StructuredAdapterDriver {
                         .ok_or("ACP session/new response omitted sessionId")?
                 };
                 self.thread_or_session_id = Some(id.clone());
-                self.phase = DriverPhase::AcpAwaitPrompt;
-                Ok(vec![frame(json!({
-                    "jsonrpc":"2.0", "id":3, "method":"session/prompt",
-                    "params":{"sessionId":id, "prompt":[{"type":"text","text":self.prompt}]},
-                }))?])
+                if let Some(prompt) = self.prompt.as_deref() {
+                    self.phase = DriverPhase::AcpAwaitPrompt;
+                    Ok(vec![frame(json!({
+                        "jsonrpc":"2.0", "id":3, "method":"session/prompt",
+                        "params":{"sessionId":id, "prompt":[{"type":"text","text":prompt}]},
+                    }))?])
+                } else {
+                    self.phase = DriverPhase::Complete;
+                    Ok(vec![])
+                }
             }
             // Non-correlated events are output, not control replies.
             _ => Ok(vec![]),
@@ -242,6 +261,148 @@ impl StructuredAdapterDriver {
                 DriverPhase::CodexAwaitTurn | DriverPhase::AcpAwaitPrompt
             )
     }
+}
+
+/// Build the only automatic responses OwnMesh may send to agent-initiated
+/// requests. These responses are deliberately denial-only: vendor payloads
+/// are output facts, never authority to execute a device operation.
+#[must_use]
+pub fn fail_closed_protocol_response(dialect: AdapterDialect, value: &Value) -> Option<Value> {
+    let method = value.get("method")?.as_str()?;
+    let id = value.get("id")?.clone();
+    match dialect {
+        AdapterDialect::KimiAcp
+        | AdapterDialect::OpenCodeServer
+        | AdapterDialect::QwenAcp
+        | AdapterDialect::HermesAcp
+        | AdapterDialect::QoderAcp => {
+            if method == "session/request_permission" {
+                let reject_id = value
+                    .pointer("/params/options")
+                    .and_then(Value::as_array)
+                    .and_then(|options| {
+                        options.iter().find_map(|option| {
+                            let kind = option.get("kind")?.as_str()?;
+                            kind.starts_with("reject_")
+                                .then(|| option.get("optionId")?.as_str().map(str::to_owned))
+                                .flatten()
+                        })
+                    });
+                let outcome = reject_id.map_or_else(
+                    || json!({"outcome":"cancelled"}),
+                    |option_id| json!({"outcome":"selected","optionId":option_id}),
+                );
+                return Some(json!({"jsonrpc":"2.0","id":id,"result":{"outcome":outcome}}));
+            }
+            if method.starts_with("fs/") || method.starts_with("terminal/") {
+                return Some(json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "error":{"code":-32601,"message":"capability_not_advertised"}
+                }));
+            }
+            None
+        }
+        AdapterDialect::CodexAppServer => {
+            if method.ends_with("/requestApproval") {
+                Some(json!({"id":id,"result":{"decision":"decline"}}))
+            } else if method == "item/tool/requestUserInput"
+                || method == "mcpServer/elicitation/request"
+            {
+                Some(json!({
+                    "id":id,
+                    "error":{"code":-32601,"message":"capability_not_advertised"}
+                }))
+            } else {
+                None
+            }
+        }
+        AdapterDialect::ClaudeStreamJson
+        | AdapterDialect::PiRpc
+        | AdapterDialect::AgyStreamJson => None,
+    }
+}
+
+/// Parse one bounded LF record and encode a correlated denial when it is an
+/// agent-initiated permission or unadvertised client-capability request.
+pub fn fail_closed_protocol_frame(
+    dialect: AdapterDialect,
+    record: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
+    if record.len() > MAX_STRUCTURED_FRAME_BYTES || !record.ends_with(b"\n") {
+        return Err("structured adapter record must be LF terminated and <= 64KiB".into());
+    }
+    let value: Value = serde_json::from_slice(&record[..record.len() - 1])
+        .map_err(|_| "malformed structured adapter JSON record")?;
+    fail_closed_protocol_response(dialect, &value)
+        .map(frame)
+        .transpose()
+}
+
+/// Encode the documented reusable-session cancellation operation. One-shot
+/// stream-json adapters deliberately return a typed degraded reason instead of
+/// inventing a wire command.
+pub fn cancel_protocol_frame(
+    dialect: AdapterDialect,
+    native_session_id: &str,
+    active_turn_id: Option<&str>,
+    request_id: &str,
+) -> Result<Vec<u8>, String> {
+    if native_session_id.is_empty()
+        || native_session_id.len() > 512
+        || native_session_id.chars().any(char::is_control)
+        || request_id.is_empty()
+        || request_id.len() > 128
+        || request_id.chars().any(char::is_control)
+    {
+        return Err("invalid structured adapter cancellation binding".into());
+    }
+    match dialect {
+        AdapterDialect::CodexAppServer => {
+            let turn_id = active_turn_id
+                .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control))
+                .ok_or("capability_not_advertised: active Codex turn id unavailable")?;
+            frame(json!({
+                "id":request_id,
+                "method":"turn/interrupt",
+                "params":{"threadId":native_session_id,"turnId":turn_id}
+            }))
+        }
+        AdapterDialect::KimiAcp
+        | AdapterDialect::OpenCodeServer
+        | AdapterDialect::QwenAcp
+        | AdapterDialect::HermesAcp
+        | AdapterDialect::QoderAcp => frame(json!({
+            "jsonrpc":"2.0",
+            "method":"session/cancel",
+            "params":{"sessionId":native_session_id}
+        })),
+        AdapterDialect::PiRpc => frame(json!({"id":request_id,"type":"abort"})),
+        AdapterDialect::ClaudeStreamJson | AdapterDialect::AgyStreamJson => {
+            Err("capability_not_advertised: reusable cancellation is not documented".into())
+        }
+    }
+}
+
+/// Recover the latest public Codex turn id from a bounded replay page. This is
+/// used only to bind `turn/interrupt`; no item content is retained or emitted.
+#[must_use]
+pub fn latest_codex_turn_id(page: &[u8]) -> Option<String> {
+    page.split(|byte| *byte == b'\n').rev().find_map(|record| {
+        if record.is_empty() || record.len() > MAX_STRUCTURED_FRAME_BYTES {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(record).ok()?;
+        if value.get("method").and_then(Value::as_str) != Some("turn/started") {
+            return None;
+        }
+        value
+            .pointer("/params/turn/id")
+            .or_else(|| value.pointer("/params/turnId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control))
+            .map(str::to_owned)
+    })
 }
 
 fn frame(value: Value) -> Result<Vec<u8>, String> {
@@ -319,7 +480,43 @@ mod tests {
     }
 
     #[test]
-    fn acp_resume_is_capability_gated_and_permissions_fail_closed() {
+    fn reusable_drivers_can_open_without_a_hidden_model_turn() {
+        let mut codex =
+            StructuredAdapterDriver::new(AdapterDialect::CodexAppServer, None, None, &cwd())
+                .unwrap();
+        codex.start().unwrap();
+        codex.on_record(b"{\"id\":1,\"result\":{}}\n").unwrap();
+        let next = codex
+            .on_record(b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}\n")
+            .unwrap();
+        assert!(next.is_empty());
+        assert!(codex.is_complete());
+        assert_eq!(codex.native_session_id(), Some("thread-1"));
+
+        let mut acp =
+            StructuredAdapterDriver::new(AdapterDialect::OpenCodeServer, None, None, &cwd())
+                .unwrap();
+        acp.start().unwrap();
+        acp.on_record(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{}}}\n",
+        )
+        .unwrap();
+        let next = acp
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-1\"}}\n")
+            .unwrap();
+        assert!(next.is_empty());
+        assert!(acp.is_complete());
+        assert_eq!(acp.native_session_id(), Some("session-1"));
+
+        assert!(
+            StructuredAdapterDriver::new(AdapterDialect::ClaudeStreamJson, None, None, &cwd())
+                .unwrap_err()
+                .contains("explicit prompt")
+        );
+    }
+
+    #[test]
+    fn acp_resume_is_capability_gated_and_permissions_are_typed_denials() {
         let mut driver = StructuredAdapterDriver::new(
             AdapterDialect::KimiAcp,
             Some("hello"),
@@ -331,9 +528,99 @@ mod tests {
         assert!(driver
             .on_record(b"{\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{}}}\n")
             .is_err());
-        assert!(driver
-            .on_record(b"{\"method\":\"session/request_permission\",\"params\":{}}\n")
-            .is_err());
+        let denied = driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"session/request_permission\",\"params\":{\"options\":[{\"optionId\":\"allow\",\"name\":\"Allow\",\"kind\":\"allow_once\"},{\"optionId\":\"deny\",\"name\":\"Deny\",\"kind\":\"reject_once\"}]}}\n")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&denied[0]).unwrap(),
+            json!({"jsonrpc":"2.0","id":42,"result":{"outcome":{"outcome":"selected","optionId":"deny"}}})
+        );
+    }
+
+    #[test]
+    fn permission_responses_never_auto_approve_or_echo_vendor_payloads() {
+        let acp = json!({
+            "jsonrpc":"2.0", "id":"req-secret", "method":"session/request_permission",
+            "params":{"toolCall":{"title":"SECRET_VENDOR_ACTION"},"options":[
+                {"optionId":"yes","name":"Do it","kind":"allow_always"}
+            ]}
+        });
+        let response = fail_closed_protocol_response(AdapterDialect::QwenAcp, &acp).unwrap();
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+        let encoded = response.to_string();
+        assert!(!encoded.contains("SECRET_VENDOR_ACTION"));
+        assert!(!encoded.contains("allow"));
+
+        let codex = json!({
+            "id":7,"method":"item/commandExecution/requestApproval",
+            "params":{"command":"cat /private/token"}
+        });
+        let response =
+            fail_closed_protocol_response(AdapterDialect::CodexAppServer, &codex).unwrap();
+        assert_eq!(response, json!({"id":7,"result":{"decision":"decline"}}));
+        assert!(!response.to_string().contains("/private/token"));
+    }
+
+    #[test]
+    fn unadvertised_acp_client_capabilities_return_stable_typed_errors() {
+        let request = json!({
+            "jsonrpc":"2.0","id":"fs-1","method":"fs/read_text_file",
+            "params":{"path":"/private/secret"}
+        });
+        let response =
+            fail_closed_protocol_response(AdapterDialect::OpenCodeServer, &request).unwrap();
+        assert_eq!(response["id"], "fs-1");
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(response["error"]["message"], "capability_not_advertised");
+        assert!(!response.to_string().contains("/private/secret"));
+    }
+
+    #[test]
+    fn cancellation_is_dialect_exact_and_unsupported_modes_are_degraded() {
+        let acp = cancel_protocol_frame(
+            AdapterDialect::OpenCodeServer,
+            "session-1",
+            None,
+            "cancel-1",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&acp).unwrap(),
+            json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"session-1"}})
+        );
+        let codex = cancel_protocol_frame(
+            AdapterDialect::CodexAppServer,
+            "thread-1",
+            Some("turn-1"),
+            "cancel-2",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&codex).unwrap(),
+            json!({"id":"cancel-2","method":"turn/interrupt","params":{"threadId":"thread-1","turnId":"turn-1"}})
+        );
+        let pi =
+            cancel_protocol_frame(AdapterDialect::PiRpc, "pi-session", None, "cancel-3").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&pi).unwrap(),
+            json!({"id":"cancel-3","type":"abort"})
+        );
+        assert!(cancel_protocol_frame(
+            AdapterDialect::ClaudeStreamJson,
+            "claude-session",
+            None,
+            "cancel-4"
+        )
+        .unwrap_err()
+        .starts_with("capability_not_advertised:"));
+
+        assert_eq!(
+            latest_codex_turn_id(
+                b"{\"method\":\"turn/started\",\"params\":{\"turn\":{\"id\":\"older\"}}}\n{\"method\":\"turn/started\",\"params\":{\"turn\":{\"id\":\"latest\"}}}\n"
+            )
+            .as_deref(),
+            Some("latest")
+        );
     }
 
     #[test]

@@ -434,6 +434,11 @@ pub enum SessionCmd {
         #[arg(long = "to")]
         to: String,
     },
+    /// Cancel the active structured profile turn without closing its native session.
+    Cancel {
+        /// Session id.
+        id: String,
+    },
     /// Close a session gracefully.
     Close {
         /// Session id.
@@ -475,6 +480,9 @@ pub enum ProfileCmd {
     Start {
         /// Profile id.
         id: String,
+        /// Optional initial prompt. One-shot structured profiles require it.
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// Resume a native profile session.
     Resume {
@@ -482,6 +490,9 @@ pub enum ProfileCmd {
         id: String,
         /// Native session id.
         native_id: String,
+        /// Optional prompt for the resumed native session.
+        #[arg(long)]
+        prompt: Option<String>,
     },
 }
 
