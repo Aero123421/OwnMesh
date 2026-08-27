@@ -771,22 +771,40 @@ class InstallerAdversarialTests(unittest.TestCase):
 
         `ready_after_polls` is counted in calls rather than wall-clock so the
         fixture is deterministic; the caller sets the poll interval, and the
-        assertions are about elapsed time against the deadline.
-        A negative value never becomes ready.
+        assertions are about elapsed time against the deadline. A negative
+        value never becomes ready.
+
+        A real upgrade spends its first polls with no daemon answering at all,
+        so the ready fixture starts by failing on stderr with a non-zero exit.
+        That is the branch the installer's `2>$null` and `$LASTEXITCODE`
+        handling exists for; a shim that only ever succeeds never reaches it.
         """
         counter = directory / "poll-count.txt"
         shim = directory / "ownmesh.cmd"
         ready = "9.9.9-new"
         stale = "1.0.0-old"
-        gate = (
-            f'if %n% GEQ {ready_after_polls} ('
-            f'echo {{"daemon":{{"version":"{ready}"}}}}'
-            f") else ("
-            f'echo {{"daemon":{{"version":"{stale}"}}}}'
-            f")"
-            if ready_after_polls >= 0
-            else f'echo {{"daemon":{{"version":"{stale}"}}}}'
-        )
+        if ready_after_polls >= 0:
+            unreachable_until = min(3, ready_after_polls)
+            # A multi-line block rather than one line joined by `&`: cmd.exe
+            # parses `1>&2& exit` ambiguously enough not to rely on.
+            gate = "\r\n".join(
+                [
+                    f"if %n% LSS {unreachable_until} (",
+                    "echo daemon is not answering yet 1>&2",
+                    "exit /b 1",
+                    f") else if %n% GEQ {ready_after_polls} (",
+                    f'echo {{"daemon":{{"version":"{ready}"}}}}',
+                    ") else (",
+                    f'echo {{"daemon":{{"version":"{stale}"}}}}',
+                    ")",
+                ]
+            )
+        else:
+            gate = f'echo {{"daemon":{{"version":"{stale}"}}}}'
+        # `newline=""` writes the explicit CRLFs verbatim. The default
+        # translates every "\n" to os.linesep, which on Windows — the only
+        # platform these fixtures run on — would emit "\r\r\n" and leave a
+        # stray CR on every line of a batch file.
         shim.write_text(
             "@echo off\r\n"
             "setlocal enabledelayedexpansion\r\n"
@@ -797,6 +815,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             f"{gate}\r\n"
             "exit /b 0\r\n",
             encoding="ascii",
+            newline="",
         )
         return shim
 

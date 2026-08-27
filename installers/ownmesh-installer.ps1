@@ -279,6 +279,11 @@
         param(
             [Parameter(Mandatory)][string]$OwnMeshPath,
             [Parameter(Mandatory)][string]$ExpectedVersion,
+            # Kept in lockstep with the allowlist inside Invoke-OwnMeshSchTasks,
+            # which throws on a name it does not know. A binding error here is
+            # far easier to read than that throw surfacing as a rolled-back
+            # upgrade blamed on readiness.
+            [ValidateSet("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")]
             [string[]]$TaskNames = @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd"),
             [int]$TimeoutSeconds = 60,
             [int]$PollMilliseconds = 250
@@ -297,9 +302,19 @@
         # window plus the version convergence that follows it.
         if ($TimeoutSeconds -lt 1) { $TimeoutSeconds = 1 }
         if ($PollMilliseconds -lt 1) { $PollMilliseconds = 1 }
-        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        # A monotonic clock, not wall time: a backward NTP correction during
+        # the wait is most likely on exactly the freshly imaged or just-booted
+        # machine whose slow first-run daemon this deadline exists for, and it
+        # would silently extend the deadline by the size of the correction.
+        $elapsed = [Diagnostics.Stopwatch]::StartNew()
+        $timeoutMs = [int64]$TimeoutSeconds * 1000
         $lastError = "Updated OwnMesh daemon did not become ready"
         $taskWasPresent = $false
+        # The task probe costs two process spawns and watches a condition that
+        # can transition at most once, so it runs on its own slower cadence
+        # rather than on every readiness poll.
+        $taskProbeIntervalMs = 2000
+        $nextTaskProbeMs = 0
 
         # A not-yet-ready daemon writes to stderr, and Windows PowerShell 5.1
         # wraps native stderr as a terminating NativeCommandError under
@@ -347,27 +362,39 @@
                     $lastError = "Updated OwnMesh daemon did not become ready"
                 }
 
-                # Give up before the deadline only on authoritative terminal
-                # evidence: a scheduled task that was registered while this
-                # wait ran is now gone, so no amount of further waiting can
-                # produce a ready daemon. Exit codes decide that, never
-                # task-state text, which is localized. A task never observed
-                # at all is evidence of nothing and never shortens the
-                # deadline.
-                $taskPresent = $false
-                foreach ($taskName in $TaskNames) {
-                    if ((Invoke-OwnMeshSchTasks -Action Query -TaskName $taskName) -eq 0) {
-                        $taskPresent = $true
-                        break
+                # A safety net, not the ordinary path: nothing in an upgrade
+                # unregisters the task, so this normally never fires and the
+                # deadline above is what ends a failed wait. It exists for the
+                # case where the task really does disappear underneath us —
+                # then no amount of further waiting can produce a ready daemon.
+                # Exit codes decide that, never task-state text, which is
+                # localized. A task never observed at all is evidence of
+                # nothing and never shortens the deadline.
+                if ($elapsed.ElapsedMilliseconds -ge $nextTaskProbeMs) {
+                    $nextTaskProbeMs = $elapsed.ElapsedMilliseconds + $taskProbeIntervalMs
+                    $taskPresent = $false
+                    foreach ($taskName in $TaskNames) {
+                        try {
+                            if ((Invoke-OwnMeshSchTasks -Action Query -TaskName $taskName) -eq 0) {
+                                $taskPresent = $true
+                                break
+                            }
+                        } catch {
+                            # A probe that could not run is not evidence that
+                            # the task is gone, and must never roll back a
+                            # healthy upgrade. IPC remains the authority.
+                            $taskPresent = $true
+                            break
+                        }
+                    }
+                    if ($taskPresent) {
+                        $taskWasPresent = $true
+                    } elseif ($taskWasPresent) {
+                        throw "OwnMesh scheduled task is no longer registered; the daemon cannot become ready"
                     }
                 }
-                if ($taskPresent) {
-                    $taskWasPresent = $true
-                } elseif ($taskWasPresent) {
-                    throw "OwnMesh scheduled task is no longer registered; the daemon cannot become ready"
-                }
 
-                if ([DateTime]::UtcNow -ge $deadline) {
+                if ($elapsed.ElapsedMilliseconds -ge $timeoutMs) {
                     throw "$lastError within $TimeoutSeconds seconds"
                 }
                 Start-Sleep -Milliseconds $PollMilliseconds

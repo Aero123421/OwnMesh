@@ -20,10 +20,16 @@ named below and stays tracked in those issues.
   reacquired only for that operation's own commit step. Exact-once binding is
   unchanged: the reservation is written before execution and stays in progress
   while the child runs, so a concurrent replay of the same key is refused as
-  uncertain exactly as during an inline run. Concurrent children are bounded by
-  an explicit fail-closed cap, because the mutex used to bound them to one.
-  Elevated broker execution and persistent-session/PTY host waits still hold the
-  mutex, so #160 stays open for them.
+  uncertain exactly as during an inline run. Concurrent commands are bounded
+  explicitly, because the mutex used to bound them to one: a command over the
+  bound waits for capacity before it takes the mutex, reserves a journal key,
+  or prepares an executable image, so a busy device queues rather than failing
+  and never pins more custody handles than it can run. A cancel that lands
+  while a command is queued is answered by never starting it. The same applies
+  to an approval that releases a deferred command, whether it arrives over
+  local IPC or from the control plane. Elevated broker execution and
+  persistent-session/PTY host waits still hold the mutex, so #160 stays open
+  for them.
 - A session child that exits but has not been reaped is attested as exited.
   `StructuredProcessHost::is_exited` requires both output streams at EOF *and* a
   reaped child and short-circuits on the first, so a child that exited while a
@@ -34,7 +40,12 @@ named below and stays tracked in those issues.
   still alive, refusing PID-only termination". Structured pipes are the
   official-profile transport, which is where this was first reported.
   PID-reuse protection is unchanged — the durable birth witness is still the
-  plain one — and an indeterminate probe is never read as exited (#31).
+  plain one — and a probe failure is never read as exited. On Linux the
+  liveness probe reads state `Z` as exited, so a thread-group leader that
+  called `pthread_exit` while sibling threads keep running is now attested
+  exited; the underlying `StructuredProcessHost::is_exited` short-circuit is
+  untouched, so the child still stays unreaped until the host terminates it
+  (#31).
 
 ### Installation
 
@@ -42,10 +53,13 @@ named below and stays tracked in those issues.
   bounded readiness deadline instead of sleeping a fixed 500 ms and checking
   once. A healthy daemon that needed longer to initialize — slow disk, first-run
   state, AV scanning, a loaded CI or desktop host — was treated as a failed
-  upgrade and rolled the binaries back. IPC stays the readiness authority; the
-  wait gives up early only on authoritative terminal evidence, namely a
-  scheduled task that was registered during the wait and is now gone, decided by
-  exit code rather than by localized task-state text (#154).
+  upgrade and rolled the binaries back. IPC stays the readiness authority and
+  the deadline is what ends a failed wait; the one early exit is a safety net
+  for a scheduled task that was registered during the wait and then
+  disappeared, decided by exit code rather than by localized task-state text.
+  Nothing in an ordinary upgrade unregisters that task, so in practice it does
+  not fire. The deadline is measured on a monotonic clock so a backward NTP
+  correction cannot silently extend it (#154).
 
 ## v1.2.23 — Availability, workspace authority, and dependency refresh
 

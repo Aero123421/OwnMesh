@@ -747,10 +747,24 @@ fn birth_witness(pid: Option<u32>) -> Option<u64> {
 /// already gone. Folding the OS liveness answer in here keeps the attestation
 /// from outliving the child.
 ///
-/// An indeterminate probe is never read as exited: `running_process_birth_id`
-/// returns `Ok(None)` only when the OS confirms the process is absent or has
-/// exited, and every other failure stays an `Err` that leaves the host's own
-/// view in charge.
+/// A probe failure is never read as exited: every error stays an `Err` and
+/// leaves the host's own view in charge. `Ok(None)` is not quite the same as
+/// "the OS confirmed an exit", though, and the difference is worth naming
+/// rather than papering over:
+///
+/// - Windows (`WaitForSingleObject` signalled, or `ERROR_INVALID_PARAMETER`)
+///   and macOS (`SZOMB`, `ESRCH`/`ENOENT`) really do only report a genuine
+///   exit or absence; access denial and short replies stay `Err`.
+/// - Linux reads `/proc/<pid>/stat` and treats `NotFound` as absence, which
+///   also covers `/proc` not being mounted, `hidepid`, and a mount-namespace
+///   mismatch — and it reads state `Z` as exited, which a thread-group leader
+///   that called `pthread_exit` while sibling threads run also reports.
+///
+/// Those Linux shapes are pre-existing: the plain birth witness returns
+/// `Ok(None)` for the `NotFound` cases too, and `session.open` already
+/// refuses a child it cannot identify, so they fail closed the same way with
+/// or without this call. The genuinely new exposure is the `pthread_exit`
+/// process, which is now attested exited while it is still serving.
 fn child_has_exited(pid: Option<u32>, host_reports_exited: bool) -> bool {
     if host_reports_exited {
         return true;
@@ -1309,9 +1323,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn an_unreaped_child_is_attested_as_exited() {
-        let mut child = std::process::Command::new("/bin/true")
+        let truth = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|candidate| Path::new(candidate).is_file())
+            .expect("a stock true executable must exist");
+        let mut child = std::process::Command::new(truth)
             .spawn()
-            .expect("spawn /bin/true");
+            .expect("spawn the fixture child");
         let pid = child.id();
         // Deliberately do NOT reap: wait for the kernel to publish state `Z`.
         let mut state = String::new();

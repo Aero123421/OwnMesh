@@ -4,7 +4,10 @@
 //! policy-gated [`DaemonRuntime`]. Without a runtime handle the transport stays
 //! fail-closed (`remote_routing_enabled: false`).
 
-use crate::runtime::{dispatch_off_lock, DaemonRuntime, RuntimeCallBinding};
+use crate::runtime::{
+    apply_control_plane_approval_decision_off_lock, dispatch_off_lock, DaemonRuntime,
+    RuntimeCallBinding,
+};
 use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
@@ -3867,12 +3870,12 @@ async fn dispatch_remote_operation(
                 }
             }
         }
-        let outcome = {
-            let mut guard = runtime.lock().await;
-            guard
-                .apply_control_plane_approval_decision(Some(decision_params))
-                .await
-        };
+        // #160: an approval that releases a deferred `command.run` executes
+        // that command here. Its child must not be awaited under the runtime
+        // mutex either — this is the only path by which a remote command that
+        // hit a policy Ask ever runs.
+        let outcome =
+            apply_control_plane_approval_decision_off_lock(runtime, Some(decision_params)).await;
         return match outcome {
             Ok(mut body) => {
                 // decisionOpId stays on the envelope so DeviceRoom pending matches;

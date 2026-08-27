@@ -115,7 +115,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use structured_adapter::StructuredAdapterDriver;
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 /// Session IPC method names (owned here; ipc crate methods table is ms1-stable).
@@ -771,7 +771,8 @@ impl Drop for DetachedCommandGuard {
     }
 }
 
-/// Concurrent commands executed with the runtime mutex released (#160).
+/// Concurrent commands admitted and executed with the runtime mutex released
+/// (#160).
 ///
 /// That mutex used to serialize child execution to exactly one command at a
 /// time — the same property that let one self-reentrant child stall every
@@ -779,12 +780,89 @@ impl Drop for DetachedCommandGuard {
 /// ceiling, so an explicit bound replaces it rather than letting remote
 /// requests spawn children without limit.
 ///
-/// A command over the bound waits rather than failing: the permit is taken
-/// *after* the mutex is released, so waiting here delays only other commands
-/// and never an unrelated request, and a transient capacity condition does
-/// not burn the caller's idempotency key on a terminal failure receipt.
-const MAX_OFF_LOCK_EXECUTIONS: usize = 8;
+/// The permit is taken *before* the runtime mutex and before the exact-once
+/// journal reservation, and is held until the operation commits. That
+/// ordering matters three ways:
+///
+/// - A command over the bound waits instead of failing, so a transient
+///   capacity condition never burns the caller's idempotency key on a
+///   terminal failure receipt.
+/// - Nothing waits while holding the mutex, so waiting delays only other
+///   commands and never an unrelated request. No mutex holder ever waits for
+///   a permit, so the two cannot deadlock against each other.
+/// - Executable custody — a Linux sealed memfd copy of the image, macOS
+///   ancestor-chain descriptors, Windows handles opened without write/delete
+///   sharing — is only ever prepared once a permit is held, so the number of
+///   pinned images is bounded by this constant rather than by how many
+///   requests happen to be in flight.
+///
+/// Detached commands have no wall-clock timeout, so their own cap is added on
+/// top: `MAX_DETACHED_COMMANDS` long-lived detached jobs cannot starve
+/// ordinary commands of all capacity.
+const MAX_CONCURRENT_COMMANDS: usize = 8;
+const MAX_OFF_LOCK_EXECUTIONS: usize = MAX_CONCURRENT_COMMANDS + MAX_DETACHED_COMMANDS;
 static OFF_LOCK_EXECUTION_SLOTS: Semaphore = Semaphore::const_new(MAX_OFF_LOCK_EXECUTIONS);
+
+/// Whether admitting this method can capture a command plan.
+///
+/// A method missing here is never refused — it simply runs without consuming
+/// a permit, exactly as it did before — so this is a resource bound, not an
+/// authorization gate. `approval.decision` from the control plane reaches
+/// [`DaemonRuntime::handle_approval_approve`] through its own entry point and
+/// is handled there rather than by method name.
+fn method_can_execute_a_command(method: &str) -> bool {
+    matches!(method, methods::OPS_EXEC | methods::APPROVAL_APPROVE)
+}
+
+/// Wait for a command execution permit with no lock held.
+///
+/// A cancel that lands while the command is queued is answered by never
+/// starting it. Without this, `ops.cancel` could report success on an
+/// operation whose child then started once a permit freed up — and because
+/// the permit is taken before the journal reservation, refusing here costs
+/// the caller nothing to retry.
+async fn acquire_command_slot(
+    cancel: Option<&watch::Receiver<bool>>,
+) -> IpcResult<SemaphorePermit<'static>> {
+    let unavailable = || IpcError::Remote {
+        code: app_error::INTERNAL,
+        message: "command execution capacity is unavailable".into(),
+    };
+    let cancelled = || IpcError::Remote {
+        code: app_error::CONFLICT,
+        message: "command was cancelled before execution started".into(),
+    };
+    let Some(cancel) = cancel else {
+        return OFF_LOCK_EXECUTION_SLOTS
+            .acquire()
+            .await
+            .map_err(|_| unavailable());
+    };
+    let mut cancel = cancel.clone();
+    if *cancel.borrow_and_update() {
+        return Err(cancelled());
+    }
+    // Pinned once so a cancel wake-up does not surrender this waiter's place
+    // in the semaphore's queue.
+    let mut acquire = Box::pin(OFF_LOCK_EXECUTION_SLOTS.acquire());
+    loop {
+        tokio::select! {
+            biased;
+            permit = &mut acquire => return permit.map_err(|_| unavailable()),
+            changed = cancel.changed() => {
+                if changed.is_err() {
+                    // A dropped sender is not a cancellation request, and
+                    // `changed()` would stay immediately ready and starve the
+                    // acquire.
+                    return (&mut acquire).await.map_err(|_| unavailable());
+                }
+                if *cancel.borrow_and_update() {
+                    return Err(cancelled());
+                }
+            }
+        }
+    }
+}
 
 /// Commit step for an operation whose execution was moved off the runtime
 /// mutex. Applied in push order — innermost admission layer first — once the
@@ -860,14 +938,6 @@ async fn run_off_lock_command_plan(plan: OffLockCommandPlan) -> IpcResult<Value>
         detach,
         _detached_slot,
     } = plan;
-    let _execution_slot =
-        OFF_LOCK_EXECUTION_SLOTS
-            .acquire()
-            .await
-            .map_err(|_| IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: "command execution capacity is unavailable".into(),
-            })?;
     let result = Box::pin(run_prepared_command_cancellable(
         &request, prepared, None, cancel,
     ))
@@ -2772,7 +2842,11 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // below, unchanged. `use_exec_journal` also stays inline: that journal
         // is borrowed from `self` for the whole run and cannot leave with the
         // plan.
-        if self.off_lock_execution_claimed && !use_exec_journal {
+        // The claim is consumed, not merely read. It is the one piece of the
+        // off-lock state that nothing later overwrites, so if a panic between
+        // setting and clearing it ever left it stale, taking it here bounds
+        // the damage to a single call instead of every later one.
+        if !use_exec_journal && std::mem::take(&mut self.off_lock_execution_claimed) {
             self.off_lock_execution = Some(OffLockExecution {
                 plan: OffLockCommandPlan {
                     request: req,
@@ -7495,11 +7569,19 @@ pub async fn dispatch_off_lock(
     client: &ClientIdentity,
     binding: RuntimeCallBinding,
 ) -> IpcResult<Value> {
-    let mut guard = runtime.lock().await;
-    // A captured plan never outlives the locked section that created it, so
-    // anything still here is debris from an earlier panic, not live work.
-    guard.off_lock_execution = None;
-    guard.off_lock_execution_claimed = true;
+    // #160: taken before the mutex and before any journal reservation, and
+    // held until the operation commits, so nothing is prepared or reserved for
+    // a command that has not yet been given capacity to run.
+    let _command_slot = if method_can_execute_a_command(method) {
+        let cancel = match &binding {
+            RuntimeCallBinding::Remote { cancel, .. } => cancel.as_ref(),
+            RuntimeCallBinding::Local => None,
+        };
+        Some(acquire_command_slot(cancel).await?)
+    } else {
+        None
+    };
+    let mut guard = claim_off_lock_execution(runtime).await;
     let admitted = match binding {
         RuntimeCallBinding::Local => guard.dispatch(method, params, client).await,
         RuntimeCallBinding::Remote {
@@ -7525,6 +7607,51 @@ pub async fn dispatch_off_lock(
                 .await
         }
     };
+    resume_off_lock_execution(runtime, guard, admitted).await
+}
+
+/// Apply a control-plane approval decision without holding the runtime mutex
+/// across the approved command's child (#160).
+///
+/// This is not a dispatch method, but it reaches the same `execute_exec`
+/// through `handle_approval_approve` — and it is the *only* way a remote
+/// `command.run` that hit a policy Ask ever executes, because the Agent
+/// transport maps `approval.decision` to this entry point before the ordinary
+/// dispatch path. Approving from local IPC and approving from the control
+/// plane must not differ in whether the device stalls.
+pub async fn apply_control_plane_approval_decision_off_lock(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    params: Option<Value>,
+) -> IpcResult<Value> {
+    // An approval releases a deferred request that may be a command, so this
+    // takes a permit for the same reason `ops.exec` does. A decision that
+    // turns out to be a denial holds it only for the length of the decision.
+    let _command_slot = acquire_command_slot(None).await?;
+    let mut guard = claim_off_lock_execution(runtime).await;
+    let admitted = guard.apply_control_plane_approval_decision(params).await;
+    resume_off_lock_execution(runtime, guard, admitted).await
+}
+
+/// Take the runtime mutex and declare that this caller will drain any
+/// execution the admission pass captures.
+async fn claim_off_lock_execution(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+) -> tokio::sync::MutexGuard<'_, DaemonRuntime> {
+    let mut guard = runtime.lock().await;
+    // A captured plan never outlives the locked section that created it, so
+    // anything still here is debris from an earlier panic, not live work.
+    guard.off_lock_execution = None;
+    guard.off_lock_execution_claimed = true;
+    guard
+}
+
+/// Release the runtime mutex around the captured child, then reacquire it for
+/// the operation's own commit step (#160).
+async fn resume_off_lock_execution(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    mut guard: tokio::sync::MutexGuard<'_, DaemonRuntime>,
+    admitted: IpcResult<Value>,
+) -> IpcResult<Value> {
     guard.off_lock_execution_claimed = false;
     let Some(execution) = guard.off_lock_execution.take() else {
         return admitted;
@@ -15496,7 +15623,7 @@ cleanup cannot leave the legacy large-body copy behind"
 #[cfg(test)]
 mod off_lock_execution_tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// Owner-only tempdir: `tempfile` respects the process umask, and the
     /// daemon custody attestation rejects group/world-writable ancestors, so
@@ -15595,21 +15722,23 @@ mod off_lock_execution_tests {
             .await
         });
 
-        // Let admission finish and the child start. The command itself runs
-        // for seconds, so this settle window cannot outlast it.
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        // Let admission — image hashing, platform executable custody, policy
+        // evaluation, the audit append — finish and the child start. That work
+        // is what holds the mutex, and it is generous compared with the
+        // fixture command's own runtime.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
         assert!(
             !long.is_finished(),
             "the fixture command must still be running for this test to mean anything"
         );
-        assert!(
-            runtime.try_lock().is_ok(),
-            "the runtime mutex must be free while a command's child is alive"
-        );
 
         // The acceptance criterion from the issue: while a long `command_run`
         // is active, an unrelated read-only request completes independently.
-        let started = Instant::now();
+        //
+        // This is an ordering assertion rather than a wall-clock budget, so a
+        // loaded shared runner cannot turn it red: if the mutex were held for
+        // the child's lifetime, this read could not return until the child had
+        // exited, and the command would no longer be running when it did.
         let listed = dispatch_off_lock(
             &runtime,
             methods::OPS_FS_LIST,
@@ -15619,15 +15748,11 @@ mod off_lock_execution_tests {
         )
         .await
         .expect("an unrelated read must not wait for the running command");
-        let elapsed = started.elapsed();
         assert_eq!(listed["approval_required"], false);
         assert!(
             !long.is_finished(),
-            "the unrelated read must complete while the command is still running"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "unrelated read waited on the command: {elapsed:?}"
+            "the unrelated read only returned once the command had finished, \
+             which is what holding the runtime mutex across the child looks like"
         );
 
         let completed = long
@@ -15710,6 +15835,40 @@ mod off_lock_execution_tests {
         assert_eq!(stored["replayed"], true);
     }
 
+    /// A stock executable that exits immediately with success.
+    fn short_command() -> (String, Vec<String>) {
+        #[cfg(unix)]
+        {
+            let truth = ["/bin/true", "/usr/bin/true"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|candidate| candidate.is_file())
+                .expect("a stock true executable must exist");
+            (truth.display().to_string(), Vec::new())
+        }
+        #[cfg(windows)]
+        {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+            let ping = PathBuf::from(format!("{root}\\System32\\PING.EXE"));
+            assert!(
+                ping.is_file(),
+                "a stock ping.exe must exist: {}",
+                ping.display()
+            );
+            (
+                ping.display().to_string(),
+                ["-n", "1", "127.0.0.1"]
+                    .iter()
+                    .map(|arg| (*arg).to_owned())
+                    .collect(),
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            unimplemented!("no stock short command for this platform")
+        }
+    }
+
     /// The deferral is unreachable for a caller that already owns
     /// `&mut DaemonRuntime`: it has no mutex to release, so it executes
     /// inline and can never observe the internal control error.
@@ -15720,16 +15879,14 @@ mod off_lock_execution_tests {
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
         runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
         let client = ClientIdentity::new("offlock-inline-test", "test");
-        let (program, args) = long_running_command();
+        let (program, args) = short_command();
 
         let completed = runtime
             .dispatch(
                 methods::OPS_EXEC,
                 Some(json!({
                     "program": program,
-                    // A short argument keeps this test fast; the point is the
-                    // execution path, not the duration.
-                    "args": args.iter().take(1).cloned().collect::<Vec<_>>(),
+                    "args": args,
                     "kind": "structured",
                     "workspace_id": "ws_default",
                     "idempotency_key": "offlock_inline",
@@ -15739,6 +15896,9 @@ mod off_lock_execution_tests {
             .await
             .expect("a direct mutable caller executes inline");
         assert_eq!(completed["approval_required"], false);
+        // The command really ran here, rather than the caller receiving the
+        // internal control value the off-lock path uses.
+        assert_eq!(completed["result"]["exit_code"], 0);
         assert!(
             runtime.off_lock_execution.is_none(),
             "an unclaimed runtime must never capture a plan"
