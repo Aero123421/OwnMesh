@@ -748,6 +748,204 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertNotIn("NativeCommandError", combined)
         self.assertNotIn("指定されたファイルが見つかりません", combined)
 
+    def _readiness_snippet(self, extra: str) -> str:
+        """Wait-OwnMeshDaemonReady plus the schtasks helper it calls."""
+        text = PS_INSTALLER.read_text(encoding="utf-8")
+        helper_start = text.find("function Invoke-OwnMeshSchTasks")
+        helper_end = text.find("function Stop-InstalledOwnMeshProcesses", helper_start)
+        self.assertGreater(helper_end, helper_start, "could not bound Invoke-OwnMeshSchTasks")
+        wait_start = text.find("function Wait-OwnMeshDaemonReady")
+        self.assertNotEqual(wait_start, -1, "Wait-OwnMeshDaemonReady helper is missing")
+        wait_end = text.find("function Restore-OwnMeshBackup", wait_start)
+        self.assertGreater(wait_end, wait_start, "could not bound Wait-OwnMeshDaemonReady")
+        return (
+            text[helper_start:helper_end]
+            + text[wait_start:wait_end]
+            + "$ErrorActionPreference = 'Stop'\n"
+            + "Set-StrictMode -Version Latest\n"
+            + extra
+        )
+
+    def _fake_ownmesh_status_cli(self, directory: Path, ready_after_polls: int) -> Path:
+        """A stand-in `ownmesh.exe` whose daemon reports the new version late.
+
+        `ready_after_polls` is counted in calls rather than wall-clock so the
+        fixture is deterministic; the caller sets the poll interval, and the
+        assertions are about elapsed time against the deadline.
+        A negative value never becomes ready.
+        """
+        counter = directory / "poll-count.txt"
+        shim = directory / "ownmesh.cmd"
+        ready = "9.9.9-new"
+        stale = "1.0.0-old"
+        gate = (
+            f'if %n% GEQ {ready_after_polls} ('
+            f'echo {{"daemon":{{"version":"{ready}"}}}}'
+            f") else ("
+            f'echo {{"daemon":{{"version":"{stale}"}}}}'
+            f")"
+            if ready_after_polls >= 0
+            else f'echo {{"daemon":{{"version":"{stale}"}}}}'
+        )
+        shim.write_text(
+            "@echo off\r\n"
+            "setlocal enabledelayedexpansion\r\n"
+            "set /a n=0\r\n"
+            f'if exist "{counter}" set /p n=<"{counter}"\r\n'
+            "set /a n=n+1\r\n"
+            f'> "{counter}" echo %n%\r\n'
+            f"{gate}\r\n"
+            "exit /b 0\r\n",
+            encoding="ascii",
+        )
+        return shim
+
+    def _run_powershell(self, snippet: str) -> subprocess.CompletedProcess[str]:
+        powershell = shutil.which("powershell")
+        assert powershell is not None
+        return subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", snippet],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    def test_windows_ps1_has_no_fixed_readiness_sleep(self) -> None:
+        """#154: readiness is polled to a bounded deadline, never slept for.
+
+        The single fixed 500 ms wait plus one status call failed healthy
+        upgrades that needed longer to initialize and rolled the binaries
+        back. This is a source assertion so it holds on every platform, not
+        only where PowerShell can run.
+        """
+        text = PS_INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("Wait-OwnMeshDaemonReady", text)
+        self.assertNotRegex(
+            text,
+            r"(?im)^\s*Start-Sleep\s+-Milliseconds\s+500\s*$",
+            "the fixed post-start readiness sleep must not come back",
+        )
+        # The wait runs inside the try whose catch restores the backup, so a
+        # never-ready daemon still rolls back.
+        wait_call = text.find("Wait-OwnMeshDaemonReady `")
+        self.assertNotEqual(wait_call, -1, "the installer must call the bounded wait")
+        rollback = text.find("Post-install verification failed", wait_call)
+        self.assertGreater(rollback, wait_call, "the wait must precede the rollback handler")
+
+    def test_windows_ps1_readiness_accepts_a_delayed_daemon(self) -> None:
+        """A daemon that needs well over 500 ms is an upgrade that succeeded."""
+        if not _is_windows():
+            self.skipTest("Windows PowerShell 5.1 only")
+        if not shutil.which("powershell"):
+            self.skipTest("powershell.exe not available")
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-") as tmp:
+            # 200 ms x 8 polls is ~1.6 s: comfortably past the old fixed wait.
+            shim = self._fake_ownmesh_status_cli(Path(tmp), ready_after_polls=8)
+            snippet = self._readiness_snippet(
+                "$started = [DateTime]::UtcNow\n"
+                f"Wait-OwnMeshDaemonReady -OwnMeshPath '{shim}' "
+                "-ExpectedVersion '9.9.9-new' -TimeoutSeconds 30 -PollMilliseconds 200\n"
+                # Formatted as an integer so a comma-decimal locale cannot
+                # change what the assertion below reads.
+                "$elapsed = [int]([DateTime]::UtcNow - $started).TotalMilliseconds\n"
+                "Write-Output \"ready-after-ms=$elapsed\"\n"
+            )
+            completed = self._run_powershell(snippet)
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            match = re.search(r"ready-after-ms=([0-9]+)", combined)
+            self.assertIsNotNone(match, combined)
+            assert match is not None
+            elapsed_ms = float(match.group(1))
+            self.assertGreater(
+                elapsed_ms,
+                500,
+                "the fixture must outlast the old fixed wait to be meaningful",
+            )
+
+    def test_windows_ps1_readiness_fails_after_the_full_deadline(self) -> None:
+        """A never-ready daemon fails only once the whole deadline is spent."""
+        if not _is_windows():
+            self.skipTest("Windows PowerShell 5.1 only")
+        if not shutil.which("powershell"):
+            self.skipTest("powershell.exe not available")
+        with tempfile.TemporaryDirectory(prefix="ownmesh-never-ready-") as tmp:
+            shim = self._fake_ownmesh_status_cli(Path(tmp), ready_after_polls=-1)
+            snippet = self._readiness_snippet(
+                "$started = [DateTime]::UtcNow\n"
+                "try {\n"
+                f"  Wait-OwnMeshDaemonReady -OwnMeshPath '{shim}' "
+                "-ExpectedVersion '9.9.9-new' -TimeoutSeconds 3 -PollMilliseconds 200\n"
+                "  Write-Output 'unexpected-success'\n"
+                "} catch {\n"
+                "  $elapsed = [int]([DateTime]::UtcNow - $started).TotalMilliseconds\n"
+                "  Write-Output \"failed-after-ms=$elapsed\"\n"
+                "  Write-Output \"message=$($_.Exception.Message)\"\n"
+                "}\n"
+            )
+            completed = self._run_powershell(snippet)
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            self.assertNotIn("unexpected-success", combined)
+            self.assertIn("Updated OwnMesh daemon version did not match the CLI", combined)
+            match = re.search(r"failed-after-ms=([0-9]+)", combined)
+            self.assertIsNotNone(match, combined)
+            assert match is not None
+            elapsed_ms = float(match.group(1))
+            self.assertGreaterEqual(
+                elapsed_ms,
+                3000,
+                f"the full deadline must be spent before rollback: {combined}",
+            )
+
+    def test_windows_ps1_readiness_stops_early_when_the_task_disappears(self) -> None:
+        """Authoritative terminal evidence short-circuits the deadline.
+
+        The task probe is shadowed here so the control flow can be exercised
+        without registering a real scheduled task; the real helper's schtasks
+        behavior is covered by its own test.
+        """
+        if not _is_windows():
+            self.skipTest("Windows PowerShell 5.1 only")
+        if not shutil.which("powershell"):
+            self.skipTest("powershell.exe not available")
+        with tempfile.TemporaryDirectory(prefix="ownmesh-task-gone-") as tmp:
+            shim = self._fake_ownmesh_status_cli(Path(tmp), ready_after_polls=-1)
+            snippet = self._readiness_snippet(
+                "$script:probe = 0\n"
+                "function Invoke-OwnMeshSchTasks {\n"
+                "  param([string]$Action, [string]$TaskName)\n"
+                "  $script:probe = $script:probe + 1\n"
+                "  if ($script:probe -le 1) { return 0 } else { return 1 }\n"
+                "}\n"
+                "$started = [DateTime]::UtcNow\n"
+                "try {\n"
+                f"  Wait-OwnMeshDaemonReady -OwnMeshPath '{shim}' "
+                "-ExpectedVersion '9.9.9-new' -TimeoutSeconds 60 -PollMilliseconds 200\n"
+                "  Write-Output 'unexpected-success'\n"
+                "} catch {\n"
+                "  $elapsed = [int]([DateTime]::UtcNow - $started).TotalMilliseconds\n"
+                "  Write-Output \"failed-after-ms=$elapsed\"\n"
+                "  Write-Output \"message=$($_.Exception.Message)\"\n"
+                "}\n"
+            )
+            completed = self._run_powershell(snippet)
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            self.assertNotIn("unexpected-success", combined)
+            self.assertIn("scheduled task is no longer registered", combined)
+            match = re.search(r"failed-after-ms=([0-9]+)", combined)
+            self.assertIsNotNone(match, combined)
+            assert match is not None
+            elapsed_ms = float(match.group(1))
+            self.assertLess(
+                elapsed_ms,
+                30000,
+                f"terminal task evidence must not wait out the deadline: {combined}",
+            )
+
     def test_windows_ps1_sha256_helper_with_core_psmodulepath(self) -> None:
         if not _is_windows():
             self.skipTest("Windows PowerShell 5.1 only")

@@ -275,6 +275,111 @@
         return $serviceWasRunning
     }
 
+    function Wait-OwnMeshDaemonReady {
+        param(
+            [Parameter(Mandatory)][string]$OwnMeshPath,
+            [Parameter(Mandatory)][string]$ExpectedVersion,
+            [string[]]$TaskNames = @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd"),
+            [int]$TimeoutSeconds = 60,
+            [int]$PollMilliseconds = 250
+        )
+
+        # A successful `service start` proves only that the daemon was asked
+        # to start. Readiness is the authenticated daemon status reporting the
+        # version that was just installed, polled to a bounded deadline.
+        #
+        # This used to be one fixed 500 ms sleep and a single status call, so
+        # a healthy daemon that needed longer to initialize — slow disk,
+        # first-run state, AV scanning, a loaded CI or desktop host — was
+        # treated as a failed upgrade and rolled the binaries back. The CLI
+        # already spends up to its own bounded start deadline proving IPC
+        # readiness before `service start` returns; this deadline covers that
+        # window plus the version convergence that follows it.
+        if ($TimeoutSeconds -lt 1) { $TimeoutSeconds = 1 }
+        if ($PollMilliseconds -lt 1) { $PollMilliseconds = 1 }
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $lastError = "Updated OwnMesh daemon did not become ready"
+        $taskWasPresent = $false
+
+        # A not-yet-ready daemon writes to stderr, and Windows PowerShell 5.1
+        # wraps native stderr as a terminating NativeCommandError under
+        # $ErrorActionPreference Stop. Only the exit code and the parsed
+        # payload are authoritative here.
+        $previousEap = $ErrorActionPreference
+        $previousNative = $null
+        if (Test-Path -LiteralPath variable:PSNativeCommandUseErrorActionPreference) {
+            $previousNative = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        try {
+            $ErrorActionPreference = "Continue"
+            while ($true) {
+                $statusText = (& $OwnMeshPath --json status 2>$null | Out-String)
+                if ($LASTEXITCODE -eq 0) {
+                    # A partially written or non-JSON reply is a not-ready
+                    # daemon, not an installer failure: keep polling.
+                    $status = $null
+                    try {
+                        $status = $statusText | ConvertFrom-Json -ErrorAction Stop
+                    } catch {
+                        $status = $null
+                    }
+                    if ($null -eq $status) {
+                        $lastError = "Updated OwnMesh daemon returned a status that was not valid JSON"
+                    } else {
+                        # Set-StrictMode is active: probe for the properties
+                        # rather than dereferencing a payload that a partially
+                        # initialized daemon may not have filled in yet.
+                        $reported = $null
+                        if ($status.PSObject.Properties.Name -contains "daemon") {
+                            $daemon = $status.daemon
+                            if ($null -ne $daemon -and
+                                $daemon.PSObject.Properties.Name -contains "version") {
+                                $reported = $daemon.version
+                            }
+                        }
+                        if ($null -ne $reported -and $reported -eq $ExpectedVersion) {
+                            return
+                        }
+                        $lastError = "Updated OwnMesh daemon version did not match the CLI"
+                    }
+                } else {
+                    $lastError = "Updated OwnMesh daemon did not become ready"
+                }
+
+                # Give up before the deadline only on authoritative terminal
+                # evidence: a scheduled task that was registered while this
+                # wait ran is now gone, so no amount of further waiting can
+                # produce a ready daemon. Exit codes decide that, never
+                # task-state text, which is localized. A task never observed
+                # at all is evidence of nothing and never shortens the
+                # deadline.
+                $taskPresent = $false
+                foreach ($taskName in $TaskNames) {
+                    if ((Invoke-OwnMeshSchTasks -Action Query -TaskName $taskName) -eq 0) {
+                        $taskPresent = $true
+                        break
+                    }
+                }
+                if ($taskPresent) {
+                    $taskWasPresent = $true
+                } elseif ($taskWasPresent) {
+                    throw "OwnMesh scheduled task is no longer registered; the daemon cannot become ready"
+                }
+
+                if ([DateTime]::UtcNow -ge $deadline) {
+                    throw "$lastError within $TimeoutSeconds seconds"
+                }
+                Start-Sleep -Milliseconds $PollMilliseconds
+            }
+        } finally {
+            $ErrorActionPreference = $previousEap
+            if ($null -ne $previousNative) {
+                $PSNativeCommandUseErrorActionPreference = $previousNative
+            }
+        }
+    }
+
     function Restore-OwnMeshBackup {
         param(
             [Parameter(Mandatory)][string]$TargetDir,
@@ -797,16 +902,10 @@
                 if ($LASTEXITCODE -ne 0) {
                     throw "Updated OwnMesh service did not restart"
                 }
-                Start-Sleep -Milliseconds 500
-                $statusText = (& $ownmeshPath --json status | Out-String)
-                if ($LASTEXITCODE -ne 0) {
-                    throw "Updated OwnMesh daemon did not become ready"
-                }
-                $status = $statusText | ConvertFrom-Json
                 $expectedVersion = ($installedVersion -split '\s+')[-1]
-                if ($status.daemon.version -ne $expectedVersion) {
-                    throw "Updated OwnMesh daemon version did not match the CLI"
-                }
+                Wait-OwnMeshDaemonReady `
+                    -OwnMeshPath $ownmeshPath `
+                    -ExpectedVersion $expectedVersion
             }
         } catch {
             $postInstallError = $_.Exception.Message
