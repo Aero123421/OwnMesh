@@ -1143,6 +1143,9 @@ fn child_path(search_dirs: &[PathBuf]) -> Option<String> {
 
 /// Resolve the interpreter dependency of a Unix shebang wrapper without
 /// invoking a shell or importing a login environment.
+// The Windows branch is intentionally infallible but retains the Unix
+// branch's fallible signature so callers have one cross-platform contract.
+#[allow(clippy::unnecessary_wraps)]
 fn resolve_shebang_interpreter(
     program: &Path,
     search_dirs: &[PathBuf],
