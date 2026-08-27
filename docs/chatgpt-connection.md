@@ -239,7 +239,7 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 | Some tools are missing from ChatGPT | Stale connector catalog. Compare generations, see **Tool catalog looks stale** below |
 | Tools disappear entirely / no catalog at all | Edge rejection, not a stale catalog. Run `python scripts/probe_machine_endpoints.py https://<worker>` and see [deploy-cloudflare.md](./deploy-cloudflare.md#machine-endpoints-must-not-require-a-browser-signature) |
 | `ownmesh_system_diagnose` returns `diagnosis_unavailable` | Read `diagnosis_rejection`; `unsupported_contract_version` means deploy the current Worker, other reasons point at the device |
-| `OWNMESH_E_SELF_REENTRANT_EXEC` | Expected. Running the OwnMesh CLI on the device it manages would deadlock the daemon, so it is refused before spawn. Use `ownmesh_system_diagnose` and the policy/grants/workspace tools instead; only `ownmesh --version` / `--help` are executable this way |
+| `OWNMESH_E_SELF_REENTRANT_EXEC` | Expected. Running the OwnMesh CLI on the device it manages re-enters the daemon it is talking to, so it is refused before spawn rather than left to race the daemon's own state. Use `ownmesh_system_diagnose` and the policy/grants/workspace tools instead; only `ownmesh --version` / `--help` are executable this way |
 | `OWNMESH_E_AUTHORIZATION_REFRESHED` | The operation was never delivered and its authorization was refreshed while it waited. Resubmit the same request; it is authorized under the current credentials |
 
 ### Tool catalog looks stale
