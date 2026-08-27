@@ -5563,21 +5563,25 @@ path or install the tool so detection and execution agree",
         self.active_remote_principal_credential_generation =
             remote_principal_credential_generation.filter(|generation| *generation > 0);
         let outcome = if method == methods::OPS_EXEC {
-            match self.admit_exec(params, client).await {
-                Ok(GateOutcome::Reply(value)) => DispatchOutcome::Done(Ok(value)),
-                Ok(GateOutcome::Run(work))
-                    if pending_request_releases_runtime_lock(&work.request) =>
-                {
-                    DispatchOutcome::Execute(Box::new(AdmittedExec {
-                        work: *work,
-                        cancel: self.active_cancel.clone(),
-                        runtime_dir: self.paths.runtime_dir.clone(),
-                    }))
+            if let Err(error) = self.preflight_authenticated_dispatch(method, client) {
+                DispatchOutcome::Done(Err(error))
+            } else {
+                match self.admit_exec(params, client).await {
+                    Ok(GateOutcome::Reply(value)) => DispatchOutcome::Done(Ok(value)),
+                    Ok(GateOutcome::Run(work))
+                        if pending_request_releases_runtime_lock(&work.request) =>
+                    {
+                        DispatchOutcome::Execute(Box::new(AdmittedExec {
+                            work: *work,
+                            cancel: self.active_cancel.clone(),
+                            runtime_dir: self.paths.runtime_dir.clone(),
+                        }))
+                    }
+                    Ok(GateOutcome::Run(work)) => {
+                        DispatchOutcome::Done(self.finish_allowed(*work).await)
+                    }
+                    Err(error) => DispatchOutcome::Done(Err(error)),
                 }
-                Ok(GateOutcome::Run(work)) => {
-                    DispatchOutcome::Done(self.finish_allowed(*work).await)
-                }
-                Err(error) => DispatchOutcome::Done(Err(error)),
             }
         } else {
             DispatchOutcome::Done(self.dispatch(method, params, client).await)
@@ -5867,15 +5871,15 @@ path or install the tool so detection and execution agree",
         }))
     }
 
-    /// Dispatch one authenticated RPC method bound to `client` identity.
-    pub async fn dispatch(
-        &mut self,
+    fn preflight_authenticated_dispatch(
+        &self,
         method: &str,
-        params: Option<Value>,
         client: &ClientIdentity,
-    ) -> IpcResult<Value> {
+    ) -> IpcResult<()> {
         // client.client_name holds the server-assigned principal key (never a
-        // self-reported HELLO label).
+        // self-reported HELLO label). The unlocked `command.run` admit path
+        // must use this same gate; skipping it would let lockdown, a degraded
+        // journal, or a revoked principal reach spawn.
         if self.is_client_revoked(&client.client_name) {
             return Err(IpcError::Remote {
                 code: app_error::TOKEN_REVOKED,
@@ -5884,6 +5888,17 @@ path or install the tool so detection and execution agree",
         }
         self.check_lockdown(method)?;
         self.check_journal_degraded(method)?;
+        Ok(())
+    }
+
+    /// Dispatch one authenticated RPC method bound to `client` identity.
+    pub async fn dispatch(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        self.preflight_authenticated_dispatch(method, client)?;
         match method {
             methods::ROUTE_STATUS => Ok(self.handle_route_status()),
             methods::OPS_EXEC => self.handle_exec(params, client).await,

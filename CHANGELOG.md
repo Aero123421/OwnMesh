@@ -15,7 +15,9 @@
   adds a bounded `runtime_queue` check (`idle` / `executing` /
   `self_reentrant_exec`) without argv, paths, or output. A live unlocked exec
   that reserved a journal marker is not reported as a stuck receipt; a leftover
-  marker plus a keyless in-flight exec stays visible.
+  marker plus a keyless in-flight exec stays visible. The unlocked admit path
+  still applies lockdown, journal-degraded, and revoked-principal gates before
+  spawn.
 - `session.open` will not commit `state=running` unless the OS reports the
   attested child as still running. A short-lived process that is already a
   zombie at the attestation barrier is rolled back instead of poisoning later

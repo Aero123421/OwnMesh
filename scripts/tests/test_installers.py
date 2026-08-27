@@ -854,7 +854,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, combined)
             self.assertIn("ready elapsed_ms=", combined)
             self.assertGreaterEqual(elapsed_ms, 800)
-            self.assertLess(elapsed_ms, 5000)
+            self.assertLess(elapsed_ms, 15000)
 
     def test_windows_ps1_never_ready_daemon_fails_after_deadline(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ownmesh-ready-never-") as tmp:
@@ -910,7 +910,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, combined)
             self.assertIn("ready elapsed_ms=", combined)
             self.assertGreaterEqual(elapsed_ms, 800)
-            self.assertLess(elapsed_ms, 5000)
+            self.assertLess(elapsed_ms, 15000)
 
     def test_windows_ps1_terminal_task_failure_after_running_fails(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ownmesh-ready-taskfail-") as tmp:

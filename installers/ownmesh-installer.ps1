@@ -221,7 +221,7 @@
                 }
                 return @{
                     State = [int]$task.State
-                    LastTaskResult = [int]$task.LastTaskResult
+                    LastTaskResult = [int64]$task.LastTaskResult
                 }
             } catch {
                 # Missing task, COM unavailable, or folder mismatch: try the
@@ -239,7 +239,7 @@
         )
         if ($null -eq $Run) { return $false }
         $state = [int]$Run.State
-        $result = [int]$Run.LastTaskResult
+        $result = [int64]$Run.LastTaskResult
         # TASK_STATE_DISABLED = 1: this instance will not start.
         if ($state -eq 1) { return $true }
         # TASK_STATE_QUEUED = 2, TASK_STATE_RUNNING = 4: this instance is live.
@@ -281,7 +281,7 @@
                 if ([int]$run.State -eq 1) {
                     throw "Scheduled task is disabled"
                 }
-                throw ("Scheduled task action failed with last run result {0}" -f [int]$run.LastTaskResult)
+                throw ("Scheduled task action failed with last run result {0}" -f [int64]$run.LastTaskResult)
             }
             $previousEap = $ErrorActionPreference
             try {
