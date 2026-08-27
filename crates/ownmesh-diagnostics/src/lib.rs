@@ -473,7 +473,7 @@ pub struct DoctorInput {
     pub journals: JournalsObservation,
     pub profile_discovery: ProfileDiscoveryObservation,
     /// Ancestor custody of config/state/runtime. Empty means the same walk
-    /// the Agent uses at start found no blocking ancestor (#168).
+    /// the Agent uses at start found no blocking ancestor.
     pub layout_custody: LayoutCustodyObservation,
 }
 
@@ -616,9 +616,8 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         }
     }
 
-    // #168: Agent start custody is independent of config-file other-write.
-    // A 0700 OwnMesh directory under a group-writable ancestor still refuses
-    // to boot; that must be a dedicated fail, not daemon.ipc "not connected".
+    // Agent start custody is independent of config-file other-write. A 0700
+    // OwnMesh directory under a group-writable ancestor still refuses to boot.
     if let Some(error) = &input.layout_custody.inspect_error {
         checks.push(
             DoctorCheck::fail(

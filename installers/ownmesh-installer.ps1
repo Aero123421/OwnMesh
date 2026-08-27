@@ -206,10 +206,6 @@
     # (numeric LastTaskResult / State). `schtasks /Query /FO LIST /V` text is
     # localized and cannot be the readiness authority. $null means the probe
     # could not run; polling continues rather than inventing a failure.
-    #
-    # TASK_STATE_QUEUED = 2, TASK_STATE_RUNNING = 4. A non-zero LastTaskResult
-    # while the instance is still queued/running is the previous run, not this
-    # one. SCHED_S_TASK_RUNNING (0x41301) is also not a terminal failure.
     function Get-OwnMeshScheduledTaskRun {
         foreach ($taskName in @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
             try {
@@ -237,23 +233,36 @@
     }
 
     function Test-OwnMeshScheduledTaskTerminalFailure {
-        param($Run)
+        param(
+            $Run,
+            [bool]$SawRunning = $false
+        )
         if ($null -eq $Run) { return $false }
         $state = [int]$Run.State
         $result = [int]$Run.LastTaskResult
+        # TASK_STATE_DISABLED = 1: this instance will not start.
+        if ($state -eq 1) { return $true }
+        # TASK_STATE_QUEUED = 2, TASK_STATE_RUNNING = 4: this instance is live.
         if ($state -eq 2 -or $state -eq 4) { return $false }
         if ($result -eq 0) { return $false }
-        # 0x00041301 SCHED_S_TASK_RUNNING, 0x00041300 SCHED_S_TASK_READY,
-        # 0x00041303 SCHED_S_TASK_HAS_NOT_RUN, 0x00041306 disabled.
-        if ($result -in @(267008, 267009, 267011, 267014)) { return $false }
+        # Informational scheduler HRESULTs, not action failures:
+        # 0x00041300 SCHED_S_TASK_READY, 0x00041301 SCHED_S_TASK_RUNNING,
+        # 0x00041303 SCHED_S_TASK_HAS_NOT_RUN.
+        # 0x00041306 is SCHED_S_TASK_TERMINATED (completed instance), not
+        # SCHED_S_TASK_DISABLED (0x00041302). Disabled is State = 1 above.
+        if ($result -in @(267008, 267009, 267011)) { return $false }
+        # TASK_STATE_READY (3) with leftover LastTaskResult is the previous
+        # crash/stop, not this instance. Fail only after this poll loop
+        # observed RUNNING.
+        if (-not $SawRunning) { return $false }
         return $true
     }
 
     # Shared with `ownmesh update`: poll authenticated `ownmesh --json status`
     # until daemon.version matches the installed CLI, or the bounded deadline
-    # elapses. A healthy daemon that needs more than 500 ms (slow disk,
-    # first-run state, AV scan) must succeed. Fail immediately only when the
-    # scheduled task itself reports a terminal action result.
+    # elapses. Authenticated status is the readiness authority. COM last-run
+    # is a hint after this instance has been observed running, or when the
+    # task is disabled.
     function Wait-OwnMeshDaemonReady {
         param(
             [Parameter(Mandatory)][string]$OwnMeshPath,
@@ -264,9 +273,14 @@
         if ($TimeoutSeconds -lt 1) { throw "TimeoutSeconds must be >= 1" }
         if ($PollMilliseconds -lt 1) { throw "PollMilliseconds must be >= 1" }
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $sawRunning = $false
         while ($true) {
             $run = Get-OwnMeshScheduledTaskRun
-            if (Test-OwnMeshScheduledTaskTerminalFailure -Run $run) {
+            if ($null -ne $run -and [int]$run.State -eq 4) { $sawRunning = $true }
+            if (Test-OwnMeshScheduledTaskTerminalFailure -Run $run -SawRunning $sawRunning) {
+                if ([int]$run.State -eq 1) {
+                    throw "Scheduled task is disabled"
+                }
                 throw ("Scheduled task action failed with last run result {0}" -f [int]$run.LastTaskResult)
             }
             $previousEap = $ErrorActionPreference

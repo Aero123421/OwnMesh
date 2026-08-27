@@ -2470,35 +2470,59 @@ pub fn inspect_layout_custody(
 /// Clear group/other write on one existing directory this process owns.
 /// Never recursive. Returns `(old_mode, new_mode)` with the `0o7777` mask.
 ///
+/// Opens with `O_DIRECTORY|O_NOFOLLOW` and `fchmod`s that fd so a replaceable
+/// ancestor cannot swap a symlink between the owner check and the mode change.
+///
 /// # Errors
 ///
 /// Fails closed when the path is missing, not a directory, not owned by this
 /// uid, or a symlink/reparse.
 #[cfg(unix)]
 pub fn clear_group_other_write(path: &Path) -> IpcResult<(u32, u32)> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    reject_symlink_or_reparse_if_present(path)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() {
-        return Err(IpcError::Unauthorized(format!(
-            "refusing to change a non-directory: {}",
-            path.display()
-        )));
-    }
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|err| map_repair_open_error(path, err))?;
+    let stat = rustix::fs::fstat(&fd).map_err(std::io::Error::from)?;
     let expected = rustix::process::geteuid().as_raw();
-    if metadata.uid() != expected {
+    if stat.st_uid != expected {
         return Err(IpcError::Unauthorized(format!(
             "refusing to chmod a directory owned by uid {}: {}",
-            metadata.uid(),
+            stat.st_uid,
             path.display()
         )));
     }
-    let old = metadata.permissions().mode() & 0o7777;
+    let old = stat.st_mode & 0o7777;
     let new = old & !0o022;
     if new != old {
-        fs::set_permissions(path, fs::Permissions::from_mode(new))?;
+        let mode = rustix::fs::Mode::from_bits_truncate(new);
+        rustix::fs::fchmod(&fd, mode).map_err(std::io::Error::from)?;
     }
     Ok((old, new))
+}
+
+#[cfg(unix)]
+fn map_repair_open_error(path: &Path, err: rustix::io::Errno) -> IpcError {
+    if err == rustix::io::Errno::NOTDIR || err == rustix::io::Errno::LOOP {
+        let is_symlink = fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            IpcError::Unauthorized(format!("refusing to chmod a symlink: {}", path.display()))
+        } else {
+            IpcError::Unauthorized(format!(
+                "refusing to change a non-directory: {}",
+                path.display()
+            ))
+        }
+    } else {
+        IpcError::from(std::io::Error::from(err))
+    }
 }
 
 #[cfg(not(unix))]
@@ -2750,6 +2774,10 @@ mod tests {
         // The tempdir itself is owned by us; a missing path fails closed.
         let missing = root.path().join("nope");
         assert!(clear_group_other_write(&missing).is_err());
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        let err = clear_group_other_write(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
     }
 
     #[cfg(unix)]

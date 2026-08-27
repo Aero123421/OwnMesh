@@ -753,25 +753,34 @@ const MAX_CACHED_DESTINATION_TRANSFERS: usize = 256;
 /// Concurrent detached `command.run` jobs per daemon. Fail-closed when full.
 const MAX_DETACHED_COMMANDS: usize = 4;
 static DETACHED_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-/// `command.run` executions that have released the runtime mutex and are
-/// waiting on a child/broker. Diagnose subtracts this from in-progress journal
-/// markers so a live exec is not reported as a stuck receipt (#160).
+/// Unlocked `command.run` waits currently outside the runtime mutex.
 static EXTERNAL_EXEC_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Unlocked execs that reserved an exact-once journal marker. Stuck-receipt
+/// diagnosis subtracts this from `in_progress`, not every in-flight exec.
+static EXTERNAL_EXEC_JOURNALED: AtomicUsize = AtomicUsize::new(0);
 /// Bounded counter of pre-spawn `OWNMESH_E_SELF_REENTRANT_EXEC` refusals.
 /// Never stores argv, paths, or output.
 static SELF_REENTRANT_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
-struct ExternalExecGuard;
+struct ExternalExecGuard {
+    journaled: bool,
+}
 
 impl Drop for ExternalExecGuard {
     fn drop(&mut self) {
         EXTERNAL_EXEC_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        if self.journaled {
+            EXTERNAL_EXEC_JOURNALED.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
-fn acquire_external_exec() -> ExternalExecGuard {
+fn acquire_external_exec(journaled: bool) -> ExternalExecGuard {
     EXTERNAL_EXEC_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
-    ExternalExecGuard
+    if journaled {
+        EXTERNAL_EXEC_JOURNALED.fetch_add(1, Ordering::SeqCst);
+    }
+    ExternalExecGuard { journaled }
 }
 
 /// Policy admission completed; the request is allowed and the exact-once
@@ -7362,7 +7371,7 @@ run `ownmesh doctor` or inspect {} ",
 ///
 /// `command.run` admission runs under the mutex; the child wait runs after
 /// the mutex is released so a child that re-enters daemon IPC cannot deadlock
-/// the device (#160). Other methods still serialize on the mutex.
+/// the device. Other methods still serialize on the mutex.
 pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
     Arc::new(move |method, params, client| {
         let runtime = Arc::clone(&runtime);
@@ -7375,15 +7384,16 @@ pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
     })
 }
 
-pub(super) fn runtime_queue_observation() -> (usize, u64) {
+pub(super) fn runtime_queue_observation() -> (usize, usize, u64) {
     (
         EXTERNAL_EXEC_IN_FLIGHT.load(Ordering::SeqCst),
+        EXTERNAL_EXEC_JOURNALED.load(Ordering::SeqCst),
         SELF_REENTRANT_REFUSALS.load(Ordering::SeqCst),
     )
 }
 
 /// Admit under the runtime mutex, run non-elevated `command.run` without it,
-/// then reacquire only to finalize the exact-once journal marker (#160).
+/// then reacquire only to finalize the exact-once journal marker.
 pub async fn dispatch_unlocked(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     method: &str,
@@ -7415,8 +7425,8 @@ pub async fn dispatch_unlocked(
     match outcome {
         DispatchOutcome::Done(result) => result,
         DispatchOutcome::Execute(admitted) => {
-            let _inflight = acquire_external_exec();
             let admitted = *admitted;
+            let _inflight = acquire_external_exec(admitted.work.journal_key.is_some());
             let executed = execute_admitted_exec(&admitted).await;
             let mut guard = runtime.lock().await;
             guard.finalize_allowed(admitted.work, executed)
@@ -8110,17 +8120,11 @@ fn same_file_as_any(
 }
 
 /// Refuse an execution request that would run an OwnMesh binary which
-/// re-enters this daemon's IPC (#160).
+/// re-enters this daemon's IPC.
 ///
-/// The daemon holds one global runtime mutex across a `command.run` child's
-/// full lifetime. A child that synchronously calls back into daemon IPC waits
-/// for that same mutex, so neither side can progress and every later request
-/// for the device queues behind the deadlock — one permitted command makes the
-/// whole device look broken.
-///
-/// This is a bounded pre-spawn guard, not the concurrency fix: it cannot see
-/// an OwnMesh CLI call inside a shell string or a script, which is why the
-/// runtime lock still must not be held across arbitrary child work.
+/// Bounded pre-spawn guard: it cannot see an OwnMesh CLI call inside a shell
+/// string or a script, so the runtime lock still must not be held across
+/// arbitrary child work.
 fn reject_self_reentrant_ownmesh_exec(program: &str, args: &[String]) -> IpcResult<()> {
     let path = Path::new(program);
     if !path.is_absolute() {
@@ -11641,10 +11645,8 @@ mod broker_intent_tests {
         }
     }
 
-    /// #160: a long `command.run` must release the runtime mutex so an
-    /// unrelated filesystem/diagnosis request can complete before the child
-    /// exits. Holding the mutex across `sleep` is the original device-wide
-    /// stall.
+    /// A long `command.run` must release the runtime mutex so an unrelated
+    /// filesystem request can complete while the child is still running.
     #[cfg(unix)]
     #[tokio::test]
     async fn command_run_does_not_hold_the_runtime_lock_across_child_wait() {
@@ -11653,32 +11655,48 @@ mod broker_intent_tests {
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
         runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
         let runtime = Arc::new(Mutex::new(runtime));
-        let client = ClientIdentity::new("exec-unlock-test", "test");
         let sleep = if Path::new("/bin/sleep").is_file() {
             "/bin/sleep"
         } else {
             "/usr/bin/sleep"
         };
-        let exec = dispatch_unlocked(
-            &runtime,
-            methods::OPS_EXEC,
-            Some(json!({
-                "program": sleep,
-                "args": ["2"],
-                "kind": "structured",
-                "workspace_id": "ws_default",
-                "timeout_ms": 5_000,
-                "idempotency_key": "unlock_sleep_1",
-            })),
-            &client,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let runtime_for_exec = Arc::clone(&runtime);
+        let client_for_exec = ClientIdentity::new("exec-unlock-test", "test");
+        let sleep_path = sleep.to_string();
+        let exec = tokio::spawn(async move {
+            dispatch_unlocked(
+                &runtime_for_exec,
+                methods::OPS_EXEC,
+                Some(json!({
+                    "program": sleep_path,
+                    "args": ["2"],
+                    "kind": "structured",
+                    "workspace_id": "ws_default",
+                    "timeout_ms": 5_000,
+                    "idempotency_key": "unlock_sleep_1",
+                })),
+                &client_for_exec,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+        let wait_started = std::time::Instant::now();
+        loop {
+            if runtime_queue_observation().0 > 0 {
+                break;
+            }
+            assert!(
+                wait_started.elapsed() < std::time::Duration::from_secs(2),
+                "command.run never became an unlocked in-flight exec"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let probe = ClientIdentity::new("exec-unlock-probe", "test");
         let started = std::time::Instant::now();
         let listed = dispatch_unlocked(
             &runtime,
@@ -11687,7 +11705,7 @@ mod broker_intent_tests {
                 "path": "",
                 "workspace_id": "ws_default",
             })),
-            &client,
+            &probe,
             None,
             None,
             None,
@@ -11698,12 +11716,16 @@ mod broker_intent_tests {
         .await
         .expect("filesystem list must not wait for the sleep child");
         assert!(
+            !exec.is_finished(),
+            "fs.list must overlap the still-running sleep child"
+        );
+        assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
             "unrelated fs.list waited on command.run: {:?}",
             started.elapsed()
         );
         assert_eq!(listed.get("approval_required"), Some(&json!(false)));
-        let exec_result = exec.await.expect("sleep must complete");
+        let exec_result = exec.await.expect("join exec").expect("sleep must complete");
         assert_eq!(exec_result.get("approval_required"), Some(&json!(false)));
     }
 

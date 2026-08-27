@@ -13,8 +13,9 @@
   (#160, [ADR 0015](docs/adr/0015-runtime-lock-released-across-command-wait.md)).
   The pre-spawn `OWNMESH_E_SELF_REENTRANT_EXEC` guard remains. `system.diagnose`
   adds a bounded `runtime_queue` check (`idle` / `executing` /
-  `self_reentrant_exec`) without argv, paths, or output, and a live unlocked
-  exec's journal marker is not reported as a stuck receipt.
+  `self_reentrant_exec`) without argv, paths, or output. A live unlocked exec
+  that reserved a journal marker is not reported as a stuck receipt; a leftover
+  marker plus a keyless in-flight exec stays visible.
 - `session.open` will not commit `state=running` unless the OS reports the
   attested child as still running. A short-lived process that is already a
   zombie at the attestation barrier is rolled back instead of poisoning later
@@ -22,9 +23,10 @@
 - The Windows portable installer polls authenticated `ownmesh --json status`
   until `daemon.version` matches the installed CLI, using the same 20 s
   bounded deadline as `ownmesh update`. A healthy daemon that needs more than
-  500 ms no longer triggers binary rollback. A scheduled-task action that
-  fails with a locale-independent COM last-run result fails immediately
-  (#154).
+  500 ms no longer triggers binary rollback. A leftover Task Scheduler
+  `LastTaskResult` while the task is READY is not this instance; a terminal
+  COM result fails the installer only after this instance was observed
+  running, or when the task is disabled (#154).
 - Setup, `ownmesh doctor`, and the TUI Repair Agent path inspect the same
   config/state/runtime ancestor custody walk the Agent uses at start. A
   group-writable parent such as `~/.local/state` is a dedicated

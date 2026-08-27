@@ -872,7 +872,47 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertGreaterEqual(elapsed, 1.8)
             self.assertLess(elapsed, 6)
 
-    def test_windows_ps1_terminal_task_failure_fails_immediately(self) -> None:
+    def test_windows_ps1_disabled_task_fails_immediately(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-disabled-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=8,
+                poll_milliseconds=200,
+                task_run_ps="@{ State = 1; LastTaskResult = 2147942402 }",
+            )
+            elapsed = time.monotonic() - started
+            combined = completed.stdout + completed.stderr
+            self.assertNotEqual(completed.returncode, 0, combined)
+            self.assertIn("Scheduled task is disabled", combined)
+            self.assertLess(elapsed, 2)
+
+    def test_windows_ps1_ready_stale_last_result_still_waits_for_status(self) -> None:
+        """READY + leftover LastTaskResult is the previous run, not this instance."""
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-stale-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=800
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=5,
+                poll_milliseconds=100,
+                task_run_ps="@{ State = 3; LastTaskResult = 2147942402 }",
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            self.assertIn("ready elapsed_ms=", combined)
+            self.assertGreaterEqual(elapsed_ms, 800)
+            self.assertLess(elapsed_ms, 5000)
+
+    def test_windows_ps1_terminal_task_failure_after_running_fails(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ownmesh-ready-taskfail-") as tmp:
             stub = self._write_status_stub(
                 Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
@@ -883,7 +923,14 @@ class InstallerAdversarialTests(unittest.TestCase):
                 expected_version="1.2.23",
                 timeout_seconds=8,
                 poll_milliseconds=200,
-                task_run_ps="@{ State = 3; LastTaskResult = 2147942402 }",
+                task_run_ps=(
+                    "if (-not (Test-Path variable:script:OwnMeshTaskPoll)) "
+                    "{ $script:OwnMeshTaskPoll = 0 }; "
+                    "$script:OwnMeshTaskPoll++; "
+                    "if ($script:OwnMeshTaskPoll -eq 1) "
+                    "{ return @{ State = 4; LastTaskResult = 267009 } }; "
+                    "return @{ State = 3; LastTaskResult = 2147942402 }"
+                ),
             )
             elapsed = time.monotonic() - started
             combined = completed.stdout + completed.stderr

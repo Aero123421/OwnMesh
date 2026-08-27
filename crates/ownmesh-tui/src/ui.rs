@@ -954,6 +954,34 @@ fn localized(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustodyRepairPrompt {
+    Empty,
+    ChmodOwnedOnly,
+    ChmodOwnedAndRemainder,
+    RemediationOnly,
+}
+
+fn custody_repair_prompt(
+    issues: &[(String, ownmesh_ipc::CustodyAncestorIssue)],
+    uid: u32,
+) -> CustodyRepairPrompt {
+    if issues.is_empty() {
+        return CustodyRepairPrompt::Empty;
+    }
+    let owned_replacement = issues.iter().any(|(_, issue)| {
+        issue.kind == ownmesh_ipc::CustodyIssueKind::ReplacementPermitted && issue.uid == uid
+    });
+    let remainder = issues.iter().any(|(_, issue)| {
+        issue.kind != ownmesh_ipc::CustodyIssueKind::ReplacementPermitted || issue.uid != uid
+    });
+    match (owned_replacement, remainder) {
+        (true, false) => CustodyRepairPrompt::ChmodOwnedOnly,
+        (true, true) => CustodyRepairPrompt::ChmodOwnedAndRemainder,
+        (false, _) => CustodyRepairPrompt::RemediationOnly,
+    }
+}
+
 fn draw_custody_repair_modal(frame: &mut Frame<'_>, app: &App) {
     let area = centered_fixed(frame.area(), 76, 16);
     frame.render_widget(Clear, area);
@@ -969,14 +997,38 @@ fn draw_custody_repair_modal(frame: &mut Frame<'_>, app: &App) {
             " Агент не запускается ",
         ));
     let uid = ownmesh_ipc::process_euid();
+    let prompt = custody_repair_prompt(&app.custody_repair, uid);
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(localized(
-        app.lang,
-        "A parent directory of OwnMesh state is group/other-writable. Starting the service will keep failing until that ancestor is fixed. OwnMesh will not chmod recursively.",
-        "OwnMesh状態の親ディレクトリがグループ書き込み可能です。直すまでサービス開始は失敗し続けます。再帰的なchmodはしません。",
-        "OwnMesh 状态目录的父目录对组可写。修复前服务会一直启动失败。不会递归 chmod。",
-        "Родитель каталога состояния OwnMesh доступен группе на запись. Запуск будет падать, пока это не исправят. Рекурсивный chmod не выполняется.",
-    )));
+    lines.push(Line::from(match prompt {
+        CustodyRepairPrompt::Empty => localized(
+            app.lang,
+            "OwnMesh could not confirm ancestor custody. Starting the service will keep failing until this is fixed.",
+            "祖先custodyを確認できませんでした。直すまでサービス開始は失敗し続けます。",
+            "无法确认祖先目录托管。修复前服务会一直启动失败。",
+            "Не удалось проверить custody предков. Запуск будет падать, пока это не исправят.",
+        ),
+        CustodyRepairPrompt::ChmodOwnedOnly => localized(
+            app.lang,
+            "A parent directory of OwnMesh state is group/other-writable. Starting the service will keep failing until that ancestor is fixed. OwnMesh will not chmod recursively.",
+            "OwnMesh状態の親ディレクトリがグループ書き込み可能です。直すまでサービス開始は失敗し続けます。再帰的なchmodはしません。",
+            "OwnMesh 状态目录的父目录对组可写。修复前服务会一直启动失败。不会递归 chmod。",
+            "Родитель каталога состояния OwnMesh доступен группе на запись. Запуск будет падать, пока это не исправят. Рекурсивный chmod не выполняется.",
+        ),
+        CustodyRepairPrompt::ChmodOwnedAndRemainder => localized(
+            app.lang,
+            "Some listed ancestors you own can have group/other write cleared; others need the listed remediation. OwnMesh will not chmod recursively or chmod a directory it does not own.",
+            "所有する列挙パスはグループ書き込みを外せますが、残りは列挙の修復手順が必要です。再帰chmodや非所有ディレクトリのchmodはしません。",
+            "您拥有的已列祖先可清除组/其他写权限，其余请按列出的修复步骤处理。不会递归 chmod，也不会 chmod 非本人目录。",
+            "С ваших перечисленных предков можно снять group/other write; остальные — по указанному исправлению. Рекурсивный chmod и chmod чужих каталогов не выполняются.",
+        ),
+        CustodyRepairPrompt::RemediationOnly => localized(
+            app.lang,
+            "Listed ancestors block Agent start. OwnMesh will not chmod a directory it does not own. Use the listed remediation.",
+            "列挙の祖先がAgent開始を止めています。非所有ディレクトリはchmodしません。列挙の修復手順を使ってください。",
+            "列出的祖先阻止代理启动。不会 chmod 非本人目录。请使用列出的修复步骤。",
+            "Перечисленные предки блокируют запуск агента. OwnMesh не делает chmod чужих каталогов. Используйте указанное исправление.",
+        ),
+    }));
     lines.push(Line::from(""));
     if let Some(error) = &app.custody_repair_error {
         lines.push(Line::from(error.as_str()));
@@ -995,13 +1047,36 @@ fn draw_custody_repair_modal(frame: &mut Frame<'_>, app: &App) {
         lines.push(Line::from("(no findings)"));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(localized(
-        app.lang,
-        "Enter: remove group/other write on listed directories you own, then start Agent. Esc: cancel.",
-        "Enter: 所有する列挙ディレクトリのグループ/その他書き込みを外してAgentを開始。Esc: キャンセル。",
-        "Enter：仅清除您拥有的已列目录的组/其他写权限并启动代理。Esc：取消。",
-        "Enter: снять group/other write с перечисленных каталогов, которыми вы владеете, затем запустить агент. Esc: отмена.",
-    )));
+    lines.push(Line::from(match prompt {
+        CustodyRepairPrompt::Empty => localized(
+            app.lang,
+            "Esc: cancel.",
+            "Esc: キャンセル。",
+            "Esc：取消。",
+            "Esc: отмена.",
+        ),
+        CustodyRepairPrompt::ChmodOwnedOnly => localized(
+            app.lang,
+            "Enter: remove group/other write on listed directories you own, then start Agent. Esc: cancel.",
+            "Enter: 所有する列挙ディレクトリのグループ/その他書き込みを外してAgentを開始。Esc: キャンセル。",
+            "Enter：仅清除您拥有的已列目录的组/其他写权限并启动代理。Esc：取消。",
+            "Enter: снять group/other write с перечисленных каталогов, которыми вы владеете, затем запустить агент. Esc: отмена.",
+        ),
+        CustodyRepairPrompt::ChmodOwnedAndRemainder => localized(
+            app.lang,
+            "Enter: clear group/other write only on listed directories you own. Remaining findings need the listed remediation. Esc: cancel.",
+            "Enter: 所有するディレクトリのグループ/その他書き込みだけ外す。残りは列挙の修復手順。Esc: キャンセル。",
+            "Enter：仅清除您拥有的已列目录的组/其他写权限。其余请按列出的修复步骤处理。Esc：取消。",
+            "Enter: снять group/other write только с ваших каталогов. Остальные находки — по указанному исправлению. Esc: отмена.",
+        ),
+        CustodyRepairPrompt::RemediationOnly => localized(
+            app.lang,
+            "Enter cannot change these paths. Use the listed remediation. Esc: cancel.",
+            "Enterではこれらのパスは変えられません。列挙の修復手順を使ってください。Esc: キャンセル。",
+            "Enter 无法更改这些路径。请使用列出的修复步骤。Esc：取消。",
+            "Enter не меняет эти пути. Используйте указанное исправление. Esc: отмена.",
+        ),
+    }));
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
         .style(app.theme.body)
@@ -1725,5 +1800,68 @@ mod tests {
         app.replace_device_inventory(crate::control_plane::DeviceInventory::NotConfigured);
         let missing = render_snapshot(&app, MIN_COLS, MIN_ROWS).to_ascii_lowercase();
         assert!(missing.contains("not configured"));
+    }
+
+    fn ancestor_issue(
+        uid: u32,
+        kind: ownmesh_ipc::CustodyIssueKind,
+    ) -> ownmesh_ipc::CustodyAncestorIssue {
+        ownmesh_ipc::CustodyAncestorIssue {
+            path: std::path::PathBuf::from("/tmp/ownmesh-ancestor"),
+            uid,
+            mode: 0o775,
+            kind,
+        }
+    }
+
+    #[test]
+    fn custody_repair_prompt_does_not_treat_unowned_replacement_as_local_chmod() {
+        let euid = ownmesh_ipc::process_euid();
+        let owned = vec![(
+            "state".into(),
+            ancestor_issue(euid, ownmesh_ipc::CustodyIssueKind::ReplacementPermitted),
+        )];
+        assert_eq!(
+            custody_repair_prompt(&owned, euid),
+            CustodyRepairPrompt::ChmodOwnedOnly
+        );
+        let foreign_uid = euid.wrapping_add(1);
+        let unowned_replacement = vec![(
+            "state".into(),
+            ancestor_issue(
+                foreign_uid,
+                ownmesh_ipc::CustodyIssueKind::ReplacementPermitted,
+            ),
+        )];
+        assert_eq!(
+            custody_repair_prompt(&unowned_replacement, euid),
+            CustodyRepairPrompt::RemediationOnly
+        );
+        let untrusted = vec![(
+            "state".into(),
+            ancestor_issue(foreign_uid, ownmesh_ipc::CustodyIssueKind::UntrustedOwner),
+        )];
+        assert_eq!(
+            custody_repair_prompt(&untrusted, euid),
+            CustodyRepairPrompt::RemediationOnly
+        );
+        let mixed = vec![
+            (
+                "state".into(),
+                ancestor_issue(euid, ownmesh_ipc::CustodyIssueKind::ReplacementPermitted),
+            ),
+            (
+                "config".into(),
+                ancestor_issue(
+                    foreign_uid,
+                    ownmesh_ipc::CustodyIssueKind::ReplacementPermitted,
+                ),
+            ),
+        ];
+        assert_eq!(
+            custody_repair_prompt(&mixed, euid),
+            CustodyRepairPrompt::ChmodOwnedAndRemainder
+        );
+        assert_eq!(custody_repair_prompt(&[], euid), CustodyRepairPrompt::Empty);
     }
 }

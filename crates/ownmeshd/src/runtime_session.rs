@@ -269,7 +269,8 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
         // but are not searched mean installed CLIs appear not-installed.
         let profile_discovery = profile_discovery_health();
         let credential_store = credential_store_health(&self.paths);
-        let (in_flight_external, self_reentrant_refusals) = super::runtime_queue_observation();
+        let (in_flight_external, in_flight_journaled, self_reentrant_refusals) =
+            super::runtime_queue_observation();
         let mut payload = system_diagnosis_payload(
             &observed_at,
             SystemDiagnosisFacts {
@@ -295,6 +296,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 credential_store,
                 agent_route: self.agent_route_presence(),
                 in_flight_external,
+                in_flight_journaled,
                 self_reentrant_refusals,
             },
         );
@@ -806,11 +808,9 @@ install it or use an explicit path. {}",
                 };
                 let (child_pid, child_process_birth) = match (status.pid, status.process_birth_id) {
                     (Some(pid), Some(birth)) if !status.exited => {
-                        // #31: supervisor `exited=false` is not enough. A
-                        // zombie keeps its PID and start time, so a birth
-                        // witness still matches while the child is already
-                        // dead. Committing `running` here is how a
-                        // `/bin/true` session poisoned later open/replay/close.
+                        // Supervisor `exited=false` still matches a zombie birth
+                        // witness; require a live `running_process_birth_id`
+                        // before committing `running`.
                         match ownmesh_ipc::running_process_birth_id(pid) {
                             Ok(Some(observed)) if observed == birth => (pid, birth),
                             _ => {
@@ -3132,8 +3132,10 @@ struct SystemDiagnosisFacts {
     /// condition the control plane reports to MCP clients as
     /// `connection_status`. `None` means not wired (unknown), e.g. unit tests.
     agent_route: Option<&'static str>,
-    /// `command.run` executions waiting outside the runtime mutex (#160).
+    /// `command.run` executions waiting outside the runtime mutex.
     in_flight_external: usize,
+    /// Subset of `in_flight_external` that reserved an exact-once journal marker.
+    in_flight_journaled: usize,
     /// Pre-spawn self-reentrancy refusals since process start. Counter only;
     /// never argv, paths, or output.
     self_reentrant_refusals: u64,
@@ -3304,13 +3306,9 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     // to replay, compact, or evict. They must never be reported healthy, even
     // when the journal is far below capacity.
     //
-    // P0-B review: durable `in_progress` markers are equally actionable when
-    // they are *not* accounted for by a live unlocked `command.run`. Admission
-    // reserves the marker, then releases the runtime mutex for the child wait
-    // (#160), so a diagnosis can run concurrently and must not treat that live
-    // marker as a stuck receipt. Markers beyond the live in-flight count still
-    // belong to a failed or crashed run whose key is permanently
-    // non-replayable.
+    // Durable `in_progress` markers are stuck unless a live unlocked exec
+    // reserved that marker. Subtract only journaled in-flight execs so a
+    // leftover key plus a keyless command stays visible.
     let op_status = if facts.op_journal_degraded {
         "degraded"
     } else if facts.op_journal_entries >= super::MAX_OP_JOURNAL_ENTRIES
@@ -3352,7 +3350,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "op_journal_uncertain"
     } else if facts
         .op_journal_in_progress
-        .saturating_sub(facts.in_flight_external)
+        .saturating_sub(facts.in_flight_journaled)
         > 0
     {
         "op_journal_in_progress"
@@ -3434,11 +3432,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "stale_count": facts.stale_sessions,
             },
             {
-                // #160: bounded runtime-queue observation. Never includes argv,
-                // paths, environment, or user output. `executing` is a live
-                // unlocked command.wait, not a deadlock; `self_reentrant_exec`
-                // records that the pre-spawn guard refused an OwnMesh CLI
-                // re-entry at least once this process.
+                // Bounded runtime-queue observation. Never includes argv,
+                // paths, environment, or user output.
                 "id": "runtime_queue",
                 "status": if facts.in_flight_external > 0 || facts.self_reentrant_refusals > 0 {
                     "warn"
@@ -3521,6 +3516,7 @@ mod system_diagnosis_tests {
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
             in_flight_external: 0,
+            in_flight_journaled: 0,
             self_reentrant_refusals: 0,
         };
         let value = system_diagnosis_payload("2026-08-25T00:00:00Z", facts);
@@ -3644,6 +3640,7 @@ mod system_diagnosis_tests {
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
             in_flight_external: 0,
+            in_flight_journaled: 0,
             self_reentrant_refusals: 0,
         };
         let cases = [
@@ -3738,6 +3735,7 @@ mod system_diagnosis_tests {
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
             in_flight_external: 0,
+            in_flight_journaled: 0,
             self_reentrant_refusals: 0,
         };
 
@@ -3845,11 +3843,9 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["op_journal"]["status"], "degraded");
         assert_eq!(value["journals"]["op_journal"]["degraded"], true);
 
-        // P0-B review: a durable in-progress marker means an operation never
-        // reached its completed receipt (failed or crashed after reserving
-        // the key) *unless* a live unlocked command.run currently accounts
-        // for it (#160). A leftover marker is uncertain and permanently
-        // non-replayable, so it must NOT be reported healthy.
+        // A leftover in-progress marker is not healthy. A live unlocked exec
+        // that reserved that marker is not stuck; a keyless in-flight exec
+        // must not hide a leftover key.
         let value = system_diagnosis_payload(
             "2026-08-13T00:00:00Z",
             SystemDiagnosisFacts {
@@ -3865,19 +3861,30 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["op_journal"]["status"], "warn");
         assert_eq!(value["journals"]["op_journal"]["in_progress"], 1);
         assert_eq!(value["journals"]["op_journal"]["uncertain"], 0);
-        // A live unlocked exec's reserved marker is not a stuck receipt.
         let value = system_diagnosis_payload(
             "2026-08-13T00:00:00Z",
             SystemDiagnosisFacts {
                 op_journal_entries: 1,
                 op_journal_in_progress: 1,
                 in_flight_external: 1,
+                in_flight_journaled: 1,
                 ..healthy.clone()
             },
         );
         assert_eq!(value["overall"], "healthy");
         assert_eq!(value["checks"][6]["id"], "runtime_queue");
         assert_eq!(value["checks"][6]["state"], "executing");
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: 1,
+                op_journal_in_progress: 1,
+                in_flight_external: 1,
+                in_flight_journaled: 0,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "op_journal_in_progress");
         // It stays distinct from the uncertain class.
         let value = system_diagnosis_payload(
             "2026-08-13T00:00:00Z",
@@ -3935,6 +3942,7 @@ mod system_diagnosis_tests {
             credential_store: ("warn", Some("preferred(encrypted-file)".into()), 1),
             agent_route: None,
             in_flight_external: 0,
+            in_flight_journaled: 0,
             self_reentrant_refusals: 0,
         };
         let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);

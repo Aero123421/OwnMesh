@@ -45,9 +45,9 @@ moves off the mutex.
 5. **The self-reentrant pre-spawn guard stays.** A typed refusal is still
    better than spawning a known-deadly child. `system.diagnose` exposes a
    bounded `runtime_queue` check (`idle` / `executing` / `self_reentrant_exec`)
-   without argv, paths, environment, or user output. A live unlocked exec's
-   journal marker is subtracted from `op_journal_in_progress` so diagnosis
-   during a command is not reported as a stuck receipt.
+   without argv, paths, environment, or user output. Diagnosis subtracts only
+   unlocked execs that reserved a journal marker, so a leftover marker plus a
+   keyless exec stays visible as stuck.
 
 ## Consequences
 

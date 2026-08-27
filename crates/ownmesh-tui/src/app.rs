@@ -169,7 +169,7 @@ pub enum Overlay {
     Help,
     Wizard,
     Connector,
-    /// Ancestor custody is blocking Agent start (#168). Details live on `App`.
+    /// Ancestor custody is blocking Agent start. Details live on `App`.
     CustodyRepair,
 }
 
@@ -199,7 +199,7 @@ pub struct App {
     pub device_inventory: DeviceInventory,
     pending_setup: Option<SetupRequest>,
     pending_reauthentication: bool,
-    /// Blocking ancestor-custody findings for Overlay::CustodyRepair (#168).
+    /// Blocking ancestor-custody findings for Overlay::CustodyRepair.
     pub custody_repair: Vec<(String, ownmesh_ipc::CustodyAncestorIssue)>,
     pub custody_repair_error: Option<String>,
 }
@@ -507,10 +507,17 @@ impl App {
             }
             Ok(remaining) => {
                 self.custody_repair = remaining;
-                Err(
-                    "group/other write was cleared on owned directories, but another ancestor still blocks Agent start"
-                        .into(),
-                )
+                if changed.is_empty() {
+                    Err(
+                        "listed ancestors still block Agent start; group/other write was not cleared (untrusted owner or sticky-child is not a chmod-g-w case)"
+                            .into(),
+                    )
+                } else {
+                    Err(format!(
+                        "updated {}, but another ancestor still blocks Agent start",
+                        changed.join(", ")
+                    ))
+                }
             }
             Err(error) => Err(error.to_string()),
         }
@@ -547,10 +554,7 @@ impl App {
                     self.custody_repair = issues;
                     self.custody_repair_error = None;
                     self.overlay = Overlay::CustodyRepair;
-                    return Err(
-                        "Agent cannot start until listed ancestors no longer permit replacement"
-                            .into(),
-                    );
+                    return Err("Agent cannot start until listed ancestors are fixed".into());
                 }
                 Err(error) => return Err(error.to_string()),
             }

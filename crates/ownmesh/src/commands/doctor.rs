@@ -204,7 +204,7 @@ fn observe_config(paths: &OwnMeshPaths) -> ConfigObservation {
     obs
 }
 
-/// Same ancestor walk the Agent uses at start (#168). Read-only.
+/// Same ancestor walk the Agent uses at start. Read-only.
 pub(crate) fn observe_layout_custody(paths: &OwnMeshPaths) -> LayoutCustodyObservation {
     let roots = [
         ("config", paths.config_dir.as_path()),
@@ -258,11 +258,17 @@ pub(crate) fn preflight_layout_custody(paths: &OwnMeshPaths) -> Result<(), Strin
     if observed.findings.is_empty() {
         return Ok(());
     }
-    let mut lines = vec![
-        "Agent cannot start: a config/state/runtime ancestor permits replacement by another user."
-            .into(),
-        "OwnMesh will not chmod a shared parent without an explicit per-path confirmation, and never recursively.".into(),
-    ];
+    let mut lines =
+        vec!["Agent cannot start until listed config/state/runtime ancestors are fixed.".into()];
+    if observed
+        .findings
+        .iter()
+        .any(|finding| finding.kind == "replacement_permitted")
+    {
+        lines.push(
+            "OwnMesh will not chmod a shared parent without an explicit per-path confirmation, and never recursively.".into(),
+        );
+    }
     for finding in &observed.findings {
         lines.push(format!(
             "  [{}] {} mode={:04o} uid={}: {}",
