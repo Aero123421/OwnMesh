@@ -115,7 +115,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use structured_adapter::StructuredAdapterDriver;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Semaphore};
 use uuid::Uuid;
 
 /// Session IPC method names (owned here; ipc crate methods table is ms1-stable).
@@ -776,39 +776,15 @@ impl Drop for DetachedCommandGuard {
 /// That mutex used to serialize child execution to exactly one command at a
 /// time — the same property that let one self-reentrant child stall every
 /// later request for the device. Releasing it removes that accidental
-/// ceiling, so an explicit fail-closed one replaces it rather than leaving
-/// child spawning unbounded.
+/// ceiling, so an explicit bound replaces it rather than letting remote
+/// requests spawn children without limit.
+///
+/// A command over the bound waits rather than failing: the permit is taken
+/// *after* the mutex is released, so waiting here delays only other commands
+/// and never an unrelated request, and a transient capacity condition does
+/// not burn the caller's idempotency key on a terminal failure receipt.
 const MAX_OFF_LOCK_EXECUTIONS: usize = 8;
-static OFF_LOCK_EXECUTIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-
-struct OffLockExecutionGuard;
-
-impl Drop for OffLockExecutionGuard {
-    fn drop(&mut self) {
-        OFF_LOCK_EXECUTIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-fn acquire_off_lock_execution_slot() -> IpcResult<OffLockExecutionGuard> {
-    loop {
-        let n = OFF_LOCK_EXECUTIONS_IN_FLIGHT.load(Ordering::SeqCst);
-        if n >= MAX_OFF_LOCK_EXECUTIONS {
-            return Err(IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: format!(
-                    "concurrent command cap reached ({MAX_OFF_LOCK_EXECUTIONS}); wait for an \
-in-flight command to finish or cancel one"
-                ),
-            });
-        }
-        if OFF_LOCK_EXECUTIONS_IN_FLIGHT
-            .compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return Ok(OffLockExecutionGuard);
-        }
-    }
-}
+static OFF_LOCK_EXECUTION_SLOTS: Semaphore = Semaphore::const_new(MAX_OFF_LOCK_EXECUTIONS);
 
 /// Commit step for an operation whose execution was moved off the runtime
 /// mutex. Applied in push order — innermost admission layer first — once the
@@ -835,7 +811,6 @@ struct OffLockCommandPlan {
     workspace_id: Option<String>,
     detach: bool,
     _detached_slot: Option<DetachedCommandGuard>,
-    _execution_slot: OffLockExecutionGuard,
 }
 
 /// Everything [`DaemonRuntime::finish_approved_operation`] needs to commit an
@@ -884,8 +859,15 @@ async fn run_off_lock_command_plan(plan: OffLockCommandPlan) -> IpcResult<Value>
         workspace_id,
         detach,
         _detached_slot,
-        _execution_slot,
     } = plan;
+    let _execution_slot =
+        OFF_LOCK_EXECUTION_SLOTS
+            .acquire()
+            .await
+            .map_err(|_| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "command execution capacity is unavailable".into(),
+            })?;
     let result = Box::pin(run_prepared_command_cancellable(
         &request, prepared, None, cancel,
     ))
@@ -2570,6 +2552,51 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         Ok(body)
     }
 
+    /// Restore this operation's own journal entry from a pre-execution
+    /// snapshot.
+    ///
+    /// #160: assigning the whole snapshot back would also revert entries an
+    /// unrelated operation committed while this command's child ran with the
+    /// runtime mutex released. Only the key this operation reserved is its own
+    /// to roll back; with nothing else interleaved the two are equivalent.
+    fn restore_op_journal_entry(
+        &mut self,
+        key: Option<&String>,
+        snapshot: &HashMap<String, Value>,
+    ) {
+        let Some(key) = key else {
+            return;
+        };
+        match snapshot.get(key) {
+            Some(previous) => {
+                self.op_journal.insert(key.clone(), previous.clone());
+            }
+            None => {
+                self.op_journal.remove(key);
+            }
+        }
+    }
+
+    /// Restore one approval record from a snapshot, for the same reason as
+    /// [`Self::restore_op_journal_entry`]. An approval bridge's durably
+    /// completed *target* is deliberately left alone: only the outer record
+    /// this call owns is reverted.
+    fn restore_approval_record(
+        &mut self,
+        approval_id: &str,
+        snapshot: &HashMap<String, ApprovalRecord>,
+    ) {
+        match snapshot.get(approval_id) {
+            Some(previous) => {
+                self.approvals
+                    .insert(approval_id.to_owned(), previous.clone());
+            }
+            None => {
+                self.approvals.remove(approval_id);
+            }
+        }
+    }
+
     /// Attach a commit step to the execution captured during this admission
     /// pass (#160). Finalizers run innermost-first once the runtime mutex is
     /// reacquired. A no-op when nothing was deferred.
@@ -2746,7 +2773,6 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // is borrowed from `self` for the whole run and cannot leave with the
         // plan.
         if self.off_lock_execution_claimed && !use_exec_journal {
-            let execution_slot = acquire_off_lock_execution_slot()?;
             self.off_lock_execution = Some(OffLockExecution {
                 plan: OffLockCommandPlan {
                     request: req,
@@ -2755,7 +2781,6 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                     workspace_id: p.workspace_id.clone(),
                     detach: p.detach,
                     _detached_slot: detached_slot,
-                    _execution_slot: execution_slot,
                 },
                 finalizers: Vec::new(),
             });
@@ -4638,8 +4663,8 @@ path or install the tool so detection and execution agree",
 
         if let Err(e) = self.store_idempotent(idem_key.as_ref(), &body) {
             if !is_approval_bridge {
-                self.op_journal = executing_op_journal;
-                self.approvals = executing_approvals;
+                self.restore_op_journal_entry(idem_key.as_ref(), &executing_op_journal);
+                self.restore_approval_record(&approval_id, &executing_approvals);
             }
             return Err(e);
         }
@@ -4653,7 +4678,10 @@ path or install the tool so detection and execution agree",
             // The operation ran. Keep the durable and in-memory non-retriable
             // marker rather than pretending this approval is pending again. A
             // successfully persisted op-journal completion remains usable.
-            self.approvals = post_execution_approvals.unwrap_or(executing_approvals);
+            let source = post_execution_approvals
+                .as_ref()
+                .unwrap_or(&executing_approvals);
+            self.restore_approval_record(&approval_id, source);
             return Err(e);
         }
 
@@ -7504,6 +7532,10 @@ pub async fn dispatch_off_lock(
     debug_assert!(
         admitted.is_err(),
         "a deferred execution must not also produce a completed admission result"
+    );
+    debug_assert!(
+        !execution.finalizers.is_empty(),
+        "a deferred execution must carry the commit step of the admission that captured it"
     );
     drop(guard);
     let OffLockExecution { plan, finalizers } = execution;

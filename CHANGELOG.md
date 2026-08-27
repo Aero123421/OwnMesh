@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+Continues the availability work from v1.2.23. These entries do not claim every
+acceptance criterion of the issues they reference is complete; what remains is
+named below and stays tracked in those issues.
+
+### Device availability
+
+- A running command no longer holds the daemon's runtime mutex. The daemon kept
+  one `Mutex<DaemonRuntime>` for a child's whole lifetime, so a remotely
+  launched child that synchronously re-entered daemon IPC waited on the lock its
+  own parent held, and every later filesystem, Git, session, diagnosis, and
+  command request for that device queued behind it until the first operation was
+  cancelled by hand. Admission — revocation, lockdown, policy, grants,
+  executable custody, the exact-once journal reservation — still runs under the
+  mutex and now ends by capturing an immutable, authority-bound execution plan;
+  the guard is released, the child is spawned and awaited, and the mutex is
+  reacquired only for that operation's own commit step. Exact-once binding is
+  unchanged: the reservation is written before execution and stays in progress
+  while the child runs, so a concurrent replay of the same key is refused as
+  uncertain exactly as during an inline run. Concurrent children are bounded by
+  an explicit fail-closed cap, because the mutex used to bound them to one.
+  Elevated broker execution and persistent-session/PTY host waits still hold the
+  mutex, so #160 stays open for them.
+- A session child that exits but has not been reaped is attested as exited.
+  `StructuredProcessHost::is_exited` requires both output streams at EOF *and* a
+  reaped child and short-circuits on the first, so a child that exited while a
+  descendant still held its stdout/stderr open never reached the reap and kept
+  its PID slot and kernel start time. The supervisor therefore attested
+  `exited: false` for a process that was already gone, `session.open` published a
+  durable `running` record for it, and `close` answered "authenticated child is
+  still alive, refusing PID-only termination". Structured pipes are the
+  official-profile transport, which is where this was first reported.
+  PID-reuse protection is unchanged — the durable birth witness is still the
+  plain one — and an indeterminate probe is never read as exited (#31).
+
+### Installation
+
+- The Windows portable installer polls the authenticated daemon status to a
+  bounded readiness deadline instead of sleeping a fixed 500 ms and checking
+  once. A healthy daemon that needed longer to initialize — slow disk, first-run
+  state, AV scanning, a loaded CI or desktop host — was treated as a failed
+  upgrade and rolled the binaries back. IPC stays the readiness authority; the
+  wait gives up early only on authoritative terminal evidence, namely a
+  scheduled task that was registered during the wait and is now gone, decided by
+  exit code rather than by localized task-state text (#154).
+
 ## v1.2.23 — Availability, workspace authority, and dependency refresh
 
 v1.2.23 is the first formal release after v1.2.21. The v1.2.22 source train
