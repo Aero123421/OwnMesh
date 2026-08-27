@@ -472,6 +472,27 @@ pub struct DoctorInput {
     pub service: ServiceObservation,
     pub journals: JournalsObservation,
     pub profile_discovery: ProfileDiscoveryObservation,
+    /// Ancestor custody of config/state/runtime. Empty means the same walk
+    /// the Agent uses at start found no blocking ancestor.
+    pub layout_custody: LayoutCustodyObservation,
+}
+
+/// One ancestor the Agent start walk would reject.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayoutCustodyFinding {
+    pub layout: String,
+    pub path: String,
+    pub uid: u32,
+    pub mode: u32,
+    pub kind: String,
+    pub remediation: String,
+}
+
+/// Gathered ancestor-custody observation. Inspection errors are fail-closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayoutCustodyObservation {
+    pub findings: Vec<LayoutCustodyFinding>,
+    pub inspect_error: Option<String>,
 }
 
 /// True for built-in presets that deny `command.run` / `session.open`.
@@ -593,6 +614,48 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                     .unwrap_or_else(|| "config path permissions look loose".into()),
             ));
         }
+    }
+
+    // Agent start custody is independent of config-file other-write. A 0700
+    // OwnMesh directory under a group-writable ancestor still refuses to boot.
+    if let Some(error) = &input.layout_custody.inspect_error {
+        checks.push(
+            DoctorCheck::fail(
+                "layout.custody",
+                format!("could not inspect config/state/runtime ancestors: {error}"),
+            )
+            .with_detail("Agent start uses the same walk and will fail closed"),
+        );
+    } else if input.layout_custody.findings.is_empty() {
+        checks.push(DoctorCheck::pass(
+            "layout.custody",
+            "config/state/runtime ancestors satisfy Agent start custody",
+        ));
+    } else {
+        let first = &input.layout_custody.findings[0];
+        let extra = input.layout_custody.findings.len().saturating_sub(1);
+        let extra_note = if extra == 0 {
+            String::new()
+        } else {
+            format!("; {extra} additional blocking ancestor(s)")
+        };
+        let message = format!(
+            "Agent cannot start: {} {} is mode {:04o} uid {} ({}){extra_note}. {}",
+            first.layout, first.path, first.mode, first.uid, first.kind, first.remediation
+        );
+        let detail = input
+            .layout_custody
+            .findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{} {} mode={:04o} uid={} {}",
+                    finding.layout, finding.path, finding.mode, finding.uid, finding.remediation
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        checks.push(DoctorCheck::fail("layout.custody", message).with_detail(detail));
     }
 
     // Credential availability (values never appear). Do not equate the absence
@@ -1930,6 +1993,36 @@ mod tests {
             .expect("version check");
         assert_eq!(version.status, CheckStatus::Warn, "{version:?}");
         assert!(version.message.contains("omitted version"), "{version:?}");
+    }
+
+    #[test]
+    fn layout_custody_findings_are_a_blocking_check() {
+        let mut input = DoctorInput::default();
+        input.layout_custody.findings.push(LayoutCustodyFinding {
+            layout: "state".into(),
+            path: "/home/user/.local/state".into(),
+            uid: 1000,
+            mode: 0o775,
+            kind: "replacement_permitted".into(),
+            remediation: "chmod g-w,o-w /home/user/.local/state  # 0775 -> 0755; not recursive"
+                .into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "layout.custody")
+            .expect("layout.custody check");
+        assert_eq!(check.status, CheckStatus::Fail, "{check:?}");
+        assert!(
+            check.message.contains("/home/user/.local/state"),
+            "{check:?}"
+        );
+        assert!(check.message.contains("0775"), "{check:?}");
+        assert!(check.message.contains("chmod g-w,o-w"), "{check:?}");
+        assert!(!check.message.contains("keyring"), "{check:?}");
+        assert_eq!(report.outcome, DoctorOutcome::Error);
+        assert!(!report.ok);
     }
 
     #[test]

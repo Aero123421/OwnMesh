@@ -693,7 +693,13 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("Invoke-OwnMeshSchTasks", text)
         self.assertIn("Get-OwnMeshFileSha256", text)
         self.assertIn("Restore-OwnMeshBackup", text)
-        self.assertIn("Updated OwnMesh daemon version did not match the CLI", text)
+        self.assertIn("Updated OwnMesh daemon did not become ready with the expected version", text)
+        self.assertIn("Wait-OwnMeshDaemonReady", text)
+        self.assertIn("Get-OwnMeshScheduledTaskRun", text)
+        self.assertIn("OWNMESH_DAEMON_READY_TIMEOUT_SECONDS", text)
+        # A single 500 ms sleep is the race this polling replaces: a healthy
+        # daemon that needs longer must not trigger rollback (#154).
+        self.assertNotRegex(text, r"(?im)^\s*Start-Sleep\s+-Milliseconds\s+500\b")
         # Windows PowerShell 5.1 NativeCommandError must not reach schtasks.exe.
         self.assertNotRegex(text, r"(?m)^\s*& schtasks\.exe\b")
         self.assertIn('cmd.exe /c "schtasks.exe /$Action /TN `"$TaskName`" 1>nul 2>nul"', text)
@@ -747,6 +753,190 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("query-fake=", combined)
         self.assertNotIn("NativeCommandError", combined)
         self.assertNotIn("指定されたファイルが見つかりません", combined)
+
+    def _ownmesh_ready_helpers(self) -> str:
+        text = PS_INSTALLER.read_text(encoding="utf-8")
+        start = text.find("function Get-OwnMeshScheduledTaskRun")
+        self.assertNotEqual(start, -1, "Get-OwnMeshScheduledTaskRun helper is missing")
+        end = text.find("function Stop-InstalledOwnMeshProcesses", start)
+        self.assertGreater(end, start, "could not bound daemon-ready helpers")
+        return text[start:end]
+
+    def _pwsh_for_ready_fixtures(self) -> str:
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            self.skipTest("powershell not available")
+        return pwsh
+
+    def _write_status_stub(
+        self, directory: Path, *, version: str, delay_ms: int = 0, never_ready: bool = False
+    ) -> Path:
+        script = directory / "ownmesh-status-stub.py"
+        script.write_text(
+            "\n".join(
+                [
+                    "import json, os, sys, time",
+                    f"delay = {delay_ms} / 1000",
+                    "if delay:",
+                    "    time.sleep(delay)",
+                    "args = sys.argv[1:]",
+                    "if args == ['--json', 'status']:",
+                    f"    version = '0.0.0-never' if {str(never_ready)} else {version!r}",
+                    "    print(json.dumps({'schema_version': 1, 'daemon': {'version': version}}))",
+                    "    sys.exit(0)",
+                    "sys.exit(2)",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        if _is_windows():
+            stub = directory / "ownmesh.cmd"
+            stub.write_text(
+                f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n',
+                encoding="ascii",
+            )
+            return stub
+        stub = directory / "ownmesh"
+        stub.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(script))} \"$@\"\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        return stub
+
+    def _run_wait_ready(
+        self,
+        stub: Path,
+        *,
+        expected_version: str,
+        timeout_seconds: int,
+        poll_milliseconds: int = 200,
+        task_run_ps: str = "$null",
+    ) -> subprocess.CompletedProcess[str]:
+        pwsh = self._pwsh_for_ready_fixtures()
+        snippet = (
+            self._ownmesh_ready_helpers()
+            + "function Get-OwnMeshScheduledTaskRun { "
+            + task_run_ps
+            + " }\n"
+            + f"$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            + "try {\n"
+            + f"    Wait-OwnMeshDaemonReady -OwnMeshPath {shlex.quote(str(stub))} "
+            + f"-ExpectedVersion {shlex.quote(expected_version)} "
+            + f"-TimeoutSeconds {timeout_seconds} -PollMilliseconds {poll_milliseconds}\n"
+            + "    Write-Output (\"ready elapsed_ms={0}\" -f $sw.ElapsedMilliseconds)\n"
+            + "} catch {\n"
+            + "    Write-Output (\"failed elapsed_ms={0} err={1}\" -f $sw.ElapsedMilliseconds, $_.Exception.Message)\n"
+            + "    exit 1\n"
+            + "}\n"
+        )
+        return subprocess.run(
+            [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", snippet],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    def test_windows_ps1_delayed_daemon_ready_succeeds_without_rollback(self) -> None:
+        # #154: a healthy daemon that needs more than 500 ms must not roll back.
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-delay-") as tmp:
+            stub = self._write_status_stub(Path(tmp), version="1.2.23", delay_ms=800)
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub, expected_version="1.2.23", timeout_seconds=5, poll_milliseconds=100
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            self.assertIn("ready elapsed_ms=", combined)
+            self.assertGreaterEqual(elapsed_ms, 800)
+            self.assertLess(elapsed_ms, 15000)
+
+    def test_windows_ps1_never_ready_daemon_fails_after_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-never-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub, expected_version="1.2.23", timeout_seconds=2, poll_milliseconds=100
+            )
+            elapsed = time.monotonic() - started
+            combined = completed.stdout + completed.stderr
+            self.assertNotEqual(completed.returncode, 0, combined)
+            self.assertIn("did not become ready with the expected version", combined)
+            self.assertGreaterEqual(elapsed, 1.8)
+            self.assertLess(elapsed, 6)
+
+    def test_windows_ps1_disabled_task_fails_immediately(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-disabled-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=8,
+                poll_milliseconds=200,
+                task_run_ps="@{ State = 1; LastTaskResult = 2147942402 }",
+            )
+            elapsed = time.monotonic() - started
+            combined = completed.stdout + completed.stderr
+            self.assertNotEqual(completed.returncode, 0, combined)
+            self.assertIn("Scheduled task is disabled", combined)
+            self.assertLess(elapsed, 2)
+
+    def test_windows_ps1_ready_stale_last_result_still_waits_for_status(self) -> None:
+        """READY + leftover LastTaskResult is the previous run, not this instance."""
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-stale-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=800
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=5,
+                poll_milliseconds=100,
+                task_run_ps="@{ State = 3; LastTaskResult = 2147942402 }",
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            self.assertIn("ready elapsed_ms=", combined)
+            self.assertGreaterEqual(elapsed_ms, 800)
+            self.assertLess(elapsed_ms, 15000)
+
+    def test_windows_ps1_terminal_task_failure_after_running_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-taskfail-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=8,
+                poll_milliseconds=200,
+                task_run_ps=(
+                    "if (-not (Test-Path variable:script:OwnMeshTaskPoll)) "
+                    "{ $script:OwnMeshTaskPoll = 0 }; "
+                    "$script:OwnMeshTaskPoll++; "
+                    "if ($script:OwnMeshTaskPoll -eq 1) "
+                    "{ return @{ State = 4; LastTaskResult = 267009 } }; "
+                    "return @{ State = 3; LastTaskResult = 2147942402 }"
+                ),
+            )
+            elapsed = time.monotonic() - started
+            combined = completed.stdout + completed.stderr
+            self.assertNotEqual(completed.returncode, 0, combined)
+            self.assertIn("Scheduled task action failed with last run result", combined)
+            self.assertLess(elapsed, 2)
 
     def test_windows_ps1_sha256_helper_with_core_psmodulepath(self) -> None:
         if not _is_windows():

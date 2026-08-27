@@ -169,6 +169,8 @@ pub enum Overlay {
     Help,
     Wizard,
     Connector,
+    /// Ancestor custody is blocking Agent start. Details live on `App`.
+    CustodyRepair,
 }
 
 /// Root application model.
@@ -197,6 +199,9 @@ pub struct App {
     pub device_inventory: DeviceInventory,
     pending_setup: Option<SetupRequest>,
     pending_reauthentication: bool,
+    /// Blocking ancestor-custody findings for Overlay::CustodyRepair.
+    pub custody_repair: Vec<(String, ownmesh_ipc::CustodyAncestorIssue)>,
+    pub custody_repair_error: Option<String>,
 }
 
 impl App {
@@ -251,6 +256,8 @@ impl App {
             device_inventory,
             pending_setup: None,
             pending_reauthentication: false,
+            custody_repair: Vec::new(),
+            custody_repair_error: None,
         }
     }
 
@@ -415,23 +422,104 @@ impl App {
             .unwrap_or(OverviewAction::SetupRepair)
         {
             OverviewAction::SetupRepair => self.open_setup_wizard(),
-            OverviewAction::RepairAgent => {
-                self.pending_setup = Some(SetupRequest {
-                    control_plane_url: self.readiness.server_url.clone().unwrap_or_default(),
-                    lang: self.lang,
-                    preset: self.policy_preset,
-                    configure: false,
-                    update_policy: false,
-                    login: false,
-                    enroll: false,
-                    install_agent: true,
-                });
-            }
+            OverviewAction::RepairAgent => self.begin_repair_agent(),
             OverviewAction::Connector => self.overlay = Overlay::Connector,
             OverviewAction::Reauthenticate => self.pending_reauthentication = true,
             OverviewAction::Devices => self.goto_screen(Screen::Devices),
             OverviewAction::Workspace => self.goto_screen(Screen::Workspaces),
             OverviewAction::Doctor => self.goto_screen(Screen::Diagnostics),
+        }
+    }
+
+    fn begin_repair_agent(&mut self) {
+        let roots = [
+            ("config", self.paths.config_dir.as_path()),
+            ("state", self.paths.state_dir.as_path()),
+            ("runtime", self.paths.runtime_dir.as_path()),
+        ];
+        match ownmesh_ipc::inspect_layout_custody(&roots) {
+            Ok(issues) if issues.is_empty() => {
+                self.queue_agent_install();
+            }
+            Ok(issues) => {
+                self.custody_repair = issues;
+                self.custody_repair_error = None;
+                self.overlay = Overlay::CustodyRepair;
+            }
+            Err(error) => {
+                self.custody_repair.clear();
+                self.custody_repair_error = Some(error.to_string());
+                self.overlay = Overlay::CustodyRepair;
+            }
+        }
+    }
+
+    fn queue_agent_install(&mut self) {
+        self.pending_setup = Some(SetupRequest {
+            control_plane_url: self.readiness.server_url.clone().unwrap_or_default(),
+            lang: self.lang,
+            preset: self.policy_preset,
+            configure: false,
+            update_policy: false,
+            login: false,
+            enroll: false,
+            install_agent: true,
+        });
+    }
+
+    /// Apply consented, non-recursive group/other-write removal on owned
+    /// blocking ancestors, then start the Agent. Returns an error string to
+    /// keep on the overlay when a path cannot be changed.
+    pub fn confirm_custody_repair(&mut self) -> Result<(), String> {
+        let uid = ownmesh_ipc::process_euid();
+        let mut changed = Vec::new();
+        for (_, issue) in &self.custody_repair {
+            if issue.kind != ownmesh_ipc::CustodyIssueKind::ReplacementPermitted {
+                continue;
+            }
+            if issue.uid != uid {
+                return Err(format!(
+                    "will not chmod {} (owned by uid {}, not this user)",
+                    issue.path.display(),
+                    issue.uid
+                ));
+            }
+            let (old, new) = ownmesh_ipc::clear_group_other_write(&issue.path)
+                .map_err(|error| error.to_string())?;
+            changed.push(format!("{} {:04o}->{:04o}", issue.path.display(), old, new));
+        }
+        let roots = [
+            ("config", self.paths.config_dir.as_path()),
+            ("state", self.paths.state_dir.as_path()),
+            ("runtime", self.paths.runtime_dir.as_path()),
+        ];
+        match ownmesh_ipc::inspect_layout_custody(&roots) {
+            Ok(remaining) if remaining.is_empty() => {
+                self.overlay = Overlay::None;
+                self.custody_repair.clear();
+                self.status_line = if changed.is_empty() {
+                    "Ancestor custody is clear; starting Agent.".into()
+                } else {
+                    format!("Updated {}. Starting Agent.", changed.join(", "))
+                };
+                self.queue_agent_install();
+                Ok(())
+            }
+            Ok(remaining) => {
+                self.custody_repair = remaining;
+                if changed.is_empty() {
+                    Err(
+                        "listed ancestors still block Agent start; group/other write was not cleared (untrusted owner or sticky-child is not a chmod-g-w case)"
+                            .into(),
+                    )
+                } else {
+                    Err(format!(
+                        "updated {}, but another ancestor still blocks Agent start",
+                        changed.join(", ")
+                    ))
+                }
+            }
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -454,6 +542,23 @@ impl App {
                 service_installed: self.readiness.service_installed,
             },
         )?;
+        if request.login || request.enroll || request.install_agent {
+            let roots = [
+                ("config", self.paths.config_dir.as_path()),
+                ("state", self.paths.state_dir.as_path()),
+                ("runtime", self.paths.runtime_dir.as_path()),
+            ];
+            match ownmesh_ipc::inspect_layout_custody(&roots) {
+                Ok(issues) if issues.is_empty() => {}
+                Ok(issues) => {
+                    self.custody_repair = issues;
+                    self.custody_repair_error = None;
+                    self.overlay = Overlay::CustodyRepair;
+                    return Err("Agent cannot start until listed ancestors are fixed".into());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
         self.pending_setup = Some(request);
         Ok(())
     }
@@ -742,5 +847,49 @@ fn doctor_input_from_local(
         service: ServiceObservation::default(),
         journals: ownmesh_diagnostics::JournalsObservation::default(),
         profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
+        layout_custody: tui_layout_custody(paths),
+    }
+}
+
+fn tui_layout_custody(paths: &OwnMeshPaths) -> ownmesh_diagnostics::LayoutCustodyObservation {
+    let roots = [
+        ("config", paths.config_dir.as_path()),
+        ("state", paths.state_dir.as_path()),
+        ("runtime", paths.runtime_dir.as_path()),
+    ];
+    match ownmesh_ipc::inspect_layout_custody(&roots) {
+        Ok(issues) => {
+            let uid = ownmesh_ipc::process_euid();
+            ownmesh_diagnostics::LayoutCustodyObservation {
+                findings: issues
+                    .into_iter()
+                    .map(
+                        |(layout, issue)| ownmesh_diagnostics::LayoutCustodyFinding {
+                            layout,
+                            path: issue.path.display().to_string(),
+                            uid: issue.uid,
+                            mode: issue.unix_mode(),
+                            kind: match issue.kind {
+                                ownmesh_ipc::CustodyIssueKind::ReplacementPermitted => {
+                                    "replacement_permitted".into()
+                                }
+                                ownmesh_ipc::CustodyIssueKind::UntrustedOwner => {
+                                    "untrusted_owner".into()
+                                }
+                                ownmesh_ipc::CustodyIssueKind::StickyChildNotOwned => {
+                                    "sticky_child_not_owned".into()
+                                }
+                            },
+                            remediation: issue.remediation(uid),
+                        },
+                    )
+                    .collect(),
+                inspect_error: None,
+            }
+        }
+        Err(error) => ownmesh_diagnostics::LayoutCustodyObservation {
+            findings: Vec::new(),
+            inspect_error: Some(error.to_string()),
+        },
     }
 }

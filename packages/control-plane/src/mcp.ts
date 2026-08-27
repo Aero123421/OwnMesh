@@ -2087,7 +2087,7 @@ const SYSTEM_DIAGNOSIS_CHECK_IDS = new Set([
 // above must be present and unknown ids are dropped either way. The Control
 // Plane additionally synthesizes its own authoritative `route` check from
 // DeviceRoom presence.
-const SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS = new Set(["agent_route"]);
+const SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS = new Set(["agent_route", "runtime_queue"]);
 const SYSTEM_DIAGNOSIS_ALL_CHECK_IDS = new Set([
   ...SYSTEM_DIAGNOSIS_CHECK_IDS,
   ...SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS,
@@ -2124,6 +2124,14 @@ const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
     disabled: { status: "pass", provenance: "observed" },
     unknown: { status: "pass", provenance: "observed" },
     offline: { status: "fail", provenance: "observed" },
+  },
+  // #160 additive: live unlocked command.wait / pre-spawn self-reentrancy
+  // guard. Older Agents omit it; missing is not a required-check failure.
+  runtime_queue: {
+    idle: { status: "pass", provenance: "observed" },
+    executing: { status: "warn", provenance: "observed" },
+    self_reentrant_exec: { status: "warn", provenance: "observed" },
+    runtime_queue_blocked: { status: "fail", provenance: "observed" },
   },
 };
 
