@@ -2503,7 +2503,9 @@ pub fn clear_group_other_write(path: &Path) -> IpcResult<(u32, u32)> {
         let mode = rustix::fs::Mode::from_bits_truncate(new);
         rustix::fs::fchmod(&fd, mode).map_err(std::io::Error::from)?;
     }
-    Ok((old, new))
+    // `st_mode` is `u32` on Linux and `u16` on macOS (`mode_t`).
+    #[allow(clippy::useless_conversion)]
+    Ok((u32::from(old), u32::from(new)))
 }
 
 #[cfg(unix)]

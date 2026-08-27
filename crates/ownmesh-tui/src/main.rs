@@ -960,6 +960,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use app::OverviewAction;
     use ownmesh_ipc::{reject_unknown_handler, AuthGate, IpcBus, IpcServer, ServerConfig};
     use ownmesh_policy::{
