@@ -25,6 +25,13 @@
   500 ms no longer triggers binary rollback. A scheduled-task action that
   fails with a locale-independent COM last-run result fails immediately
   (#154).
+- Setup, `ownmesh doctor`, and the TUI Repair Agent path inspect the same
+  config/state/runtime ancestor custody walk the Agent uses at start. A
+  group-writable parent such as `~/.local/state` is a dedicated
+  `layout.custody` failure with path, mode, owner, and a non-recursive
+  `chmod g-w,o-w` next step — not a healthy doctor report plus a looping
+  `service start`. Repair never chmods a directory it does not own and never
+  recurses; TUI confirmation shows the exact paths first (#168).
 
 ## v1.2.23 — Availability, workspace authority, and dependency refresh
 

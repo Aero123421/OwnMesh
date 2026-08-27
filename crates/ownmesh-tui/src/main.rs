@@ -452,6 +452,23 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         return;
     }
 
+    if app.overlay == Overlay::CustodyRepair {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.overlay = Overlay::None;
+                app.custody_repair.clear();
+                app.custody_repair_error = None;
+            }
+            KeyCode::Enter => {
+                if let Err(error) = app.confirm_custody_repair() {
+                    app.custody_repair_error = Some(error);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q' | 'Q') => app.should_quit = true,
         KeyCode::F(1) | KeyCode::Char('?') => app.overlay = Overlay::Help,
@@ -686,6 +703,38 @@ fn refresh_devices(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
 }
 
 fn run_setup_cli(request: &SetupRequest) -> SetupCliOutcome {
+    if request.login || request.enroll || request.install_agent {
+        if let Ok(paths) = ownmesh_config::OwnMeshPaths::discover() {
+            let roots = [
+                ("config", paths.config_dir.as_path()),
+                ("state", paths.state_dir.as_path()),
+                ("runtime", paths.runtime_dir.as_path()),
+            ];
+            match ownmesh_ipc::inspect_layout_custody(&roots) {
+                Ok(issues) if issues.is_empty() => {}
+                Ok(issues) => {
+                    let uid = ownmesh_ipc::process_euid();
+                    eprintln!(
+                        "OwnMesh setup: Agent cannot start until these ancestors no longer permit replacement:"
+                    );
+                    for (layout, issue) in &issues {
+                        eprintln!(
+                            "  [{layout}] {} mode={:04o} uid={}: {}",
+                            issue.path.display(),
+                            issue.unix_mode(),
+                            issue.uid,
+                            issue.remediation(uid)
+                        );
+                    }
+                    return SetupCliOutcome::Failed;
+                }
+                Err(error) => {
+                    eprintln!("OwnMesh setup: cannot inspect layout custody: {error}");
+                    return SetupCliOutcome::Failed;
+                }
+            }
+        }
+    }
     let Ok(current) = std::env::current_exe() else {
         return SetupCliOutcome::Failed;
     };
@@ -911,6 +960,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::OverviewAction;
     use ownmesh_ipc::{reject_unknown_handler, AuthGate, IpcBus, IpcServer, ServerConfig};
     use ownmesh_policy::{
         full_access_has_no_hidden_restrictive_rules, preset_document, AccessPreset,
@@ -979,6 +1029,41 @@ mod tests {
         App::new(OwnMeshPaths::for_base(dir.path()), None)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn repair_agent_opens_custody_overlay_instead_of_starting() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let mut app = App::new(paths, None);
+        app.readiness.server_url = Some("https://cp.example.test".into());
+        app.readiness.account_present = true;
+        app.readiness.device_id = Some("dev_test".into());
+        app.readiness.agent_running = false;
+        app.readiness.service_installed = false;
+        assert_eq!(app.overview_actions()[0], OverviewAction::RepairAgent);
+        app.overview_action_cursor = 0;
+        app.run_overview_action();
+        assert_eq!(app.overlay, Overlay::CustodyRepair);
+        assert!(app.take_pending_setup().is_none());
+        assert!(!app.custody_repair.is_empty());
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o7777,
+            0o775,
+            "opening the overlay must not chmod"
+        );
+        app.confirm_custody_repair()
+            .expect("owned ancestor can be repaired");
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert!(app.take_pending_setup().is_some());
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
     #[test]
     fn ctrl_c_quits_from_every_screen_overlay_and_palette() {
         let rt = nav_runtime();
@@ -988,7 +1073,12 @@ mod tests {
             handle_key(&mut app, ctrl_char('c'), &rt);
             assert!(app.should_quit, "Ctrl+C must quit on {screen:?}");
         }
-        for overlay in [Overlay::Help, Overlay::Wizard, Overlay::Connector] {
+        for overlay in [
+            Overlay::Help,
+            Overlay::Wizard,
+            Overlay::Connector,
+            Overlay::CustodyRepair,
+        ] {
             let mut app = test_app();
             app.overlay = overlay;
             handle_key(&mut app, ctrl_char('c'), &rt);

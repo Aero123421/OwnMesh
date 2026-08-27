@@ -57,6 +57,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         Overlay::Help => draw_help_modal(frame, app),
         Overlay::Wizard => draw_wizard(frame, app),
         Overlay::Connector => draw_connector_modal(frame, app),
+        Overlay::CustodyRepair => draw_custody_repair_modal(frame, app),
         Overlay::None => {}
     }
     if app.palette.open {
@@ -951,6 +952,61 @@ fn localized(
         Lang::ZhHans => zh,
         Lang::RuRu => ru,
     }
+}
+
+fn draw_custody_repair_modal(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_fixed(frame.area(), 76, 16);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(app.border_set())
+        .border_style(app.theme.accent)
+        .title(localized(
+            app.lang,
+            " Agent cannot start ",
+            " Agentを開始できません ",
+            " 代理无法启动 ",
+            " Агент не запускается ",
+        ));
+    let uid = ownmesh_ipc::process_euid();
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(localized(
+        app.lang,
+        "A parent directory of OwnMesh state is group/other-writable. Starting the service will keep failing until that ancestor is fixed. OwnMesh will not chmod recursively.",
+        "OwnMesh状態の親ディレクトリがグループ書き込み可能です。直すまでサービス開始は失敗し続けます。再帰的なchmodはしません。",
+        "OwnMesh 状态目录的父目录对组可写。修复前服务会一直启动失败。不会递归 chmod。",
+        "Родитель каталога состояния OwnMesh доступен группе на запись. Запуск будет падать, пока это не исправят. Рекурсивный chmod не выполняется.",
+    )));
+    lines.push(Line::from(""));
+    if let Some(error) = &app.custody_repair_error {
+        lines.push(Line::from(error.as_str()));
+        lines.push(Line::from(""));
+    }
+    for (layout, issue) in &app.custody_repair {
+        lines.push(Line::from(format!(
+            "[{layout}] {} mode={:04o} uid={}",
+            issue.path.display(),
+            issue.unix_mode(),
+            issue.uid
+        )));
+        lines.push(Line::from(issue.remediation(uid)));
+    }
+    if app.custody_repair.is_empty() && app.custody_repair_error.is_none() {
+        lines.push(Line::from("(no findings)"));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(localized(
+        app.lang,
+        "Enter: remove group/other write on listed directories you own, then start Agent. Esc: cancel.",
+        "Enter: 所有する列挙ディレクトリのグループ/その他書き込みを外してAgentを開始。Esc: キャンセル。",
+        "Enter：仅清除您拥有的已列目录的组/其他写权限并启动代理。Esc：取消。",
+        "Enter: снять group/other write с перечисленных каталогов, которыми вы владеете, затем запустить агент. Esc: отмена.",
+    )));
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .style(app.theme.body)
+        .block(block);
+    frame.render_widget(p, area);
 }
 
 fn draw_help_modal(frame: &mut Frame<'_>, app: &App) {

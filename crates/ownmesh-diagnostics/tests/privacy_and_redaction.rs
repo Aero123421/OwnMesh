@@ -117,6 +117,7 @@ fn base_input() -> DoctorInput {
         },
         journals: JournalsObservation::default(),
         profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
+        layout_custody: ownmesh_diagnostics::LayoutCustodyObservation::default(),
     }
 }
 

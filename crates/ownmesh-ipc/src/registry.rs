@@ -2259,8 +2259,114 @@ fn validate_state_dir_owner(state_dir: &Path, require_protected: bool) -> IpcRes
     result
 }
 
+/// Why an ancestor of config/state/runtime cannot host the Agent (#168).
+///
+/// The daemon's startup check is the authority. Doctor, setup, and the TUI
+/// repair overlay use the same classification so they cannot disagree with
+/// the fail-closed runtime walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyIssueKind {
+    /// Group or other write is set and the directory is not sticky.
+    ReplacementPermitted,
+    /// Owner is neither this process uid nor host root.
+    UntrustedOwner,
+    /// Sticky ancestor whose child is not owned by this process.
+    StickyChildNotOwned,
+}
+
+/// One ancestor that would make `ownmeshd` refuse to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyAncestorIssue {
+    pub path: PathBuf,
+    pub uid: u32,
+    pub mode: u32,
+    pub kind: CustodyIssueKind,
+}
+
+impl CustodyAncestorIssue {
+    /// Permission bits including sticky (`0o7777` mask).
+    #[must_use]
+    pub fn unix_mode(&self) -> u32 {
+        self.mode & 0o7777
+    }
+
+    /// Exact unauthorized message the daemon emits for this finding.
+    #[must_use]
+    pub fn ipc_message(&self, expected_uid: u32) -> String {
+        match self.kind {
+            CustodyIssueKind::UntrustedOwner => format!(
+                "credential state ancestor is owned by untrusted uid {}: {}",
+                self.uid,
+                self.path.display()
+            ),
+            CustodyIssueKind::ReplacementPermitted => format!(
+                "credential state ancestor permits replacement by another user: {}",
+                self.path.display()
+            ),
+            CustodyIssueKind::StickyChildNotOwned => format!(
+                "credential state path under sticky ancestor is not owned by uid {expected_uid}: {}",
+                self.path.display()
+            ),
+        }
+    }
+
+    /// Operator-facing next step. Never a recursive chmod.
+    #[must_use]
+    pub fn remediation(&self, current_uid: u32) -> String {
+        match self.kind {
+            CustodyIssueKind::ReplacementPermitted if self.uid == current_uid => {
+                format!(
+                    "chmod g-w,o-w {}  # {:04o} -> {:04o}; not recursive",
+                    self.path.display(),
+                    self.unix_mode(),
+                    self.unix_mode() & !0o022
+                )
+            }
+            CustodyIssueKind::ReplacementPermitted => format!(
+                "ask the owner of {} (uid {}) to clear group/other write (mode {:04o}); OwnMesh will not chmod a directory it does not own",
+                self.path.display(),
+                self.uid,
+                self.unix_mode()
+            ),
+            CustodyIssueKind::UntrustedOwner => format!(
+                "ancestor {} is owned by uid {}, not this user or root; move OwnMesh state or correct ownership (not a chmod-g-w case)",
+                self.path.display(),
+                self.uid
+            ),
+            CustodyIssueKind::StickyChildNotOwned => format!(
+                "path under sticky ancestor {} is not owned by this user",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+/// Effective uid used by ancestor custody (daemon start, doctor, setup).
+#[must_use]
+pub fn process_euid() -> u32 {
+    #[cfg(unix)]
+    {
+        rustix::process::geteuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Inspect every existing ancestor of `start` with the same rules as Agent
+/// startup. Missing components are skipped so setup can run before the leaf
+/// directory exists; an unreadable existing ancestor is fail-closed.
+///
+/// # Errors
+///
+/// Returns an I/O error when an existing ancestor cannot be inspected.
+pub fn inspect_parent_custody(start: &Path) -> IpcResult<Vec<CustodyAncestorIssue>> {
+    inspect_parent_custody_inner(start)
+}
+
 #[cfg(unix)]
-fn validate_parent_custody(state_dir: &Path) -> IpcResult<()> {
+fn inspect_parent_custody_inner(start: &Path) -> IpcResult<Vec<CustodyAncestorIssue>> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let expected = rustix::process::geteuid().as_raw();
     // v1.2.13 review (ADR 0011 update): custody is byte-for-byte strict —
@@ -2278,39 +2384,137 @@ fn validate_parent_custody(state_dir: &Path) -> IpcResult<()> {
     // here; a drop-in that re-introduces `PrivateUsers=yes` fails closed at
     // startup with `ancestor is owned by untrusted uid 65534` and is
     // disclosed by `ownmesh doctor`.
-    let mut child = state_dir;
+    let mut issues = Vec::new();
+    let mut child = start;
     while let Some(parent) = child.parent() {
         if parent == child || parent.as_os_str().is_empty() {
             break;
         }
-        let parent_metadata = parent_custody_metadata(parent)?;
+        let parent_metadata = match parent_custody_metadata(parent) {
+            Ok(metadata) => metadata,
+            Err(IpcError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+                child = parent;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let parent_uid = parent_metadata.uid();
-        if !ancestor_owner_is_trusted(parent_uid, expected) {
-            return Err(IpcError::Unauthorized(format!(
-                "credential state ancestor is owned by untrusted uid {}: {}",
-                parent_uid,
-                parent.display()
-            )));
-        }
         let mode = parent_metadata.permissions().mode();
+        if !ancestor_owner_is_trusted(parent_uid, expected) {
+            issues.push(CustodyAncestorIssue {
+                path: parent.to_path_buf(),
+                uid: parent_uid,
+                mode,
+                kind: CustodyIssueKind::UntrustedOwner,
+            });
+        }
         let writable_by_other = mode & 0o022 != 0;
         let sticky = mode & 0o1000 != 0;
         // A sticky directory such as /tmp prevents another uid from replacing an
         // owner-owned child. Without sticky, any replacement-capable ancestor is
         // rejected, not merely the immediate state parent.
         if writable_by_other && !sticky {
-            return Err(IpcError::Unauthorized(format!(
-                "credential state ancestor permits replacement by another user: {}",
-                parent.display()
-            )));
+            issues.push(CustodyAncestorIssue {
+                path: parent.to_path_buf(),
+                uid: parent_uid,
+                mode,
+                kind: CustodyIssueKind::ReplacementPermitted,
+            });
         }
-        if sticky && fs::symlink_metadata(child)?.uid() != expected {
-            return Err(IpcError::Unauthorized(format!(
-                "credential state path under sticky ancestor is not owned by uid {expected}: {}",
-                child.display()
-            )));
+        if sticky {
+            match fs::symlink_metadata(child) {
+                Ok(child_meta) if child_meta.uid() != expected => {
+                    issues.push(CustodyAncestorIssue {
+                        path: child.to_path_buf(),
+                        uid: child_meta.uid(),
+                        mode: child_meta.permissions().mode(),
+                        kind: CustodyIssueKind::StickyChildNotOwned,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         child = parent;
+    }
+    Ok(issues)
+}
+
+#[cfg(not(unix))]
+fn inspect_parent_custody_inner(_start: &Path) -> IpcResult<Vec<CustodyAncestorIssue>> {
+    Ok(Vec::new())
+}
+
+/// Inspect config, state, and runtime roots and return unique ancestor issues
+/// in walk order. Layout labels are `"config"`, `"state"`, `"runtime"`.
+///
+/// # Errors
+///
+/// Propagates inspection failures from [`inspect_parent_custody`].
+pub fn inspect_layout_custody(
+    roots: &[(&str, &Path)],
+) -> IpcResult<Vec<(String, CustodyAncestorIssue)>> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (layout, root) in roots {
+        for issue in inspect_parent_custody(root)? {
+            if seen.insert(issue.path.clone()) {
+                out.push(((*layout).to_owned(), issue));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Clear group/other write on one existing directory this process owns.
+/// Never recursive. Returns `(old_mode, new_mode)` with the `0o7777` mask.
+///
+/// # Errors
+///
+/// Fails closed when the path is missing, not a directory, not owned by this
+/// uid, or a symlink/reparse.
+#[cfg(unix)]
+pub fn clear_group_other_write(path: &Path) -> IpcResult<(u32, u32)> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    reject_symlink_or_reparse_if_present(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(IpcError::Unauthorized(format!(
+            "refusing to change a non-directory: {}",
+            path.display()
+        )));
+    }
+    let expected = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected {
+        return Err(IpcError::Unauthorized(format!(
+            "refusing to chmod a directory owned by uid {}: {}",
+            metadata.uid(),
+            path.display()
+        )));
+    }
+    let old = metadata.permissions().mode() & 0o7777;
+    let new = old & !0o022;
+    if new != old {
+        fs::set_permissions(path, fs::Permissions::from_mode(new))?;
+    }
+    Ok((old, new))
+}
+
+#[cfg(not(unix))]
+pub fn clear_group_other_write(path: &Path) -> IpcResult<(u32, u32)> {
+    let _ = path;
+    Err(IpcError::Protocol(
+        "ancestor mode repair is only implemented on Unix".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn validate_parent_custody(state_dir: &Path) -> IpcResult<()> {
+    let expected = rustix::process::geteuid().as_raw();
+    let issues = inspect_parent_custody(state_dir)?;
+    if let Some(issue) = issues.first() {
+        return Err(IpcError::Unauthorized(issue.ipc_message(expected)));
     }
     Ok(())
 }
@@ -2437,14 +2641,117 @@ mod tests {
         assert!(src.contains("read owner-only") || src.contains("read owner"));
     }
 
-    /// v1.2.13 review regression: the overflow uid 65534 — the only visible
-    /// representation of *every* host uid outside a user namespace's
-    /// mapping, host root and attacker alike — must never be accepted as an
-    /// ancestor owner. A systemd `--user` service that forces a user
-    /// namespace reports a foreign-owned 0755/01777 ancestor as 65534, and
-    /// its owner can replace the daemon's state directory (A5 cross-user
-    /// boundary). The shipped unit therefore does not force a user namespace
-    /// (ADR 0011) and custody stays byte-for-byte strict.
+    /// #168: a 0700 OwnMesh leaf under a 0775 ancestor is the reproduced
+    /// Agent start refusal. Inspect must name that ancestor; clearing only
+    /// group/other write on that directory (not recursive) is the repair.
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_ancestor_is_reported_and_one_level_repair_leaves_higher_issues() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let higher = root.path().join("higher");
+        let mid = higher.join("mid");
+        let leaf = mid.join("ownmesh");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::set_permissions(&higher, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&mid, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let issues = inspect_parent_custody(&leaf).unwrap();
+        let paths: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.kind == CustodyIssueKind::ReplacementPermitted)
+            .map(|issue| issue.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&mid),
+            "mid 0775 must be reported: {issues:?}"
+        );
+        assert!(
+            paths.contains(&higher),
+            "higher 0775 must remain visible: {issues:?}"
+        );
+        assert!(
+            !paths.contains(&leaf),
+            "the 0700 leaf is not the blocking ancestor"
+        );
+
+        let err = validate_parent_custody(&leaf).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("permits replacement by another user"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&mid.display().to_string())
+                || message.contains(&higher.display().to_string()),
+            "{message}"
+        );
+
+        let (old, new) = clear_group_other_write(&mid).unwrap();
+        assert_eq!(old, 0o775);
+        assert_eq!(new, 0o755);
+        assert_eq!(
+            fs::symlink_metadata(&mid).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::symlink_metadata(&higher).unwrap().permissions().mode() & 0o7777,
+            0o775,
+            "repair is not recursive"
+        );
+
+        let remaining = inspect_parent_custody(&leaf).unwrap();
+        let remaining_paths: Vec<_> = remaining
+            .iter()
+            .filter(|issue| issue.kind == CustodyIssueKind::ReplacementPermitted)
+            .map(|issue| issue.path.clone())
+            .collect();
+        assert!(
+            !remaining_paths.contains(&mid),
+            "repaired mid must drop out"
+        );
+        assert!(
+            remaining_paths.contains(&higher),
+            "unrepaired higher ancestor still blocks start: {remaining:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_ancestors_are_not_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let mid = root.path().join("mid");
+        let leaf = mid.join("ownmesh");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::set_permissions(&mid, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o700)).unwrap();
+        let issues = inspect_parent_custody(&leaf).unwrap();
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.path != mid && issue.path != leaf),
+            "{issues:?}"
+        );
+        validate_parent_custody(&leaf).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_group_other_write_refuses_unowned_or_non_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        let err = clear_group_other_write(&file).unwrap_err();
+        assert!(err.to_string().contains("non-directory"), "{err}");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // The tempdir itself is owned by us; a missing path fails closed.
+        let missing = root.path().join("nope");
+        assert!(clear_group_other_write(&missing).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn overflow_uid_is_never_an_accepted_ancestor_owner() {
