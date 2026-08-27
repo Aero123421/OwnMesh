@@ -53,10 +53,20 @@ fn dispatch_profile_with(
             });
             Ok(())
         }
-        ProfileCmd::Start { id } => open_profile(cli, call_local_daemon, id, None),
-        ProfileCmd::Resume { id, native_id } => {
-            open_profile(cli, call_local_daemon, id, Some(native_id.as_str()))
+        ProfileCmd::Start { id, prompt } => {
+            open_profile(cli, call_local_daemon, id, None, prompt.as_deref())
         }
+        ProfileCmd::Resume {
+            id,
+            native_id,
+            prompt,
+        } => open_profile(
+            cli,
+            call_local_daemon,
+            id,
+            Some(native_id.as_str()),
+            prompt.as_deref(),
+        ),
         ProfileCmd::Login { id } => open_profile_login(cli, call_local_daemon, id),
         ProfileCmd::Test { id } => test_profile(cli, call_local_daemon, id),
     }
@@ -67,6 +77,7 @@ fn open_profile(
     call_local_daemon: &impl Fn(&str, Option<Value>) -> Result<Value, ExitCode>,
     profile_id: &str,
     native_session_id: Option<&str>,
+    prompt: Option<&str>,
 ) -> Result<(), ExitCode> {
     let value = call_local_daemon(
         "session.open",
@@ -75,6 +86,7 @@ fn open_profile(
             "kind": "profile_agent",
             "profile_id": profile_id,
             "native_session_id": native_session_id,
+            "prompt": prompt,
             "adapter_mode": "auto",
         })),
     )?;
@@ -152,7 +164,18 @@ fn test_profile(
         eprintln!("profile test: profile.show returned an invalid status");
         return Err(ExitCode::Internal);
     };
-    let passed = detected && state != "unsupported_version";
+    let launchable = status
+        .get("launchable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let protocol = status
+        .get("structured_protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("untested");
+    // A version probe is launch evidence only. `profile test` must never turn
+    // `installed` into a protocol PASS or hide a paid model call behind a
+    // health check. Until a protocol-only receipt exists, report untested.
+    let passed = detected && launchable && protocol == "ready";
     if cli.json {
         println!(
             "{}",
@@ -161,6 +184,8 @@ fn test_profile(
                 "profile_id": profile_id,
                 "status": if passed { "pass" } else { "fail" },
                 "detected": detected,
+                "launchable": launchable,
+                "structured_protocol": protocol,
                 "profile_state": state,
                 "details": status,
             })
@@ -169,9 +194,11 @@ fn test_profile(
             crate::commands::fail::note_envelope_emitted();
         }
     } else if passed {
-        println!("PASS  {profile_id}  state={state}");
+        println!("PASS  {profile_id}  state={state} protocol={protocol}");
     } else {
-        eprintln!("FAIL  {profile_id}  detected={detected} state={state}");
+        eprintln!(
+            "FAIL  {profile_id}  detected={detected} launchable={launchable} state={state} protocol={protocol}"
+        );
     }
 
     if passed {
@@ -200,6 +227,7 @@ mod tests {
         let cmd = ProfileCmd::Resume {
             id: "codex".into(),
             native_id: "native-7".into(),
+            prompt: Some("continue".into()),
         };
         dispatch_profile_with(&cli(), &cmd, &|method, params| {
             calls.borrow_mut().push((method.to_owned(), params));
@@ -213,6 +241,7 @@ mod tests {
         assert_eq!(params["kind"], "profile_agent");
         assert_eq!(params["profile_id"], "codex");
         assert_eq!(params["native_session_id"], "native-7");
+        assert_eq!(params["prompt"], "continue");
         assert_eq!(params["adapter_mode"], "auto");
     }
 
@@ -244,6 +273,23 @@ mod tests {
                 "status": {
                     "detected": true,
                     "state": "unsupported_version"
+                }
+            }))
+        });
+        assert_eq!(result, Err(ExitCode::ProfileUnavailable));
+    }
+
+    #[test]
+    fn profile_test_never_treats_binary_presence_as_protocol_success() {
+        let cmd = ProfileCmd::Test { id: "codex".into() };
+        let result = dispatch_profile_with(&cli(), &cmd, &|method, _| {
+            assert_eq!(method, methods::PROFILE_SHOW);
+            Ok(json!({
+                "status": {
+                    "detected": true,
+                    "launchable": true,
+                    "state": "installed",
+                    "structured_protocol": "untested"
                 }
             }))
         });

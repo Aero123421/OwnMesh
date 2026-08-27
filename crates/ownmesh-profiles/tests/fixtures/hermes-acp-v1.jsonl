@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"hermes-fixture","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello from Hermes"}}}}
+{"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission","params":{"sessionId":"hermes-fixture","toolCall":{"toolCallId":"hermes-tool-1","title":"Dangerous command","kind":"execute"},"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}

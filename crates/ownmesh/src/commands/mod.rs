@@ -227,6 +227,7 @@ mod registry_tests {
         let manifest = manifest();
         let explicit = string_list(&manifest, "explicit_unsupported_surfaces");
         let additional = string_list(&manifest, "additional_unsupported");
+        let evidence_waivers = string_list(&manifest, "release_evidence_waivers");
 
         assert_eq!(
             manifest["explicit_unsupported_count"].as_u64(),
@@ -244,7 +245,7 @@ mod registry_tests {
         );
         assert_eq!(
             manifest["total_unsupported_surfaces"].as_u64(),
-            Some((explicit.len() + additional.len()) as u64)
+            Some((explicit.len() + additional.len() + evidence_waivers.len()) as u64)
         );
         assert_eq!(
             manifest["explicit_unsupported_count"].as_u64(),
@@ -267,6 +268,7 @@ mod registry_tests {
             .iter()
             .copied()
             .collect();
+        let evidence_set: HashSet<_> = evidence_waivers.iter().copied().collect();
         assert_eq!(
             explicit_set.len(),
             EXPLICIT_UNSUPPORTED_CLI_SURFACES.len(),
@@ -280,6 +282,10 @@ mod registry_tests {
         assert!(
             explicit_set.is_disjoint(&additional_set),
             "explicit and additional registries must not overlap"
+        );
+        assert!(
+            explicit_set.is_disjoint(&evidence_set) && additional_set.is_disjoint(&evidence_set),
+            "release evidence waivers must not overlap unsupported registries"
         );
     }
 }

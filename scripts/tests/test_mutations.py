@@ -36,6 +36,7 @@ def _manifest_with_no_unsupported(text: str, *, completeness: bool = True) -> st
     data["explicit_unsupported_count"] = 0
     data["explicit_unsupported_surfaces"] = []
     data["additional_unsupported"] = []
+    data["release_evidence_waivers"] = []
     data["total_unsupported_surfaces"] = 0
     rendered = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
     # Stable releases already have this exact inventory. Keep the mutation
@@ -56,6 +57,7 @@ def _manifest_with_false_complete_claim(text: str) -> str:
     data["explicit_unsupported_count"] = 1
     data["explicit_unsupported_surfaces"] = ["__mutation_unimplemented_surface__"]
     data["additional_unsupported"] = []
+    data["release_evidence_waivers"] = []
     data["total_unsupported_surfaces"] = 1
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 

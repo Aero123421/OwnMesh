@@ -49,6 +49,8 @@ pub enum ProfileError {
         "{0} is not installed or not resolvable; install it or add its bin dir to the daemon search dirs, then run `ownmesh doctor`"
     )]
     NotInstalled(String),
+    #[error("profile launch dependency unavailable: {0}")]
+    LaunchDependency(String),
 }
 
 pub type ProfileResult<T> = Result<T, ProfileError>;
@@ -206,6 +208,7 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
                 "{{prompt}}".into(),
                 "--output-format".into(),
                 "stream-json".into(),
+                "--verbose".into(),
             ],
             resume: NativeResume::Argv {
                 args: vec![
@@ -215,6 +218,7 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
                     "{{native_id}}".into(),
                     "--output-format".into(),
                     "stream-json".into(),
+                    "--verbose".into(),
                 ],
             },
             auth_probe: None,
@@ -226,8 +230,8 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
             transport: StdioJsonRpc,
             dialect: KimiAcp,
             start_args: vec!["acp".into()],
-            resume: NativeResume::Argv {
-                args: vec!["acp".into(), "--session".into(), "{{native_id}}".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
             },
             auth_probe: None,
             structured_events: true,
@@ -287,8 +291,8 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
             transport: StdioJsonRpc,
             dialect: HermesAcp,
             start_args: vec!["acp".into()],
-            resume: NativeResume::Argv {
-                args: vec!["acp".into(), "--resume".into(), "{{native_id}}".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
             },
             auth_probe: None,
             structured_events: true,
@@ -453,6 +457,24 @@ pub enum ProfileReadyState {
     Running,
 }
 
+/// Authentication evidence is separate from executable launchability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileAuthState {
+    Unknown,
+    NeedsLogin,
+    Authenticated,
+}
+
+/// Structured protocol evidence is never inferred from a parsed version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileProtocolState {
+    Untested,
+    Ready,
+    Incompatible,
+}
+
 /// Detection / status result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProfileStatus {
@@ -462,7 +484,20 @@ pub struct ProfileStatus {
     pub version: Option<String>,
     pub preferred_interface: Option<InterfacePreference>,
     pub state: ProfileReadyState,
+    /// True only when the exact detected program and any shebang interpreter
+    /// can be launched with `child_path`.
+    pub launchable: bool,
+    pub authentication: ProfileAuthState,
+    pub structured_protocol: ProfileProtocolState,
     pub notes: Vec<String>,
+    /// Exact child PATH used for both probes and launch, omitted only when it
+    /// cannot be represented safely on the current platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_path: Option<String>,
+    /// Resolved shebang interpreter for wrapper-based CLIs (for example npm's
+    /// `/usr/bin/env node`). This is launch evidence, never auth evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpreter_path: Option<String>,
 }
 
 /// Launch plan for a profile or generic CLI.
@@ -531,6 +566,7 @@ pub fn official_profiles() -> Vec<Profile> {
                 "{{prompt}}".into(),
                 "--output-format".into(),
                 "stream-json".into(),
+                "--verbose".into(),
             ],
             // `-p` owns the follow-up prompt; without it a resumed process
             // would receive neither the requested turn nor stream-json flags.
@@ -541,6 +577,7 @@ pub fn official_profiles() -> Vec<Profile> {
                 "{{native_id}}".into(),
                 "--output-format".into(),
                 "stream-json".into(),
+                "--verbose".into(),
             ],
             official: true,
         },
@@ -567,7 +604,7 @@ pub fn official_profiles() -> Vec<Profile> {
                 "stream-json".into(),
             ],
             structured_start_args: vec!["acp".into()],
-            resume_args: vec!["acp".into(), "--session".into(), "{{native_id}}".into()],
+            resume_args: vec![],
             official: true,
         },
         Profile {
@@ -676,14 +713,15 @@ pub fn official_profiles() -> Vec<Profile> {
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
             structured_start_args: vec!["acp".into()],
-            resume_args: vec!["acp".into(), "--resume".into(), "{{native_id}}".into()],
+            resume_args: vec![],
             official: true,
         },
         Profile {
             id: OfficialProfileId::Qoder.as_str().into(),
             display_name: "Qoder CLI".into(),
-            // Spec §13.1: primary command is qodercli
-            binaries: vec!["qodercli".into(), "qoder".into()],
+            // Current documentation uses `qoder`; keep the historic
+            // `qodercli` executable as a detection fallback.
+            binaries: vec!["qoder".into(), "qodercli".into()],
             interface_order: vec![
                 InterfacePreference::Acp,
                 InterfacePreference::Jsonl,
@@ -809,21 +847,46 @@ impl ProfileRegistry {
         }
         let detected = binary_path.is_some();
         let preferred_interface = p.interface_order.first().copied();
-        let version = if let Some(bin) = &binary_path {
-            probe_version(bin, &p.version_args)
+        let child_path = child_path(search_dirs);
+        let interpreter_path = binary_path.as_deref().and_then(|bin| {
+            match resolve_shebang_interpreter(Path::new(bin), search_dirs) {
+                Ok(path) => path.map(|path| path.to_string_lossy().into_owned()),
+                Err(reason) => {
+                    notes.push(reason);
+                    None
+                }
+            }
+        });
+        let launch_dependency_missing = notes
+            .iter()
+            .any(|note| note.starts_with("interpreter_not_found:"));
+        if detected && child_path.is_none() {
+            notes.push("child_path_unrepresentable: deterministic search PATH is invalid".into());
+        }
+        let version = if let (Some(bin), Some(path)) = (&binary_path, &child_path) {
+            if launch_dependency_missing {
+                None
+            } else {
+                probe_version(bin, &p.version_args, path)
+            }
         } else {
             None
         };
 
         let state = if !detected {
             ProfileReadyState::NotInstalled
+        } else if launch_dependency_missing || child_path.is_none() {
+            ProfileReadyState::AdapterDegraded
         } else if let (Some(min), Some(ver)) = (&p.min_version, &version) {
             if let Some(parsed) = parse_semver_prefix(ver) {
                 if version_less(&parsed, min) {
                     notes.push(format!("version {ver} below minimum {min}"));
                     ProfileReadyState::UnsupportedVersion
                 } else {
-                    ProfileReadyState::Ready
+                    // Binary/version/launch evidence is not authentication
+                    // evidence. Without a documented read-only auth probe the
+                    // most truthful state remains `installed`.
+                    ProfileReadyState::Installed
                 }
             } else {
                 ProfileReadyState::Installed
@@ -831,6 +894,14 @@ impl ProfileRegistry {
         } else {
             ProfileReadyState::Installed
         };
+        let launchable = detected
+            && !launch_dependency_missing
+            && child_path.is_some()
+            && !matches!(state, ProfileReadyState::UnsupportedVersion);
+        if detected {
+            notes.push("authentication_unknown: no documented read-only probe".into());
+            notes.push("structured_protocol_untested: run an explicit session to verify".into());
+        }
 
         Ok(ProfileStatus {
             id: p.id.clone(),
@@ -839,7 +910,12 @@ impl ProfileRegistry {
             version,
             preferred_interface,
             state,
+            launchable,
+            authentication: ProfileAuthState::Unknown,
+            structured_protocol: ProfileProtocolState::Untested,
             notes,
+            child_path,
+            interpreter_path,
         })
     }
 
@@ -925,6 +1001,9 @@ impl ProfileRegistry {
                 status.version.unwrap_or_else(|| "unknown".into()),
             ));
         }
+        if matches!(status.state, ProfileReadyState::AdapterDegraded) {
+            return Err(ProfileError::LaunchDependency(status.notes.join("; ")));
+        }
 
         let interface = if force_pty {
             InterfacePreference::Pty
@@ -947,6 +1026,10 @@ impl ProfileRegistry {
             }
         };
 
+        let mut env = BTreeMap::new();
+        if let Some(path) = status.child_path {
+            env.insert("PATH".into(), path);
+        }
         Ok(LaunchPlan {
             profile_id: Some(p.id.clone()),
             program,
@@ -954,7 +1037,7 @@ impl ProfileRegistry {
             cwd: None,
             interface,
             use_pty: interface == InterfacePreference::Pty || force_pty,
-            env: BTreeMap::new(),
+            env,
         })
     }
 
@@ -1003,6 +1086,9 @@ impl ProfileRegistry {
             )));
         }
         let status = self.detect_with_search_dirs(id, search_dirs)?;
+        if matches!(status.state, ProfileReadyState::AdapterDegraded) {
+            return Err(ProfileError::LaunchDependency(status.notes.join("; ")));
+        }
         let needs_prompt = p.resume_args.iter().any(|arg| arg.contains("{{prompt}}"));
         if needs_prompt && prompt.is_none_or(str::is_empty) {
             return Err(ProfileError::Parse(format!(
@@ -1021,6 +1107,10 @@ impl ProfileRegistry {
         let program = status
             .binary_path
             .ok_or_else(|| ProfileError::NotInstalled(p.binaries.join(" / ")))?;
+        let mut env = BTreeMap::new();
+        if let Some(path) = status.child_path {
+            env.insert("PATH".into(), path);
+        }
         Ok(LaunchPlan {
             profile_id: Some(p.id.clone()),
             program,
@@ -1028,7 +1118,7 @@ impl ProfileRegistry {
             cwd: None,
             interface: InterfacePreference::StructuredRpc,
             use_pty: false,
-            env: BTreeMap::new(),
+            env,
         })
     }
 }
@@ -1043,6 +1133,82 @@ fn executable_search_dirs() -> Vec<PathBuf> {
         dirs.extend(ownmesh_exec::user_cli_search_dirs(home.as_deref()));
     }
     dirs
+}
+
+fn child_path(search_dirs: &[PathBuf]) -> Option<String> {
+    std::env::join_paths(search_dirs)
+        .ok()
+        .and_then(|value| value.into_string().ok())
+}
+
+/// Resolve the interpreter dependency of a Unix shebang wrapper without
+/// invoking a shell or importing a login environment.
+fn resolve_shebang_interpreter(
+    program: &Path,
+    search_dirs: &[PathBuf],
+) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    {
+        let _ = (program, search_dirs);
+        Ok(None)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(program)
+            .map_err(|_| "interpreter_not_found: wrapper could not be inspected".to_owned())?;
+        let mut prefix = [0_u8; 4096];
+        let count = file
+            .read(&mut prefix)
+            .map_err(|_| "interpreter_not_found: wrapper could not be inspected".to_owned())?;
+        let first_line = prefix[..count]
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let Some(shebang) = first_line.strip_prefix(b"#!") else {
+            return Ok(None);
+        };
+        let shebang = std::str::from_utf8(shebang)
+            .map_err(|_| "interpreter_not_found: shebang is not UTF-8".to_owned())?
+            .trim();
+        let mut words = shebang.split_ascii_whitespace();
+        let interpreter = words
+            .next()
+            .ok_or_else(|| "interpreter_not_found: empty shebang".to_owned())?;
+        let interpreter_path = PathBuf::from(interpreter);
+        if interpreter_path
+            .file_name()
+            .is_some_and(|name| name == "env")
+        {
+            let mut command = words
+                .next()
+                .ok_or_else(|| "interpreter_not_found: env shebang omitted command".to_owned())?;
+            if command == "-S" {
+                command = words.next().ok_or_else(|| {
+                    "interpreter_not_found: env -S shebang omitted command".to_owned()
+                })?;
+            } else if command.starts_with('-') {
+                return Err(format!(
+                    "interpreter_not_found: unsupported env shebang option {command}"
+                ));
+            }
+            return ownmesh_exec::resolve_launchable_executable_in_dirs(
+                command,
+                search_dirs,
+                None,
+                false,
+                None,
+            )
+            .map(Some)
+            .ok_or_else(|| format!("interpreter_not_found: {command}"));
+        }
+        if interpreter_path.is_absolute() && ownmesh_exec::is_launchable_file(&interpreter_path) {
+            Ok(Some(interpreter_path))
+        } else {
+            Err(format!("interpreter_not_found: {interpreter}"))
+        }
+    }
 }
 
 fn expand_template(
@@ -1075,7 +1241,7 @@ async fn stop_version_probe(child: &mut tokio::process::Child) {
     let _ = tokio::time::timeout(VERSION_PROBE_STOP_GRACE, child.wait()).await;
 }
 
-async fn probe_version_bounded(bin: &str, args: &[String]) -> Option<String> {
+async fn probe_version_bounded(bin: &str, args: &[String], child_path: &str) -> Option<String> {
     use tokio::io::AsyncReadExt;
 
     // P1-C: resolve through the shared executable resolver so Windows batch
@@ -1091,14 +1257,15 @@ async fn probe_version_bounded(bin: &str, args: &[String]) -> Option<String> {
     // both memory and the producer: once the direct child exits, the deadline
     // expires, or the aggregate budget is full, dropping the read ends makes
     // inherited descendant writes fail instead of growing a temporary file.
-    let mut child = tokio::process::Command::new(&resolved_argv[0])
+    let mut command = tokio::process::Command::new(&resolved_argv[0]);
+    command
         .args(&resolved_argv[1..])
+        .env("PATH", child_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
+        .kill_on_drop(true);
+    let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     let mut stderr = child.stderr.take()?;
     let deadline = tokio::time::Instant::now() + VERSION_PROBE_TIMEOUT;
@@ -1165,15 +1332,16 @@ async fn probe_version_bounded(bin: &str, args: &[String]) -> Option<String> {
     }
 }
 
-fn probe_version(bin: &str, args: &[String]) -> Option<String> {
+fn probe_version(bin: &str, args: &[String], child_path: &str) -> Option<String> {
     let bin = bin.to_owned();
     let args = args.to_vec();
+    let child_path = child_path.to_owned();
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .ok()?;
-        runtime.block_on(probe_version_bounded(&bin, &args))
+        runtime.block_on(probe_version_bounded(&bin, &args, &child_path))
     })
     .join()
     .ok()
@@ -1635,6 +1803,14 @@ pub struct NormalizedEvent {
     pub text: Option<String>,
     pub native_session_id: Option<String>,
     pub raw_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Stable reason when a vendor asks for a capability OwnMesh did not
+    /// advertise. Never contains vendor payload text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_reason: Option<String>,
 }
 
 /// Maximum accepted adapter record length, excluding the trailing LF.
@@ -1677,6 +1853,25 @@ pub struct AdapterEventPage {
 /// append and is never converted into a partial event.
 #[must_use]
 pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPage {
+    parse_adapter_event_page_inner(raw, base_cursor, None)
+}
+
+/// Parse one bounded page with the official vendor dialect selected by the
+/// session's immutable profile metadata.
+#[must_use]
+pub fn parse_adapter_event_page_for_dialect(
+    raw: &[u8],
+    base_cursor: u64,
+    dialect: AdapterDialect,
+) -> AdapterEventPage {
+    parse_adapter_event_page_inner(raw, base_cursor, Some(dialect))
+}
+
+fn parse_adapter_event_page_inner(
+    raw: &[u8],
+    base_cursor: u64,
+    dialect: Option<AdapterDialect>,
+) -> AdapterEventPage {
     let mut events = Vec::new();
     let mut consumed = 0_usize;
     let mut scan = 0_usize;
@@ -1699,25 +1894,27 @@ pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPag
             }
         } else {
             match std::str::from_utf8(line) {
-                Ok(text) => match classify_adapter_event(text.trim_end_matches('\r')) {
-                    Ok(Some(event)) => AdapterEventRecord {
-                        cursor,
-                        event: Some(event),
-                        error: None,
-                    },
-                    Ok(None) => {
-                        // JSON-RPC handshakes, keepalives, and responses are
-                        // protocol control records, not user-visible replay.
-                        consumed = record_end;
-                        scan = record_end;
-                        continue;
+                Ok(text) => {
+                    match classify_adapter_event_for_dialect(text.trim_end_matches('\r'), dialect) {
+                        Ok(Some(event)) => AdapterEventRecord {
+                            cursor,
+                            event: Some(event),
+                            error: None,
+                        },
+                        Ok(None) => {
+                            // JSON-RPC handshakes, keepalives, and responses are
+                            // protocol control records, not user-visible replay.
+                            consumed = record_end;
+                            scan = record_end;
+                            continue;
+                        }
+                        Err(error) => AdapterEventRecord {
+                            cursor,
+                            event: None,
+                            error: Some(error.into()),
+                        },
                     }
-                    Err(error) => AdapterEventRecord {
-                        cursor,
-                        event: None,
-                        error: Some(error.into()),
-                    },
-                },
+                }
                 Err(_) => AdapterEventRecord {
                     cursor,
                     event: None,
@@ -1748,6 +1945,507 @@ pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPag
 /// Best-effort event normalization from JSONL adapter lines.
 pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
     classify_adapter_event(raw).ok().flatten()
+}
+
+fn classify_adapter_event_for_dialect(
+    raw: &str,
+    dialect: Option<AdapterDialect>,
+) -> Result<Option<NormalizedEvent>, &'static str> {
+    match dialect {
+        Some(AdapterDialect::CodexAppServer) => classify_codex_event(raw),
+        Some(AdapterDialect::ClaudeStreamJson) => classify_claude_event(raw),
+        Some(AdapterDialect::PiRpc) => classify_pi_event(raw),
+        Some(AdapterDialect::AgyStreamJson) => classify_agy_event(raw),
+        Some(
+            AdapterDialect::KimiAcp
+            | AdapterDialect::OpenCodeServer
+            | AdapterDialect::QwenAcp
+            | AdapterDialect::HermesAcp
+            | AdapterDialect::QoderAcp,
+        ) => classify_acp_event(raw),
+        None => classify_adapter_event(raw),
+    }
+}
+
+fn parse_event_object(
+    raw: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, &'static str> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|_| "malformed adapter JSON event")?
+        .as_object()
+        .cloned()
+        .ok_or("malformed adapter JSON event")
+}
+
+fn classify_codex_event(raw: &str) -> Result<Option<NormalizedEvent>, &'static str> {
+    // Codex is JSON-RPC-like JSONL without the jsonrpc member. The shared
+    // classifier delegates method notifications to the dedicated Codex map.
+    classify_adapter_event(raw)
+}
+
+fn classify_acp_event(raw: &str) -> Result<Option<NormalizedEvent>, &'static str> {
+    let object = parse_event_object(raw)?;
+    if object.get("error").is_some() {
+        return Ok(Some(normalized_event(
+            "error",
+            "json_rpc_error",
+            bounded_json_string(object.get("error").and_then(|error| error.get("message"))),
+            None,
+        )));
+    }
+    let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
+        return if object.contains_key("id") {
+            Ok(None)
+        } else {
+            Err("unrecognized ACP event")
+        };
+    };
+    let params = object.get("params").and_then(serde_json::Value::as_object);
+    let session_id = native_session_id(None, params);
+    if method == "session/update" {
+        let update = params
+            .and_then(|params| params.get("update"))
+            .and_then(serde_json::Value::as_object)
+            .ok_or("ACP session/update omitted update")?;
+        let update_type = update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("ACP session/update omitted sessionUpdate")?;
+        let content_text = || {
+            bounded_json_string(
+                update
+                    .get("content")
+                    .and_then(|content| content.get("text")),
+            )
+        };
+        let tool_id = || {
+            update
+                .get("toolCallId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let event = match update_type {
+            "agent_message_chunk" => typed_event(
+                "assistant_message_delta",
+                update_type,
+                content_text(),
+                session_id,
+                None,
+                None,
+                None,
+            ),
+            // Hidden reasoning is deliberately consumed as protocol control,
+            // never copied into user-visible replay.
+            "agent_thought_chunk" | "user_message_chunk" => return Ok(None),
+            "tool_call" => typed_event(
+                "tool_call",
+                update_type,
+                bounded_json_string(update.get("title")),
+                session_id,
+                tool_id(),
+                bounded_json_string(update.get("status")),
+                None,
+            ),
+            "tool_call_update" => {
+                let status = bounded_json_string(update.get("status"));
+                let kind = if matches!(status.as_deref(), Some("completed" | "failed")) {
+                    "tool_result"
+                } else {
+                    "status"
+                };
+                typed_event(
+                    kind,
+                    update_type,
+                    update
+                        .get("content")
+                        .and_then(first_content_text)
+                        .or_else(|| bounded_json_string(update.get("title"))),
+                    session_id,
+                    tool_id(),
+                    status,
+                    None,
+                )
+            }
+            "plan"
+            | "current_mode_update"
+            | "available_commands_update"
+            | "config_option_update" => typed_event(
+                "status",
+                update_type,
+                bounded_json_string(update.get("title")),
+                session_id,
+                None,
+                None,
+                None,
+            ),
+            "usage_update" => typed_event("usage", update_type, None, session_id, None, None, None),
+            _ => return Err("unrecognized ACP session/update event"),
+        };
+        return Ok(Some(event));
+    }
+    if method == "session/request_permission" {
+        let tool_call = params
+            .and_then(|params| params.get("toolCall"))
+            .and_then(serde_json::Value::as_object);
+        return Ok(Some(typed_event(
+            "permission_request",
+            method,
+            bounded_json_string(tool_call.and_then(|tool| tool.get("title"))),
+            session_id,
+            tool_call
+                .and_then(|tool| tool.get("toolCallId"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            Some("waiting_approval".into()),
+            None,
+        )));
+    }
+    if method.starts_with("fs/") || method.starts_with("terminal/") {
+        return Ok(Some(typed_event(
+            "adapter_error",
+            method,
+            Some("adapter requested a client capability OwnMesh did not advertise".into()),
+            session_id,
+            None,
+            Some("rejected".into()),
+            Some("capability_not_advertised"),
+        )));
+    }
+    if matches!(method, "ping" | "heartbeat" | "keepalive") {
+        return Ok(None);
+    }
+    Err("unrecognized ACP JSON-RPC event")
+}
+
+fn classify_claude_event(raw: &str) -> Result<Option<NormalizedEvent>, &'static str> {
+    let object = parse_event_object(raw)?;
+    let raw_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Claude event omitted type")?;
+    let session_id = object
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let event = match raw_type {
+        "system" => typed_event(
+            "session",
+            raw_type,
+            bounded_json_string(object.get("subtype")),
+            session_id,
+            None,
+            Some("running".into()),
+            None,
+        ),
+        "assistant" => {
+            let content = object
+                .get("message")
+                .and_then(|message| message.get("content"));
+            if let Some(tool) = content.and_then(first_tool_block) {
+                typed_event(
+                    "tool_call",
+                    raw_type,
+                    bounded_json_string(tool.get("name")),
+                    session_id,
+                    tool.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    Some("pending".into()),
+                    None,
+                )
+            } else if let Some(text) = content.and_then(visible_content_text) {
+                normalized_event("assistant_message", raw_type, Some(text), session_id)
+            } else {
+                return Ok(None);
+            }
+        }
+        "user" => {
+            let content = object
+                .get("message")
+                .and_then(|message| message.get("content"));
+            let Some(tool) = content.and_then(first_tool_result_block) else {
+                return Ok(None);
+            };
+            typed_event(
+                "tool_result",
+                raw_type,
+                tool.get("content").and_then(visible_content_text),
+                session_id,
+                tool.get("tool_use_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                Some(
+                    if tool.get("is_error").and_then(serde_json::Value::as_bool) == Some(true) {
+                        "failed".into()
+                    } else {
+                        "completed".into()
+                    },
+                ),
+                None,
+            )
+        }
+        "result" => {
+            let is_error = object
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            typed_event(
+                if is_error { "error" } else { "completed" },
+                raw_type,
+                bounded_json_string(object.get("result")),
+                session_id,
+                None,
+                Some(if is_error { "failed" } else { "completed" }.into()),
+                None,
+            )
+        }
+        "stream_event" => {
+            let event = object
+                .get("event")
+                .and_then(serde_json::Value::as_object)
+                .ok_or("Claude stream_event omitted event")?;
+            let delta = event.get("delta").and_then(serde_json::Value::as_object);
+            if delta
+                .and_then(|delta| delta.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("text_delta")
+            {
+                normalized_event(
+                    "assistant_message_delta",
+                    raw_type,
+                    bounded_json_string(delta.and_then(|delta| delta.get("text"))),
+                    session_id,
+                )
+            } else {
+                return Ok(None);
+            }
+        }
+        _ => return Err("unrecognized Claude stream-json event"),
+    };
+    Ok(Some(event))
+}
+
+fn classify_pi_event(raw: &str) -> Result<Option<NormalizedEvent>, &'static str> {
+    let object = parse_event_object(raw)?;
+    let raw_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Pi event omitted type")?;
+    let event = match raw_type {
+        "response" => {
+            if object.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+                normalized_event(
+                    "error",
+                    raw_type,
+                    bounded_json_string(object.get("error")),
+                    None,
+                )
+            } else {
+                return Ok(None);
+            }
+        }
+        "agent_start" | "turn_start" | "message_start" | "queue_update" | "compaction_start"
+        | "compaction_end" | "auto_retry_start" | "auto_retry_end" => {
+            normalized_event("status", raw_type, None, None)
+        }
+        "message_update" => {
+            let update = object
+                .get("assistantMessageEvent")
+                .and_then(serde_json::Value::as_object)
+                .ok_or("Pi message_update omitted assistantMessageEvent")?;
+            match update.get("type").and_then(serde_json::Value::as_str) {
+                Some("text_delta") => normalized_event(
+                    "assistant_message_delta",
+                    raw_type,
+                    bounded_json_string(update.get("delta")),
+                    None,
+                ),
+                Some("toolcall_start" | "toolcall_delta" | "toolcall_end") => typed_event(
+                    "tool_call",
+                    raw_type,
+                    None,
+                    None,
+                    None,
+                    Some("pending".into()),
+                    None,
+                ),
+                // Thinking deltas are intentionally not public replay.
+                Some("thinking_start" | "thinking_delta" | "thinking_end" | "start" | "done") => {
+                    return Ok(None);
+                }
+                Some("error") => normalized_event("error", raw_type, None, None),
+                _ => return Err("unrecognized Pi message_update event"),
+            }
+        }
+        "message_end" | "turn_end" => {
+            let text = object
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(visible_content_text);
+            normalized_event("assistant_message", raw_type, text, None)
+        }
+        "tool_execution_start" => typed_event(
+            "tool_call",
+            raw_type,
+            bounded_json_string(object.get("toolName")),
+            None,
+            bounded_json_string(object.get("toolCallId")),
+            Some("in_progress".into()),
+            None,
+        ),
+        "tool_execution_update" | "tool_execution_end" => typed_event(
+            "tool_result",
+            raw_type,
+            object
+                .get("partialResult")
+                .or_else(|| object.get("result"))
+                .and_then(|result| result.get("content"))
+                .and_then(first_content_text),
+            None,
+            bounded_json_string(object.get("toolCallId")),
+            Some(if raw_type.ends_with("end") {
+                "completed".into()
+            } else {
+                "in_progress".into()
+            }),
+            None,
+        ),
+        "agent_end" => typed_event(
+            "completed",
+            raw_type,
+            None,
+            None,
+            None,
+            Some("completed".into()),
+            None,
+        ),
+        "extension_error" => normalized_event(
+            "error",
+            raw_type,
+            bounded_json_string(object.get("error")),
+            None,
+        ),
+        _ => return Err("unrecognized Pi RPC event"),
+    };
+    Ok(Some(event))
+}
+
+fn classify_agy_event(raw: &str) -> Result<Option<NormalizedEvent>, &'static str> {
+    let object = parse_event_object(raw)?;
+    let raw_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Agy stream-json event omitted type")?;
+    let session_id = bounded_json_string(object.get("session_id"));
+    let event = match raw_type {
+        "init" => normalized_event("session", raw_type, None, session_id),
+        "message"
+            if object.get("role").and_then(serde_json::Value::as_str) == Some("assistant") =>
+        {
+            normalized_event(
+                if object.get("delta").and_then(serde_json::Value::as_bool) == Some(true) {
+                    "assistant_message_delta"
+                } else {
+                    "assistant_message"
+                },
+                raw_type,
+                bounded_json_string(object.get("content")),
+                session_id,
+            )
+        }
+        "message" => return Ok(None),
+        "tool_use" => typed_event(
+            "tool_call",
+            raw_type,
+            bounded_json_string(object.get("tool_name")),
+            session_id,
+            bounded_json_string(object.get("tool_id")),
+            Some("pending".into()),
+            None,
+        ),
+        "tool_result" => typed_event(
+            "tool_result",
+            raw_type,
+            bounded_json_string(object.get("output").or_else(|| object.get("error"))),
+            session_id,
+            bounded_json_string(object.get("tool_id")),
+            bounded_json_string(object.get("status")),
+            None,
+        ),
+        "error" => normalized_event(
+            "error",
+            raw_type,
+            bounded_json_string(object.get("message")),
+            session_id,
+        ),
+        "result" => typed_event(
+            "completed",
+            raw_type,
+            None,
+            session_id,
+            None,
+            bounded_json_string(object.get("status")),
+            None,
+        ),
+        _ => return Err("unrecognized Agy stream-json event"),
+    };
+    Ok(Some(event))
+}
+
+fn first_tool_block(
+    value: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value.as_array()?.iter().find_map(|block| {
+        let object = block.as_object()?;
+        (object.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"))
+            .then_some(object)
+    })
+}
+
+fn first_tool_result_block(
+    value: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value.as_array()?.iter().find_map(|block| {
+        let object = block.as_object()?;
+        (object.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"))
+            .then_some(object)
+    })
+}
+
+fn visible_content_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(bounded_copy(text, MAX_NORMALIZED_EVENT_TEXT_BYTES));
+    }
+    let array = value.as_array()?;
+    let mut text = String::new();
+    for block in array {
+        let Some(object) = block.as_object() else {
+            continue;
+        };
+        if object.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            continue;
+        }
+        if let Some(part) = object.get("text").and_then(serde_json::Value::as_str) {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(part);
+            if text.len() >= MAX_NORMALIZED_EVENT_TEXT_BYTES {
+                break;
+            }
+        }
+    }
+    (!text.is_empty()).then(|| bounded_copy(&text, MAX_NORMALIZED_EVENT_TEXT_BYTES))
+}
+
+fn first_content_text(value: &serde_json::Value) -> Option<String> {
+    visible_content_text(value).or_else(|| {
+        value
+            .as_object()
+            .and_then(|object| object.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .map(|text| bounded_copy(text, MAX_NORMALIZED_EVENT_TEXT_BYTES))
+    })
 }
 
 /// Classify one adapter record without exposing its raw JSON payload.
@@ -1794,6 +2492,26 @@ fn classify_json_rpc_notification(
     let params = params.and_then(serde_json::Value::as_object);
     let native_session_id = native_session_id(None, params);
     let event = match method {
+        "configWarning" | "warning" => normalized_event(
+            "status",
+            method,
+            bounded_json_string(
+                params.and_then(|value| value.get("summary").or_else(|| value.get("message"))),
+            ),
+            native_session_id,
+        ),
+        "thread/started" | "thread/status/changed" | "remoteControl/status/changed" => {
+            normalized_event(
+                "session",
+                method,
+                bounded_json_string(params.and_then(|value| {
+                    value
+                        .get("status")
+                        .or_else(|| value.get("thread").and_then(|thread| thread.get("status")))
+                })),
+                native_session_id,
+            )
+        }
         "turn/started" => normalized_event(
             "session",
             method,
@@ -1821,29 +2539,36 @@ fn classify_json_rpc_notification(
                 )
             }
         }
-        "item/agentMessage/delta" | "item/reasoning/textDelta" => normalized_event(
-            "message",
+        "item/agentMessage/delta" => normalized_event(
+            "assistant_message_delta",
             method,
             Some(required_json_string(
                 params.and_then(|value| value.get("delta")),
             )?),
             native_session_id,
         ),
+        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => return Ok(None),
         "item/started" | "item/completed" => {
             let item = params.and_then(|value| value.get("item"));
             let item_type = required_json_string(item.and_then(|value| value.get("type")))?;
-            if item_type == "agentMessage" && method == "item/started" {
+            if matches!(
+                item_type.as_str(),
+                "agentMessage" | "userMessage" | "reasoning"
+            ) && method == "item/started"
+            {
                 return Ok(None);
             }
             if item_type == "agentMessage" {
                 normalized_event(
-                    "message",
+                    "assistant_message",
                     method,
                     Some(required_json_string(
                         item.and_then(|value| value.get("text")),
                     )?),
                     native_session_id,
                 )
+            } else if matches!(item_type.as_str(), "userMessage" | "reasoning") {
+                return Ok(None);
             } else {
                 normalized_event(
                     if method == "item/completed" {
@@ -1863,6 +2588,24 @@ fn classify_json_rpc_notification(
             Some(required_json_string(
                 params.and_then(|value| value.get("delta")),
             )?),
+            native_session_id,
+        ),
+        "thread/tokenUsage/updated" | "turn/diff/updated" => normalized_event(
+            if method == "thread/tokenUsage/updated" {
+                "usage"
+            } else {
+                "status"
+            },
+            method,
+            None,
+            native_session_id,
+        ),
+        "error" => normalized_event(
+            "error",
+            method,
+            bounded_json_string(
+                params.and_then(|value| value.get("message").or_else(|| value.get("error"))),
+            ),
             native_session_id,
         ),
         _ => return Err("unrecognized adapter JSON-RPC event"),
@@ -1914,7 +2657,26 @@ fn normalized_event(
         text,
         native_session_id,
         raw_type: bounded_copy(raw_type, MAX_NORMALIZED_EVENT_TYPE_BYTES),
+        tool_call_id: None,
+        status: None,
+        capability_reason: None,
     }
+}
+
+fn typed_event(
+    kind: &str,
+    raw_type: &str,
+    text: Option<String>,
+    native_session_id: Option<String>,
+    tool_call_id: Option<String>,
+    status: Option<String>,
+    capability_reason: Option<&str>,
+) -> NormalizedEvent {
+    let mut event = normalized_event(kind, raw_type, text, native_session_id);
+    event.tool_call_id = tool_call_id.map(|value| bounded_copy(&value, 256));
+    event.status = status.map(|value| bounded_copy(&value, 128));
+    event.capability_reason = capability_reason.map(str::to_owned);
+    event
 }
 
 fn required_json_string(value: Option<&serde_json::Value>) -> Result<String, &'static str> {
@@ -1986,7 +2748,14 @@ mod tests {
             "--nocapture".to_owned(),
         ];
         let started = Instant::now();
-        assert_eq!(probe_version(&exe.to_string_lossy(), &args), None);
+        assert_eq!(
+            probe_version(
+                &exe.to_string_lossy(),
+                &args,
+                &std::env::var("PATH").unwrap_or_default(),
+            ),
+            None
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -2005,7 +2774,11 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(
-                probe_version(&shim.to_string_lossy(), &["--version".into()]),
+                probe_version(
+                    &shim.to_string_lossy(),
+                    &["--version".into()],
+                    &std::env::var("PATH").unwrap_or_default(),
+                ),
                 None,
                 "non-launchable probe target must fail closed"
             );
@@ -2142,7 +2915,11 @@ mod tests {
             "--nocapture".to_owned(),
         ];
         let started = Instant::now();
-        let _version = probe_version(&exe.to_string_lossy(), &args);
+        let _version = probe_version(
+            &exe.to_string_lossy(),
+            &args,
+            &std::env::var("PATH").unwrap_or_default(),
+        );
         std::env::remove_var(PID_FILE_ENV);
         std::env::remove_var(STATUS_ADDR_ENV);
         let pid = std::fs::read_to_string(&pid_file).unwrap();
@@ -2240,10 +3017,10 @@ mod tests {
     }
 
     #[test]
-    fn qoder_binary_is_qodercli() {
+    fn qoder_prefers_current_name_and_keeps_legacy_binary() {
         let reg = ProfileRegistry::with_official();
         let p = reg.get("qoder").unwrap();
-        assert_eq!(p.binaries[0], "qodercli");
+        assert_eq!(p.binaries, ["qoder", "qodercli"]);
     }
 
     #[test]
@@ -2509,7 +3286,7 @@ acp = false
 
     #[test]
     fn codex_json_rpc_fixture_normalizes_events_without_protocol_or_raw_payloads() {
-        let raw = include_bytes!("../tests/fixtures/codex-app-server-replay.jsonl");
+        let raw = include_bytes!("../tests/fixtures/codex-0.149.1-app-server.jsonl");
         let page = parse_adapter_event_page(raw, 100);
         assert_eq!(page.events.len(), 8);
         assert_eq!(page.events[0].event.as_ref().unwrap().kind, "session");
@@ -2536,6 +3313,147 @@ acp = false
             "unknown JSON-RPC params must not be copied into replay"
         );
         assert_eq!(page.next_cursor, 100 + raw.len() as u64);
+    }
+
+    #[test]
+    fn all_official_dialect_fixtures_normalize_bounded_public_events() {
+        let fixtures: &[(AdapterDialect, &[u8], &[&str])] = &[
+            (
+                AdapterDialect::ClaudeStreamJson,
+                include_bytes!("../tests/fixtures/claude-2.1.246-stream-json.jsonl"),
+                &[
+                    "session",
+                    "assistant_message",
+                    "tool_call",
+                    "tool_result",
+                    "completed",
+                ],
+            ),
+            (
+                AdapterDialect::KimiAcp,
+                include_bytes!("../tests/fixtures/kimi-0.37-acp.jsonl"),
+                &["assistant_message_delta", "usage"],
+            ),
+            (
+                AdapterDialect::OpenCodeServer,
+                include_bytes!("../tests/fixtures/opencode-1.18.23-acp.jsonl"),
+                &[
+                    "assistant_message_delta",
+                    "tool_call",
+                    "tool_result",
+                    "usage",
+                ],
+            ),
+            (
+                AdapterDialect::PiRpc,
+                include_bytes!("../tests/fixtures/pi-0.73.1-rpc.jsonl"),
+                &[
+                    "status",
+                    "assistant_message_delta",
+                    "tool_call",
+                    "tool_result",
+                    "completed",
+                ],
+            ),
+            (
+                AdapterDialect::AgyStreamJson,
+                include_bytes!("../tests/fixtures/agy-2026-08-27-stream-json.jsonl"),
+                &[
+                    "session",
+                    "assistant_message_delta",
+                    "tool_call",
+                    "tool_result",
+                    "completed",
+                ],
+            ),
+            (
+                AdapterDialect::QwenAcp,
+                include_bytes!("../tests/fixtures/qwen-acp-v1.jsonl"),
+                &["assistant_message_delta", "permission_request"],
+            ),
+            (
+                AdapterDialect::HermesAcp,
+                include_bytes!("../tests/fixtures/hermes-acp-v1.jsonl"),
+                &["assistant_message_delta", "permission_request"],
+            ),
+            (
+                AdapterDialect::QoderAcp,
+                include_bytes!("../tests/fixtures/qoder-acp-v1.jsonl"),
+                &["assistant_message_delta", "adapter_error"],
+            ),
+        ];
+        for (dialect, raw, expected) in fixtures {
+            let page = parse_adapter_event_page_for_dialect(raw, 0, *dialect);
+            let actual: Vec<_> = page
+                .events
+                .iter()
+                .map(|record| {
+                    record
+                        .event
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{dialect:?}: {:?}", record.error))
+                        .kind
+                        .as_str()
+                })
+                .collect();
+            assert_eq!(actual, *expected, "{dialect:?}");
+            let public = serde_json::to_string(&page).unwrap();
+            assert!(!public.contains("must-not-be-exposed"), "{dialect:?}");
+            assert!(!public.contains("redacted"), "{dialect:?}");
+        }
+    }
+
+    #[test]
+    fn npm_wrapper_requires_and_exports_the_same_interpreter_path() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, b"#!/usr/bin/env node\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&codex, perms).unwrap();
+        }
+        let reg = ProfileRegistry::with_official();
+        let degraded = reg
+            .detect_with_search_dirs("codex", std::slice::from_ref(&bin))
+            .unwrap();
+        if cfg!(unix) {
+            assert_eq!(degraded.state, ProfileReadyState::AdapterDegraded);
+            assert!(degraded
+                .notes
+                .iter()
+                .any(|note| note == "interpreter_not_found: node"));
+        }
+
+        let node = bin.join("node");
+        std::fs::write(&node, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&node).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&node, perms).unwrap();
+            let status = reg
+                .detect_with_search_dirs("codex", std::slice::from_ref(&bin))
+                .unwrap();
+            assert_eq!(
+                status.interpreter_path.as_deref(),
+                Some(node.to_string_lossy().as_ref())
+            );
+            let plan = reg
+                .launch_plan_with_search_dirs(
+                    "codex",
+                    Some("hello"),
+                    false,
+                    std::slice::from_ref(&bin),
+                )
+                .unwrap();
+            assert_eq!(plan.env.get("PATH"), status.child_path.as_ref());
+        }
     }
 
     #[test]
