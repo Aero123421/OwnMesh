@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v1.2.24 — Runtime availability and profile adapter correctness
+
+v1.2.24 is the first formal release after v1.2.23. It combines the post-release availability work in #169 and #167 with the official nine-profile adapter correctness work in #171. No authorization, privacy, telemetry, or relay default is loosened.
+
 ### Device availability
 
 - Non-elevated `command.run` no longer holds the daemon runtime mutex while
