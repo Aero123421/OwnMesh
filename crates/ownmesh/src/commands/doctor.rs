@@ -7,7 +7,8 @@ use ownmesh_config::{redact_control_plane_url, OwnMeshPaths};
 use ownmesh_diagnostics::{
     appears_redacted, run_doctor, BinaryObservation, ConfigObservation, ControlPlaneObservation,
     CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
-    DoctorOutcome, DoctorReport, PrivacyPolicyObservation, ServiceObservation,
+    DoctorOutcome, DoctorReport, LayoutCustodyFinding, LayoutCustodyObservation,
+    PrivacyPolicyObservation, ServiceObservation,
 };
 use ownmesh_domain::ExitCode;
 use ownmesh_identity::{
@@ -39,6 +40,7 @@ pub fn collect_doctor_report(
         service,
         journals: observe_journals(paths),
         profile_discovery: observe_profile_discovery(),
+        layout_custody: observe_layout_custody(paths),
     };
 
     // Control-plane URL from config. Unsafe URLs are rejected/redacted before any output.
@@ -200,6 +202,81 @@ fn observe_config(paths: &OwnMeshPaths) -> ConfigObservation {
         obs.message = Some("config file mode allows other-write".into());
     }
     obs
+}
+
+/// Same ancestor walk the Agent uses at start. Read-only.
+pub(crate) fn observe_layout_custody(paths: &OwnMeshPaths) -> LayoutCustodyObservation {
+    let roots = [
+        ("config", paths.config_dir.as_path()),
+        ("state", paths.state_dir.as_path()),
+        ("runtime", paths.runtime_dir.as_path()),
+    ];
+    match ownmesh_ipc::inspect_layout_custody(&roots) {
+        Ok(issues) => {
+            let current_uid = ownmesh_ipc::process_euid();
+            LayoutCustodyObservation {
+                findings: issues
+                    .into_iter()
+                    .map(|(layout, issue)| LayoutCustodyFinding {
+                        layout,
+                        path: issue.path.display().to_string(),
+                        uid: issue.uid,
+                        mode: issue.unix_mode(),
+                        kind: match issue.kind {
+                            ownmesh_ipc::CustodyIssueKind::ReplacementPermitted => {
+                                "replacement_permitted".into()
+                            }
+                            ownmesh_ipc::CustodyIssueKind::UntrustedOwner => {
+                                "untrusted_owner".into()
+                            }
+                            ownmesh_ipc::CustodyIssueKind::StickyChildNotOwned => {
+                                "sticky_child_not_owned".into()
+                            }
+                        },
+                        remediation: issue.remediation(current_uid),
+                    })
+                    .collect(),
+                inspect_error: None,
+            }
+        }
+        Err(error) => LayoutCustodyObservation {
+            findings: Vec::new(),
+            inspect_error: Some(error.to_string()),
+        },
+    }
+}
+
+/// Fail closed before login/enroll/service mutations when Agent start would
+/// refuse these layout ancestors.
+pub(crate) fn preflight_layout_custody(paths: &OwnMeshPaths) -> Result<(), String> {
+    let observed = observe_layout_custody(paths);
+    if let Some(error) = observed.inspect_error {
+        return Err(format!(
+            "cannot inspect config/state/runtime ancestors (Agent start uses the same walk): {error}"
+        ));
+    }
+    if observed.findings.is_empty() {
+        return Ok(());
+    }
+    let mut lines =
+        vec!["Agent cannot start until listed config/state/runtime ancestors are fixed.".into()];
+    if observed
+        .findings
+        .iter()
+        .any(|finding| finding.kind == "replacement_permitted")
+    {
+        lines.push(
+            "OwnMesh will not chmod a shared parent without an explicit per-path confirmation, and never recursively.".into(),
+        );
+    }
+    for finding in &observed.findings {
+        lines.push(format!(
+            "  [{}] {} mode={:04o} uid={}: {}",
+            finding.layout, finding.path, finding.mode, finding.uid, finding.remediation
+        ));
+    }
+    lines.push("Fix the listed directories, then re-run setup or `ownmesh service start`.".into());
+    Err(lines.join("\n"))
 }
 
 fn config_permissions_ok(path: &Path) -> bool {
@@ -2108,5 +2185,46 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
         } else {
             assert!(!obs.home_unavailable, "HOME present: {obs:?}");
         }
+    }
+
+    /// #168: doctor must fail on a group-writable ancestor, not hide it
+    /// behind daemon.ipc "not connected".
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fails_closed_on_group_writable_layout_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = preflight_layout_custody(&paths).unwrap_err();
+        assert!(
+            err.contains("chmod g-w") || err.contains("permits replacement"),
+            "{err}"
+        );
+        let report = collect_doctor_report(
+            &paths,
+            &DoctorArgs {
+                check_network: false,
+                offline: true,
+                repair_journal: false,
+                i_understand_replay_risk: false,
+            },
+            "1.2.23",
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "layout.custody")
+            .expect("layout.custody");
+        assert_eq!(check.status, ownmesh_diagnostics::CheckStatus::Fail);
+        assert!(
+            check.message.contains("0775")
+                || check.detail.as_deref().unwrap_or("").contains("0775"),
+            "{check:?}"
+        );
+        assert!(!report.ok);
+        assert_eq!(report.outcome, DoctorOutcome::Error);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

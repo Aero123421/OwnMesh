@@ -634,6 +634,10 @@ pub fn run_setup(cli: &Cli, args: &SetupArgs) -> Result<(), ExitCode> {
         eprintln!("setup: path error: {e}");
         ExitCode::UsageConfig
     })?;
+    if let Err(error) = super::doctor::preflight_layout_custody(&paths) {
+        eprintln!("setup: {error}");
+        return Err(ExitCode::UsageConfig);
+    }
 
     let mut stdout = io::stdout();
     let mut stdin = io::stdin();
@@ -927,5 +931,27 @@ mod tests {
         let dumped = serde_json::to_string(&result).unwrap();
         assert!(!dumped.to_ascii_lowercase().contains("token"));
         assert!(!dumped.contains("password"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_preflight_refuses_group_writable_ancestors_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = super::super::doctor::preflight_layout_custody(&paths).unwrap_err();
+        assert!(
+            err.contains("cannot start") || err.contains("chmod"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o7777,
+            0o775,
+            "preflight must not chmod without confirmation"
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::doctor::preflight_layout_custody(&paths).unwrap();
     }
 }

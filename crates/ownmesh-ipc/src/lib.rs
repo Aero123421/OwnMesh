@@ -58,11 +58,12 @@ pub use frame::{read_frame, write_frame, FrameDecoder, MAX_FRAME_BYTES};
 #[cfg(target_os = "macos")]
 pub use macos_peer::{macos_unix_peer_facts, MacOsUnixPeerFacts};
 pub use registry::{
-    atomic_write_owner_only, create_owner_only_file_new, open_owner_only_file_append,
+    atomic_write_owner_only, clear_group_other_write, create_owner_only_file_new,
+    inspect_layout_custody, inspect_parent_custody, open_owner_only_file_append,
     open_owner_only_file_append_linkable, open_owner_only_file_read, prepare_owner_only_state_dir,
-    publish_owner_only_file_no_replace, read_management_credential, read_owner_only_file_bounded,
-    remove_owner_only_file, BootstrapStatus, CLIENT_CREDENTIAL_ENV,
-    MANAGEMENT_CREDENTIAL_FILE_NAME,
+    process_euid, publish_owner_only_file_no_replace, read_management_credential,
+    read_owner_only_file_bounded, remove_owner_only_file, BootstrapStatus, CustodyAncestorIssue,
+    CustodyIssueKind, CLIENT_CREDENTIAL_ENV, MANAGEMENT_CREDENTIAL_FILE_NAME,
 };
 pub use rpc::{
     app_error, methods, AgentRoutePresence, CredentialClientParams, CredentialProvisionParams,

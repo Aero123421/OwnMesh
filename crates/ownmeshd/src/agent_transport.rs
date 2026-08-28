@@ -5,8 +5,7 @@
 //! fail-closed (`remote_routing_enabled: false`).
 
 use crate::runtime::{
-    apply_control_plane_approval_decision_off_lock, dispatch_off_lock, DaemonRuntime,
-    RuntimeCallBinding,
+    apply_control_plane_approval_decision_unlocked, dispatch_unlocked, DaemonRuntime,
 };
 use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
 use futures_util::stream::FuturesUnordered;
@@ -555,22 +554,20 @@ async fn transfer_runtime_call(
     params: Value,
     cancel: Option<watch::Receiver<bool>>,
 ) -> Result<Value, String> {
-    dispatch_off_lock(
-        runtime,
-        method,
-        Some(params),
-        &authority.client,
-        RuntimeCallBinding::Remote {
+    let mut guard = runtime.lock().await;
+    guard
+        .dispatch_cancellable_bound(
+            method,
+            Some(params),
+            &authority.client,
             cancel,
-            operation_id: Some(authority.operation_id.clone()),
-            expires_at_unix: Some(authority.expires_at_unix),
-            payload_hash: Some(authority.payload_hash.clone()),
-            device_id: Some(authority.device_id.clone()),
-            principal_credential_generation: None,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())
+            Some(authority.operation_id.clone()),
+            Some(authority.expires_at_unix),
+            Some(authority.payload_hash.clone()),
+            Some(authority.device_id.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn b64_standard_encode(bytes: &[u8]) -> String {
@@ -3204,6 +3201,12 @@ fn map_request_to_method(
             }
             crate::runtime::session_methods::GIVE
         }
+        ("session.cancel" | "session", "session.cancel" | "ownmesh_session_cancel" | "cancel") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::CANCEL
+        }
         (
             "session.write" | "session",
             "session.write" | "ownmesh_session_write" | "write" | "input",
@@ -3870,12 +3873,8 @@ async fn dispatch_remote_operation(
                 }
             }
         }
-        // #160: an approval that releases a deferred `command.run` executes
-        // that command here. Its child must not be awaited under the runtime
-        // mutex either — this is the only path by which a remote command that
-        // hit a policy Ask ever runs.
         let outcome =
-            apply_control_plane_approval_decision_off_lock(runtime, Some(decision_params)).await;
+            apply_control_plane_approval_decision_unlocked(runtime, Some(decision_params)).await;
         return match outcome {
             Ok(mut body) => {
                 // decisionOpId stays on the envelope so DeviceRoom pending matches;
@@ -3907,6 +3906,9 @@ async fn dispatch_remote_operation(
                             ownmesh_ipc::app_error::INVALID_PARAMS => "OWNMESH_E_INVALID_ARGUMENT",
                             ownmesh_ipc::app_error::EXECUTABLE_IDENTITY_DRIFT => {
                                 "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"
+                            }
+                            ownmesh_ipc::app_error::SELF_REENTRANT_EXEC => {
+                                "OWNMESH_E_SELF_REENTRANT_EXEC"
                             }
                             ownmesh_ipc::app_error::EXECUTABLE_FORMAT => {
                                 "OWNMESH_E_EXECUTABLE_FORMAT"
@@ -3995,22 +3997,17 @@ async fn dispatch_remote_operation(
         .get("idempotency_key")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    // #160: admission runs under the runtime mutex; a command's child is
-    // spawned and awaited with that mutex released, so an unrelated operation
-    // for this device is not queued behind it.
-    let outcome = dispatch_off_lock(
+    let outcome = dispatch_unlocked(
         runtime,
         mapped.0,
         Some(mapped.1),
         &client,
-        RuntimeCallBinding::Remote {
-            cancel: cancel_rx,
-            operation_id: Some(operation_id.clone()),
-            expires_at_unix: remote_expires_unix,
-            payload_hash: remote_payload_hash.clone(),
-            device_id: Some(device_id.as_str().to_owned()),
-            principal_credential_generation: remote_principal_credential_generation,
-        },
+        cancel_rx,
+        Some(operation_id.clone()),
+        remote_expires_unix,
+        remote_payload_hash.clone(),
+        Some(device_id.as_str().to_owned()),
+        remote_principal_credential_generation,
     )
     .await;
 
@@ -4231,6 +4228,9 @@ async fn dispatch_remote_operation(
                         }
                         ownmesh_ipc::app_error::EXECUTABLE_IDENTITY_DRIFT => {
                             "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"
+                        }
+                        ownmesh_ipc::app_error::SELF_REENTRANT_EXEC => {
+                            "OWNMESH_E_SELF_REENTRANT_EXEC"
                         }
                         ownmesh_ipc::app_error::CONFLICT
                             if message.starts_with("OWNMESH_E_JOURNAL_DEGRADED") =>
@@ -6623,7 +6623,7 @@ mod tests {
     }
 
     #[test]
-    fn session_renew_and_detach_map_to_exact_lease_methods() {
+    fn session_renew_detach_and_cancel_map_to_exact_lease_methods() {
         for (action, capability, expected) in [
             (
                 "session.renew",
@@ -6634,6 +6634,11 @@ mod tests {
                 "session.detach",
                 "session.detach",
                 crate::runtime::session_methods::DETACH,
+            ),
+            (
+                "session.cancel",
+                "session.cancel",
+                crate::runtime::session_methods::CANCEL,
             ),
         ] {
             let mut arguments = Map::new();

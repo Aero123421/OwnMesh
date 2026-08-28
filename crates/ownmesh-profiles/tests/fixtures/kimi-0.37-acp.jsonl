@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kimi-fixture","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"must-not-be-exposed"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kimi-fixture","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello from Kimi"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"kimi-fixture","update":{"sessionUpdate":"usage_update","used":42,"size":1000}}}

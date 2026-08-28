@@ -2,64 +2,54 @@
 
 ## Unreleased
 
-Continues the availability work from v1.2.23. These entries do not claim every
-acceptance criterion of the issues they reference is complete; what remains is
-named below and stays tracked in those issues.
-
 ### Device availability
 
-- A running command no longer holds the daemon's runtime mutex. The daemon kept
-  one `Mutex<DaemonRuntime>` for a child's whole lifetime, so a remotely
-  launched child that synchronously re-entered daemon IPC waited on the lock its
-  own parent held, and every later filesystem, Git, session, diagnosis, and
-  command request for that device queued behind it until the first operation was
-  cancelled by hand. Admission — revocation, lockdown, policy, grants,
-  executable custody, the exact-once journal reservation — still runs under the
-  mutex and now ends by capturing an immutable, authority-bound execution plan;
-  the guard is released, the child is spawned and awaited, and the mutex is
-  reacquired only for that operation's own commit step. Exact-once binding is
-  unchanged: the reservation is written before execution and stays in progress
-  while the child runs, so a concurrent replay of the same key is refused as
-  uncertain exactly as during an inline run. Concurrent commands are bounded
-  explicitly, because the mutex used to bound them to one: a command over the
-  bound waits for capacity before it takes the mutex, reserves a journal key,
-  or prepares an executable image, so a busy device queues rather than failing
-  and never pins more custody handles than it can run. A cancel that lands
-  while a command is queued is answered by never starting it. The same applies
-  to an approval that releases a deferred command, whether it arrives over
-  local IPC or from the control plane. Elevated broker execution and
-  persistent-session/PTY host waits still hold the mutex, so #160 stays open
-  for them.
-- A session child that exits but has not been reaped is attested as exited.
-  `StructuredProcessHost::is_exited` requires both output streams at EOF *and* a
-  reaped child and short-circuits on the first, so a child that exited while a
-  descendant still held its stdout/stderr open never reached the reap and kept
-  its PID slot and kernel start time. The supervisor therefore attested
-  `exited: false` for a process that was already gone, `session.open` published a
-  durable `running` record for it, and `close` answered "authenticated child is
-  still alive, refusing PID-only termination". Structured pipes are the
-  official-profile transport, which is where this was first reported.
-  PID-reuse protection is unchanged — the durable birth witness is still the
-  plain one — and a probe failure is never read as exited. On Linux the
-  liveness probe reads state `Z` as exited, so a thread-group leader that
-  called `pthread_exit` while sibling threads keep running is now attested
-  exited; the underlying `StructuredProcessHost::is_exited` short-circuit is
-  untouched, so the child still stays unreaped until the host terminates it
-  (#31).
-
-### Installation
-
-- The Windows portable installer polls the authenticated daemon status to a
-  bounded readiness deadline instead of sleeping a fixed 500 ms and checking
-  once. A healthy daemon that needed longer to initialize — slow disk, first-run
-  state, AV scanning, a loaded CI or desktop host — was treated as a failed
-  upgrade and rolled the binaries back. IPC stays the readiness authority and
-  the deadline is what ends a failed wait; the one early exit is a safety net
-  for a scheduled task that was registered during the wait and then
-  disappeared, decided by exit code rather than by localized task-state text.
-  Nothing in an ordinary upgrade unregisters that task, so in practice it does
-  not fire. The deadline is measured on a monotonic clock so a backward NTP
-  correction cannot silently extend it (#154).
+- Non-elevated `command.run` no longer holds the daemon runtime mutex while
+  waiting for the child. Policy admission, pinning, and the exact-once journal
+  reserve still run under the lock; the child wait runs after release; the
+  in-progress marker is the compare-and-swap target at finalization. An
+  unrelated filesystem or diagnosis request can complete while a long command
+  is running, and a shell-wrapped OwnMesh CLI no longer deadlocks the device
+  (#160, [ADR 0015](docs/adr/0015-runtime-lock-released-across-command-wait.md)).
+  The pre-spawn `OWNMESH_E_SELF_REENTRANT_EXEC` guard remains. `system.diagnose`
+  adds a bounded `runtime_queue` check (`idle` / `executing` /
+  `self_reentrant_exec`) without argv, paths, or output. A live unlocked exec
+  that reserved a journal marker is not reported as a stuck receipt; a leftover
+  marker plus a keyless in-flight exec stays visible. The unlocked admit path
+  still applies lockdown, journal-degraded, and revoked-principal gates before
+  spawn. A global command semaphore is acquired before the runtime mutex,
+  journal reservation, and executable custody; queued remote commands can be
+  cancelled without later spawning or consuming their idempotency key, while
+  detached jobs retain their separate four-job cap. Control-plane and local
+  approvals use the same unlocked typed finalization path, including approval
+  bridges, and rollback restores only the operation's own journal/approval
+  entries so unrelated concurrent commits are never overwritten.
+- `session.open` will not commit `state=running` unless the OS reports the
+  attested child as still running. A short-lived process that is already a
+  zombie at the attestation barrier is rolled back instead of poisoning later
+  open/replay/close. Structured children that exit while a descendant keeps
+  their stdout/stderr pipes open are classified at the supervisor status
+  boundary; the durable birth witness remains the plain PID-reuse witness.
+  Linux `/proc` state `Z` and absence/probe ambiguity are disclosed explicitly
+  rather than overstated as an unambiguous reap result (#31).
+- The Windows portable installer polls authenticated `ownmesh --json status`
+  until `daemon.version` matches the installed CLI, using the same 20 s
+  bounded deadline as `ownmesh update`. A healthy daemon that needs more than
+  500 ms no longer triggers binary rollback. A leftover Task Scheduler
+  `LastTaskResult` while the task is READY is not this instance; a terminal
+  COM result fails the installer only after this instance was observed
+  running, or when the task is disabled. The bounded wait uses a monotonic
+  `Stopwatch`, tolerates native stderr/partial status while startup is in
+  progress, and never treats localized task text or a failed COM probe as
+  authoritative task absence. The supported 20-second default and
+  `OWNMESH_DAEMON_READY_TIMEOUT_SECONDS` override remain unchanged (#154).
+- Setup, `ownmesh doctor`, and the TUI Repair Agent path inspect the same
+  config/state/runtime ancestor custody walk the Agent uses at start. A
+  group-writable parent such as `~/.local/state` is a dedicated
+  `layout.custody` failure with path, mode, owner, and a non-recursive
+  `chmod g-w,o-w` next step — not a healthy doctor report plus a looping
+  `service start`. Repair never chmods a directory it does not own and never
+  recurses; TUI confirmation shows the exact paths first (#168).
 
 ## v1.2.23 — Availability, workspace authority, and dependency refresh
 

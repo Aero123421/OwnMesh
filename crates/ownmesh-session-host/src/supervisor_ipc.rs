@@ -67,8 +67,11 @@ pub struct SupervisorEnv {
 }
 
 /// Dedicated credentialed client used by exactly one `ownmeshd` instance.
+/// Clones share the same authenticated connection and are used only by
+/// daemon-owned protocol pumps for already-bound structured sessions.
+#[derive(Clone)]
 pub struct SupervisorClient {
-    client: IpcClient,
+    client: Arc<IpcClient>,
 }
 
 impl SupervisorClient {
@@ -113,16 +116,18 @@ impl SupervisorClient {
         };
         let issued: CredentialSecretResult = serde_json::from_value(issued_value)?;
         Ok(Self {
-            client: IpcClient::new(
-                endpoint,
-                runtime_dir,
-                ClientIdentity::new("ownmeshd-session-proxy", env!("CARGO_PKG_VERSION")),
-                ClientOptions {
-                    max_reconnect_attempts: 4,
-                    ..ClientOptions::default()
-                },
-            )
-            .with_client_credential(issued.credential),
+            client: Arc::new(
+                IpcClient::new(
+                    endpoint,
+                    runtime_dir,
+                    ClientIdentity::new("ownmeshd-session-proxy", env!("CARGO_PKG_VERSION")),
+                    ClientOptions {
+                        max_reconnect_attempts: 4,
+                        ..ClientOptions::default()
+                    },
+                )
+                .with_client_credential(issued.credential),
+            ),
         })
     }
 

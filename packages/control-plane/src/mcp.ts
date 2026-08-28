@@ -1137,6 +1137,33 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "session",
   },
   {
+    name: "ownmesh_session_cancel",
+    description: "Cancel the active structured profile turn while preserving its reusable native session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        lease_id: str,
+        controller_epoch: { type: "integer", minimum: 1 },
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "session_id", "lease_id", "controller_epoch", "workspace_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
     name: "ownmesh_session_close",
     description: "Close a device session and terminate its persistent host using the exact controller lease",
     inputSchema: {
@@ -2087,7 +2114,7 @@ const SYSTEM_DIAGNOSIS_CHECK_IDS = new Set([
 // above must be present and unknown ids are dropped either way. The Control
 // Plane additionally synthesizes its own authoritative `route` check from
 // DeviceRoom presence.
-const SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS = new Set(["agent_route"]);
+const SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS = new Set(["agent_route", "runtime_queue"]);
 const SYSTEM_DIAGNOSIS_ALL_CHECK_IDS = new Set([
   ...SYSTEM_DIAGNOSIS_CHECK_IDS,
   ...SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS,
@@ -2124,6 +2151,14 @@ const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
     disabled: { status: "pass", provenance: "observed" },
     unknown: { status: "pass", provenance: "observed" },
     offline: { status: "fail", provenance: "observed" },
+  },
+  // #160 additive: live unlocked command.wait / pre-spawn self-reentrancy
+  // guard. Older Agents omit it; missing is not a required-check failure.
+  runtime_queue: {
+    idle: { status: "pass", provenance: "observed" },
+    executing: { status: "warn", provenance: "observed" },
+    self_reentrant_exec: { status: "warn", provenance: "observed" },
+    runtime_queue_blocked: { status: "fail", provenance: "observed" },
   },
 };
 
@@ -3929,6 +3964,8 @@ function toolCapability(toolName: string): string {
       return "session.release";
     case "ownmesh_session_give":
       return "session.give";
+    case "ownmesh_session_cancel":
+      return "session.cancel";
     case "ownmesh_session_close":
       return "session.close";
     case "ownmesh_session_terminate":
@@ -4025,6 +4062,8 @@ function toolAction(toolName: string): string {
       return "session.release";
     case "ownmesh_session_give":
       return "session.give";
+    case "ownmesh_session_cancel":
+      return "session.cancel";
     case "ownmesh_session_close":
       return "session.close";
     case "ownmesh_session_terminate":

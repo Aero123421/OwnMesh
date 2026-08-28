@@ -693,7 +693,21 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("Invoke-OwnMeshSchTasks", text)
         self.assertIn("Get-OwnMeshFileSha256", text)
         self.assertIn("Restore-OwnMeshBackup", text)
-        self.assertIn("Updated OwnMesh daemon version did not match the CLI", text)
+        self.assertIn("Updated OwnMesh daemon did not become ready with the expected version", text)
+        self.assertIn("Wait-OwnMeshDaemonReady", text)
+        self.assertIn("Get-OwnMeshScheduledTaskRun", text)
+        self.assertIn("OWNMESH_DAEMON_READY_TIMEOUT_SECONDS", text)
+        self.assertIn("[Diagnostics.Stopwatch]::StartNew()", text)
+        self.assertIn("$elapsed.ElapsedMilliseconds", text)
+        self.assertNotIn(
+            "$deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)", text
+        )
+        self.assertIn("PSNativeCommandUseErrorActionPreference", text)
+        self.assertIn("ConvertFrom-Json -ErrorAction Stop", text)
+        self.assertIn("a failed COM probe returns $null", text)
+        # A single 500 ms sleep is the race this polling replaces: a healthy
+        # daemon that needs longer must not trigger rollback (#154).
+        self.assertNotRegex(text, r"(?im)^\s*Start-Sleep\s+-Milliseconds\s+500\b")
         # Windows PowerShell 5.1 NativeCommandError must not reach schtasks.exe.
         self.assertNotRegex(text, r"(?m)^\s*& schtasks\.exe\b")
         self.assertIn('cmd.exe /c "schtasks.exe /$Action /TN `"$TaskName`" 1>nul 2>nul"', text)
@@ -748,82 +762,100 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertNotIn("NativeCommandError", combined)
         self.assertNotIn("指定されたファイルが見つかりません", combined)
 
-    def _readiness_snippet(self, extra: str) -> str:
-        """Wait-OwnMeshDaemonReady plus the schtasks helper it calls."""
+    def _ownmesh_ready_helpers(self) -> str:
         text = PS_INSTALLER.read_text(encoding="utf-8")
-        helper_start = text.find("function Invoke-OwnMeshSchTasks")
-        helper_end = text.find("function Stop-InstalledOwnMeshProcesses", helper_start)
-        self.assertGreater(helper_end, helper_start, "could not bound Invoke-OwnMeshSchTasks")
-        wait_start = text.find("function Wait-OwnMeshDaemonReady")
-        self.assertNotEqual(wait_start, -1, "Wait-OwnMeshDaemonReady helper is missing")
-        wait_end = text.find("function Restore-OwnMeshBackup", wait_start)
-        self.assertGreater(wait_end, wait_start, "could not bound Wait-OwnMeshDaemonReady")
-        return (
-            text[helper_start:helper_end]
-            + text[wait_start:wait_end]
-            + "$ErrorActionPreference = 'Stop'\n"
-            + "Set-StrictMode -Version Latest\n"
-            + extra
-        )
+        start = text.find("function Get-OwnMeshScheduledTaskRun")
+        self.assertNotEqual(start, -1, "Get-OwnMeshScheduledTaskRun helper is missing")
+        end = text.find("function Stop-InstalledOwnMeshProcesses", start)
+        self.assertGreater(end, start, "could not bound daemon-ready helpers")
+        return text[start:end]
 
-    def _fake_ownmesh_status_cli(self, directory: Path, ready_after_polls: int) -> Path:
-        """A stand-in `ownmesh.exe` whose daemon reports the new version late.
+    def _pwsh_for_ready_fixtures(self) -> str:
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            self.skipTest("powershell not available")
+        return pwsh
 
-        `ready_after_polls` is counted in calls rather than wall-clock so the
-        fixture is deterministic; the caller sets the poll interval, and the
-        assertions are about elapsed time against the deadline. A negative
-        value never becomes ready.
-
-        A real upgrade spends its first polls with no daemon answering at all,
-        so the ready fixture starts by failing on stderr with a non-zero exit.
-        That is the branch the installer's `2>$null` and `$LASTEXITCODE`
-        handling exists for; a shim that only ever succeeds never reaches it.
-        """
-        counter = directory / "poll-count.txt"
-        shim = directory / "ownmesh.cmd"
-        ready = "9.9.9-new"
-        stale = "1.0.0-old"
-        if ready_after_polls >= 0:
-            unreachable_until = min(3, ready_after_polls)
-            # A multi-line block rather than one line joined by `&`: cmd.exe
-            # parses `1>&2& exit` ambiguously enough not to rely on.
-            gate = "\r\n".join(
+    def _write_status_stub(
+        self,
+        directory: Path,
+        *,
+        version: str,
+        delay_ms: int = 0,
+        never_ready: bool = False,
+        fail_polls: int = 0,
+    ) -> Path:
+        script = directory / "ownmesh-status-stub.py"
+        counter = directory / "ownmesh-status-count.txt"
+        script.write_text(
+            "\n".join(
                 [
-                    f"if %n% LSS {unreachable_until} (",
-                    "echo daemon is not answering yet 1>&2",
-                    "exit /b 1",
-                    f") else if %n% GEQ {ready_after_polls} (",
-                    f'echo {{"daemon":{{"version":"{ready}"}}}}',
-                    ") else (",
-                    f'echo {{"daemon":{{"version":"{stale}"}}}}',
-                    ")",
+                    "import json, pathlib, sys, time",
+                    f"delay = {delay_ms} / 1000",
+                    "if delay:",
+                    "    time.sleep(delay)",
+                    "args = sys.argv[1:]",
+                    "if args == ['--json', 'status']:",
+                    f"    counter = pathlib.Path({str(counter)!r})",
+                    "    poll = int(counter.read_text() or '0') + 1 if counter.exists() else 1",
+                    "    counter.write_text(str(poll))",
+                    f"    if poll <= {fail_polls}:",
+                    "        print('daemon is not answering yet', file=sys.stderr)",
+                    "        sys.exit(1)",
+                    f"    version = '0.0.0-never' if {str(never_ready)} else {version!r}",
+                    "    print(json.dumps({'schema_version': 1, 'daemon': {'version': version}}))",
+                    "    sys.exit(0)",
+                    "sys.exit(2)",
+                    "",
                 ]
-            )
-        else:
-            gate = f'echo {{"daemon":{{"version":"{stale}"}}}}'
-        # `newline=""` writes the explicit CRLFs verbatim. The default
-        # translates every "\n" to os.linesep, which on Windows — the only
-        # platform these fixtures run on — would emit "\r\r\n" and leave a
-        # stray CR on every line of a batch file.
-        shim.write_text(
-            "@echo off\r\n"
-            "setlocal enabledelayedexpansion\r\n"
-            "set /a n=0\r\n"
-            f'if exist "{counter}" set /p n=<"{counter}"\r\n'
-            "set /a n=n+1\r\n"
-            f'> "{counter}" echo %n%\r\n'
-            f"{gate}\r\n"
-            "exit /b 0\r\n",
-            encoding="ascii",
-            newline="",
+            ),
+            encoding="utf-8",
         )
-        return shim
+        if _is_windows():
+            stub = directory / "ownmesh.cmd"
+            stub.write_text(
+                f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n',
+                encoding="ascii",
+                newline="",
+            )
+            return stub
+        stub = directory / "ownmesh"
+        stub.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(script))} \"$@\"\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        return stub
 
-    def _run_powershell(self, snippet: str) -> subprocess.CompletedProcess[str]:
-        powershell = shutil.which("powershell")
-        assert powershell is not None
+    def _run_wait_ready(
+        self,
+        stub: Path,
+        *,
+        expected_version: str,
+        timeout_seconds: int,
+        poll_milliseconds: int = 200,
+        task_run_ps: str = "$null",
+    ) -> subprocess.CompletedProcess[str]:
+        pwsh = self._pwsh_for_ready_fixtures()
+        snippet = (
+            self._ownmesh_ready_helpers()
+            + "function Get-OwnMeshScheduledTaskRun { "
+            + task_run_ps
+            + " }\n"
+            + f"$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            + "try {\n"
+            + f"    Wait-OwnMeshDaemonReady -OwnMeshPath {shlex.quote(str(stub))} "
+            + f"-ExpectedVersion {shlex.quote(expected_version)} "
+            + f"-TimeoutSeconds {timeout_seconds} -PollMilliseconds {poll_milliseconds}\n"
+            + "    Write-Output (\"ready elapsed_ms={0}\" -f $sw.ElapsedMilliseconds)\n"
+            + "} catch {\n"
+            + "    Write-Output (\"failed elapsed_ms={0} err={1}\" -f $sw.ElapsedMilliseconds, $_.Exception.Message)\n"
+            + "    exit 1\n"
+            + "}\n"
+        )
         return subprocess.run(
-            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", snippet],
+            [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", snippet],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -831,139 +863,106 @@ class InstallerAdversarialTests(unittest.TestCase):
             check=False,
         )
 
-    def test_windows_ps1_has_no_fixed_readiness_sleep(self) -> None:
-        """#154: readiness is polled to a bounded deadline, never slept for.
-
-        The single fixed 500 ms wait plus one status call failed healthy
-        upgrades that needed longer to initialize and rolled the binaries
-        back. This is a source assertion so it holds on every platform, not
-        only where PowerShell can run.
-        """
-        text = PS_INSTALLER.read_text(encoding="utf-8")
-        self.assertIn("Wait-OwnMeshDaemonReady", text)
-        self.assertNotRegex(
-            text,
-            r"(?im)^\s*Start-Sleep\s+-Milliseconds\s+500\s*$",
-            "the fixed post-start readiness sleep must not come back",
-        )
-        # The wait runs inside the try whose catch restores the backup, so a
-        # never-ready daemon still rolls back.
-        wait_call = text.find("Wait-OwnMeshDaemonReady `")
-        self.assertNotEqual(wait_call, -1, "the installer must call the bounded wait")
-        rollback = text.find("Post-install verification failed", wait_call)
-        self.assertGreater(rollback, wait_call, "the wait must precede the rollback handler")
-
-    def test_windows_ps1_readiness_accepts_a_delayed_daemon(self) -> None:
-        """A daemon that needs well over 500 ms is an upgrade that succeeded."""
-        if not _is_windows():
-            self.skipTest("Windows PowerShell 5.1 only")
-        if not shutil.which("powershell"):
-            self.skipTest("powershell.exe not available")
-        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-") as tmp:
-            # 200 ms x 8 polls is ~1.6 s: comfortably past the old fixed wait.
-            shim = self._fake_ownmesh_status_cli(Path(tmp), ready_after_polls=8)
-            snippet = self._readiness_snippet(
-                "$started = [DateTime]::UtcNow\n"
-                f"Wait-OwnMeshDaemonReady -OwnMeshPath '{shim}' "
-                "-ExpectedVersion '9.9.9-new' -TimeoutSeconds 30 -PollMilliseconds 200\n"
-                # Formatted as an integer so a comma-decimal locale cannot
-                # change what the assertion below reads.
-                "$elapsed = [int]([DateTime]::UtcNow - $started).TotalMilliseconds\n"
-                "Write-Output \"ready-after-ms=$elapsed\"\n"
+    def test_windows_ps1_delayed_daemon_ready_succeeds_without_rollback(self) -> None:
+        # #154: a healthy daemon that needs more than 500 ms must not roll back.
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-delay-") as tmp:
+            # The first status call fails noisily on native stderr, then a
+            # later authenticated payload reports the expected version.
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=800, fail_polls=1
             )
-            completed = self._run_powershell(snippet)
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub, expected_version="1.2.23", timeout_seconds=5, poll_milliseconds=100
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000
             combined = completed.stdout + completed.stderr
             self.assertEqual(completed.returncode, 0, combined)
-            match = re.search(r"ready-after-ms=([0-9]+)", combined)
-            self.assertIsNotNone(match, combined)
-            assert match is not None
-            elapsed_ms = float(match.group(1))
-            self.assertGreater(
-                elapsed_ms,
-                500,
-                "the fixture must outlast the old fixed wait to be meaningful",
-            )
+            self.assertIn("ready elapsed_ms=", combined)
+            self.assertGreaterEqual(elapsed_ms, 800)
+            self.assertLess(elapsed_ms, 15000)
 
-    def test_windows_ps1_readiness_fails_after_the_full_deadline(self) -> None:
-        """A never-ready daemon fails only once the whole deadline is spent."""
-        if not _is_windows():
-            self.skipTest("Windows PowerShell 5.1 only")
-        if not shutil.which("powershell"):
-            self.skipTest("powershell.exe not available")
-        with tempfile.TemporaryDirectory(prefix="ownmesh-never-ready-") as tmp:
-            shim = self._fake_ownmesh_status_cli(Path(tmp), ready_after_polls=-1)
-            snippet = self._readiness_snippet(
-                "$started = [DateTime]::UtcNow\n"
-                "try {\n"
-                f"  Wait-OwnMeshDaemonReady -OwnMeshPath '{shim}' "
-                "-ExpectedVersion '9.9.9-new' -TimeoutSeconds 3 -PollMilliseconds 200\n"
-                "  Write-Output 'unexpected-success'\n"
-                "} catch {\n"
-                "  $elapsed = [int]([DateTime]::UtcNow - $started).TotalMilliseconds\n"
-                "  Write-Output \"failed-after-ms=$elapsed\"\n"
-                "  Write-Output \"message=$($_.Exception.Message)\"\n"
-                "}\n"
+    def test_windows_ps1_never_ready_daemon_fails_after_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-never-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
             )
-            completed = self._run_powershell(snippet)
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub, expected_version="1.2.23", timeout_seconds=2, poll_milliseconds=100
+            )
+            elapsed = time.monotonic() - started
+            combined = completed.stdout + completed.stderr
+            self.assertNotEqual(completed.returncode, 0, combined)
+            self.assertIn("did not become ready with the expected version", combined)
+            self.assertGreaterEqual(elapsed, 1.8)
+            self.assertLess(elapsed, 6)
+
+    def test_windows_ps1_disabled_task_fails_immediately(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-disabled-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=8,
+                poll_milliseconds=200,
+                task_run_ps="@{ State = 1; LastTaskResult = 2147942402 }",
+            )
+            elapsed = time.monotonic() - started
+            combined = completed.stdout + completed.stderr
+            self.assertNotEqual(completed.returncode, 0, combined)
+            self.assertIn("Scheduled task is disabled", combined)
+            self.assertLess(elapsed, 2)
+
+    def test_windows_ps1_ready_stale_last_result_still_waits_for_status(self) -> None:
+        """READY + leftover LastTaskResult is the previous run, not this instance."""
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-stale-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=800
+            )
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=5,
+                poll_milliseconds=100,
+                task_run_ps="@{ State = 3; LastTaskResult = 2147942402 }",
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000
             combined = completed.stdout + completed.stderr
             self.assertEqual(completed.returncode, 0, combined)
-            self.assertNotIn("unexpected-success", combined)
-            self.assertIn("Updated OwnMesh daemon version did not match the CLI", combined)
-            match = re.search(r"failed-after-ms=([0-9]+)", combined)
-            self.assertIsNotNone(match, combined)
-            assert match is not None
-            elapsed_ms = float(match.group(1))
-            self.assertGreaterEqual(
-                elapsed_ms,
-                3000,
-                f"the full deadline must be spent before rollback: {combined}",
-            )
+            self.assertIn("ready elapsed_ms=", combined)
+            self.assertGreaterEqual(elapsed_ms, 800)
+            self.assertLess(elapsed_ms, 15000)
 
-    def test_windows_ps1_readiness_stops_early_when_the_task_disappears(self) -> None:
-        """Authoritative terminal evidence short-circuits the deadline.
-
-        The task probe is shadowed here so the control flow can be exercised
-        without registering a real scheduled task; the real helper's schtasks
-        behavior is covered by its own test.
-        """
-        if not _is_windows():
-            self.skipTest("Windows PowerShell 5.1 only")
-        if not shutil.which("powershell"):
-            self.skipTest("powershell.exe not available")
-        with tempfile.TemporaryDirectory(prefix="ownmesh-task-gone-") as tmp:
-            shim = self._fake_ownmesh_status_cli(Path(tmp), ready_after_polls=-1)
-            snippet = self._readiness_snippet(
-                "$script:probe = 0\n"
-                "function Invoke-OwnMeshSchTasks {\n"
-                "  param([string]$Action, [string]$TaskName)\n"
-                "  $script:probe = $script:probe + 1\n"
-                "  if ($script:probe -le 1) { return 0 } else { return 1 }\n"
-                "}\n"
-                "$started = [DateTime]::UtcNow\n"
-                "try {\n"
-                f"  Wait-OwnMeshDaemonReady -OwnMeshPath '{shim}' "
-                "-ExpectedVersion '9.9.9-new' -TimeoutSeconds 60 -PollMilliseconds 200\n"
-                "  Write-Output 'unexpected-success'\n"
-                "} catch {\n"
-                "  $elapsed = [int]([DateTime]::UtcNow - $started).TotalMilliseconds\n"
-                "  Write-Output \"failed-after-ms=$elapsed\"\n"
-                "  Write-Output \"message=$($_.Exception.Message)\"\n"
-                "}\n"
+    def test_windows_ps1_terminal_task_failure_after_running_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ownmesh-ready-taskfail-") as tmp:
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=0, never_ready=True
             )
-            completed = self._run_powershell(snippet)
+            started = time.monotonic()
+            completed = self._run_wait_ready(
+                stub,
+                expected_version="1.2.23",
+                timeout_seconds=8,
+                poll_milliseconds=200,
+                task_run_ps=(
+                    "if (-not (Test-Path variable:script:OwnMeshTaskPoll)) "
+                    "{ $script:OwnMeshTaskPoll = 0 }; "
+                    "$script:OwnMeshTaskPoll++; "
+                    "if ($script:OwnMeshTaskPoll -eq 1) "
+                    "{ return @{ State = 4; LastTaskResult = 267009 } }; "
+                    "return @{ State = 3; LastTaskResult = 2147942402 }"
+                ),
+            )
+            elapsed = time.monotonic() - started
             combined = completed.stdout + completed.stderr
-            self.assertEqual(completed.returncode, 0, combined)
-            self.assertNotIn("unexpected-success", combined)
-            self.assertIn("scheduled task is no longer registered", combined)
-            match = re.search(r"failed-after-ms=([0-9]+)", combined)
-            self.assertIsNotNone(match, combined)
-            assert match is not None
-            elapsed_ms = float(match.group(1))
-            self.assertLess(
-                elapsed_ms,
-                30000,
-                f"terminal task evidence must not wait out the deadline: {combined}",
-            )
+            self.assertNotEqual(completed.returncode, 0, combined)
+            self.assertIn("Scheduled task action failed with last run result", combined)
+            self.assertLess(elapsed, 2)
 
     def test_windows_ps1_sha256_helper_with_core_psmodulepath(self) -> None:
         if not _is_windows():

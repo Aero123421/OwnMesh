@@ -9,9 +9,12 @@
 //! of `runtime`, so it reaches `DaemonRuntime`'s private state directly, and
 //! handlers are `pub(super)` because the dispatch table lives in the parent.
 
+const CODEX_CANCEL_REPLAY_BYTES: usize = 1024 * 1024;
+
 use super::{
-    app_error, base64_standard, default_shell_command, fs_err, is_remote_runtime_principal, json,
-    normalize_handoff_target, official_adapter_spec, parse_adapter_event_page, parse_params,
+    app_error, base64_standard, cancel_protocol_frame, default_shell_command, fs_err,
+    is_remote_runtime_principal, json, latest_codex_turn_id, normalize_handoff_target,
+    official_adapter_spec, parse_adapter_event_page_for_dialect, parse_params,
     persistent_child_is_live, preset_name, principal_journal_key, reject_spoofed_principal,
     session_err, sha256_hex, AdapterDialect, ClientIdentity, DaemonRuntime, Deserialize,
     HostIoMode, IpcError, IpcResult, LiveHost, NativeResume, OperationFacts, Path, PathBuf,
@@ -269,6 +272,8 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
         // but are not searched mean installed CLIs appear not-installed.
         let profile_discovery = profile_discovery_health();
         let credential_store = credential_store_health(&self.paths);
+        let (in_flight_external, in_flight_journaled, self_reentrant_refusals) =
+            super::runtime_queue_observation();
         let mut payload = system_diagnosis_payload(
             &observed_at,
             SystemDiagnosisFacts {
@@ -293,6 +298,9 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 profile_discovery,
                 credential_store,
                 agent_route: self.agent_route_presence(),
+                in_flight_external,
+                in_flight_journaled,
+                self_reentrant_refusals,
             },
         );
         if let Some(object) = payload.as_object_mut() {
@@ -473,6 +481,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         // still use program/args/command without profile registration.
         let mut profile_meta: Option<Value> = None;
         let mut structured_adapter: Option<(String, AdapterDialect)> = None;
+        let mut profile_env: Vec<(String, String)> = Vec::new();
         // Argv resumes consume the native id in their exact launch plan; a
         // negotiated JSON-RPC resume keeps it for the structured driver.
         let mut driver_native_session_id = p.native_session_id.clone();
@@ -500,7 +509,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 code: app_error::INVALID_PARAMS,
                 message: format!("no source-backed adapter contract for profile {profile_id}"),
             })?;
-            // Process-argv resumes (Claude/Kimi/Hermes) consume the native id
+            // Process-argv resumes (currently Claude) consume the native id
             // before ACP bootstrap; passing it again would incorrectly issue a
             // second `session/load`. Negotiated resumes (Codex/ACP) start the
             // normal structured child and let the exact driver perform the
@@ -549,8 +558,21 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 });
             }
             if !plan.use_pty {
+                if matches!(
+                    spec.dialect,
+                    AdapterDialect::ClaudeStreamJson | AdapterDialect::AgyStreamJson
+                ) && p.prompt.is_none()
+                {
+                    return Err(IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: format!(
+                            "profile {profile_id} uses a one-shot structured interface and requires an explicit prompt"
+                        ),
+                    });
+                }
                 structured_adapter = Some((spec.profile_id.clone(), spec.dialect));
             }
+            profile_env = plan.env.into_iter().collect();
             profile_meta = Some(json!({
                 "profile_id": plan.profile_id,
                 "interface": plan.interface.as_str(),
@@ -618,25 +640,30 @@ install it or use an explicit path. {}",
         // Process-only kinds stay metadata until structured adapters stream events.
         // Failure to spawn is fail-closed so ChatGPT never sees a fake echo-only session.
         let spawn_live = matches!(kind, SessionKind::Pty | SessionKind::ProfileAgent);
-        // A remote persistent session cannot be owned safely without the
-        // device identity authenticated by Agent transport. Check this before
-        // inserting session metadata: otherwise a rejected launch is visible
-        // as a `running` session for the lifetime of this daemon.
-        let remote_device_id = if spawn_live && is_remote_runtime_principal(&client.client_name) {
-            Some(
-                self.active_remote_device_id
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| IpcError::Remote {
-                        code: app_error::UNAUTHORIZED,
-                        message: "remote session.open requires verified Agent device identity"
-                            .into(),
-                    })?
-                    .to_owned(),
-            )
-        } else {
-            None
-        };
+        // Structured adapters always use the same persistent structured-pipe
+        // supervisor, including local CLI calls. This prevents local
+        // `profile start/resume` from silently taking a PTY path that never
+        // performs the documented handshake. Remote calls bind the verified
+        // Agent device identity; the local-only binding uses a stable marker
+        // that cannot be supplied through public request parameters.
+        let persistent_host_device_id =
+            if spawn_live && is_remote_runtime_principal(&client.client_name) {
+                Some(
+                    self.active_remote_device_id
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| IpcError::Remote {
+                            code: app_error::UNAUTHORIZED,
+                            message: "remote session.open requires verified Agent device identity"
+                                .into(),
+                        })?
+                        .to_owned(),
+                )
+            } else if spawn_live && structured_adapter.is_some() {
+                Some("local-device".to_owned())
+            } else {
+                None
+            };
         // Once the marker exists, every later error deliberately leaves it in
         // place: retrying an uncertain external side effect is less safe than
         // requiring operator reconciliation (same posture as `gate_and_run`).
@@ -667,7 +694,13 @@ install it or use an explicit path. {}",
                     program: argv[0].clone(),
                     args: argv[1..].to_vec(),
                     cwd: cwd.clone(),
-                    env: vec![("TERM".into(), "xterm-256color".into())],
+                    env: {
+                        let mut env = profile_env.clone();
+                        if !env.iter().any(|(key, _)| key == "TERM") {
+                            env.push(("TERM".into(), "xterm-256color".into()));
+                        }
+                        env
+                    },
                 },
                 _ => {
                     let mut shell = default_shell_command();
@@ -679,13 +712,10 @@ install it or use an explicit path. {}",
                 cols: info.cols,
                 rows: info.rows,
             };
-            if is_remote_runtime_principal(&client.client_name) {
-                let device_id = remote_device_id
-                    .clone()
-                    .expect("remote persistent session identity checked before metadata insert");
+            if let Some(device_id) = persistent_host_device_id {
                 let lease = info.controller.as_ref().ok_or_else(|| IpcError::Remote {
                     code: app_error::CONFLICT,
-                    message: "remote session open did not produce a controller lease".into(),
+                    message: "persistent session open did not produce a controller lease".into(),
                 })?;
                 let request = SupervisorSpawnRequest {
                     session_id: info.id.clone(),
@@ -802,7 +832,23 @@ install it or use an explicit path. {}",
                     }
                 };
                 let (child_pid, child_process_birth) = match (status.pid, status.process_birth_id) {
-                    (Some(pid), Some(birth)) if !status.exited => (pid, birth),
+                    (Some(pid), Some(birth)) if !status.exited => {
+                        // Supervisor `exited=false` still matches a zombie birth
+                        // witness; require a live `running_process_birth_id`
+                        // before committing `running`.
+                        match ownmesh_ipc::running_process_birth_id(pid) {
+                            Ok(Some(observed)) if observed == birth => (pid, birth),
+                            _ => {
+                                let _ = self
+                                    .rollback_persistent_open(&info.id, &binding, "identity")
+                                    .await;
+                                return Err(IpcError::Remote {
+                                    code: app_error::CONFLICT,
+                                    message: "persistent session sidecar did not attest a live child process identity".into(),
+                                });
+                            }
+                        }
+                    }
                     _ => {
                         let _ = self
                             .rollback_persistent_open(&info.id, &binding, "identity")
@@ -862,7 +908,7 @@ install it or use an explicit path. {}",
                         .supervisor
                         .as_ref()
                         .expect("successful persistent sidecar spawn retains supervisor client");
-                    let native_id = match Self::bootstrap_structured_adapter(
+                    let (native_id, adapter_cursor) = match Self::bootstrap_structured_adapter(
                         supervisor,
                         &binding,
                         dialect,
@@ -883,6 +929,12 @@ install it or use an explicit path. {}",
                             return Err(error);
                         }
                     };
+                    Self::spawn_fail_closed_adapter_pump(
+                        supervisor.clone(),
+                        binding.clone(),
+                        dialect,
+                        adapter_cursor,
+                    );
                     if let Some(native_id) = native_id {
                         let native_snapshot = self.sessions.clone();
                         if let Err(error) = self.sessions.set_native_session_id(&info.id, native_id)
@@ -2051,6 +2103,137 @@ install it or use an explicit path. {}",
         self.close_persistent_session_record(session_id)
     }
 
+    pub(super) async fn handle_session_cancel(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            lease_id: Option<String>,
+            #[serde(default)]
+            controller_epoch: Option<u64>,
+            #[serde(default)]
+            workspace_id: Option<String>,
+            #[serde(default)]
+            idempotency_key: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let remote = is_remote_runtime_principal(&client.client_name);
+        if remote && p.idempotency_key.as_deref().is_none_or(str::is_empty) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.cancel requires idempotency_key for remote principals".into(),
+            });
+        }
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&client.client_name, key));
+        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
+            return Ok(replayed);
+        }
+        let now = self.prepare_session_access()?;
+        let workspace_id = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        if remote {
+            let lease_id = p
+                .lease_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "session.cancel requires lease_id for remote principals".into(),
+                })?;
+            let epoch = p.controller_epoch.ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.cancel requires controller_epoch for remote principals".into(),
+            })?;
+            self.sessions
+                .authorize_controller_lease(&p.id, &client.client_name, lease_id, epoch, now)
+                .map_err(session_err)?;
+        } else {
+            self.require_controller(&p.id, &client.client_name, now)?;
+        }
+        self.fence_ambiguous_transition(&p.id)?;
+        let info = self.sessions.get(&p.id).map_err(session_err)?.clone();
+        let profile_id = info.profile_id.as_deref().ok_or_else(|| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: "capability_not_advertised: session is not a structured profile".into(),
+        })?;
+        let spec = official_adapter_spec(profile_id).ok_or_else(|| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: "capability_not_advertised: profile has no official cancellation contract"
+                .into(),
+        })?;
+        let native_session_id = info.native_session_id.as_deref().unwrap_or(&info.id);
+        let binding = self.sidecar_binding(&p.id)?;
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        let active_turn_id = if matches!(spec.dialect, AdapterDialect::CodexAppServer) {
+            let supervisor = self.ensure_remote_supervisor().await?;
+            // Query the current spool extent with a one-byte page, then inspect
+            // only the bounded tail. Starting mid-record is safe because the
+            // extractor ignores malformed fragments before the next LF.
+            let extent = supervisor
+                .drain_stream(&binding, 0, 1, "stdout")
+                .await
+                .map_err(|error| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("structured adapter cancellation replay failed: {error}"),
+                })?;
+            let tail_offset = extent
+                .total_bytes
+                .saturating_sub(CODEX_CANCEL_REPLAY_BYTES as u64);
+            let page = supervisor
+                .drain_stream(&binding, tail_offset, CODEX_CANCEL_REPLAY_BYTES, "stdout")
+                .await
+                .map_err(|error| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("structured adapter cancellation replay failed: {error}"),
+                })?;
+            latest_codex_turn_id(&page.bytes)
+        } else {
+            None
+        };
+        let frame = cancel_protocol_frame(
+            spec.dialect,
+            native_session_id,
+            active_turn_id.as_deref(),
+            &operation_id,
+        )
+        .map_err(|message| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message,
+        })?;
+        self.ensure_remote_supervisor().await?;
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
+        self.supervisor
+            .as_ref()
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "sidecar unavailable after cancellation preflight".into(),
+            })?
+            .write(&binding, frame)
+            .await
+            .map_err(|error| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!("structured adapter cancellation write failed: {error}"),
+            })?;
+        let body = json!({
+            "cancel_requested": true,
+            "session_id": p.id,
+            "workspace_id": workspace_id,
+            "profile_id": profile_id,
+            "operation_id": operation_id,
+        });
+        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
+    }
+
     pub(super) async fn handle_session_close(
         &mut self,
         params: Option<Value>,
@@ -2679,12 +2862,12 @@ install it or use an explicit path. {}",
             .and_then(|info| info.profile_id.as_deref())
             .and_then(official_adapter_spec)
             .filter(|spec| spec.structured_events)
-            .and_then(|_| {
+            .and_then(|spec| {
                 sidecar_page.as_ref().map(|spool| {
                     let byte_len = u64::try_from(spool.bytes.len()).unwrap_or(u64::MAX);
                     let tail_after_page = spool.next_offset.unwrap_or(spool.total_bytes);
                     let base = tail_after_page.saturating_sub(byte_len);
-                    parse_adapter_event_page(&spool.bytes, base)
+                    parse_adapter_event_page_for_dialect(&spool.bytes, base, spec.dialect)
                 })
             });
         let profile_event_cursor = profile_events.as_ref().map(|page| page.next_cursor);
@@ -3111,6 +3294,13 @@ struct SystemDiagnosisFacts {
     /// condition the control plane reports to MCP clients as
     /// `connection_status`. `None` means not wired (unknown), e.g. unit tests.
     agent_route: Option<&'static str>,
+    /// `command.run` executions waiting outside the runtime mutex.
+    in_flight_external: usize,
+    /// Subset of `in_flight_external` that reserved an exact-once journal marker.
+    in_flight_journaled: usize,
+    /// Pre-spawn self-reentrancy refusals since process start. Counter only;
+    /// never argv, paths, or output.
+    self_reentrant_refusals: u64,
 }
 
 fn credential_store_health(
@@ -3278,13 +3468,9 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     // to replay, compact, or evict. They must never be reported healthy, even
     // when the journal is far below capacity.
     //
-    // P0-B review: durable `in_progress` markers are equally actionable. The
-    // daemon is single-op-at-a-time, so by the time a diagnosis runs any
-    // marker still in the journal belongs to an operation that never reached
-    // `store_idempotent` — a failed or crashed run whose outcome is uncertain
-    // and whose key is permanently non-replayable (fail-closed by design).
-    // Reporting that as a plain healthy journal hid the stuck marker behind a
-    // pass result.
+    // Durable `in_progress` markers are stuck unless a live unlocked exec
+    // reserved that marker. Subtract only journaled in-flight execs so a
+    // leftover key plus a keyless command stays visible.
     let op_status = if facts.op_journal_degraded {
         "degraded"
     } else if facts.op_journal_entries >= super::MAX_OP_JOURNAL_ENTRIES
@@ -3324,7 +3510,11 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "op_journal_pressure"
     } else if facts.op_journal_uncertain > 0 {
         "op_journal_uncertain"
-    } else if facts.op_journal_in_progress > 0 {
+    } else if facts
+        .op_journal_in_progress
+        .saturating_sub(facts.in_flight_journaled)
+        > 0
+    {
         "op_journal_in_progress"
     } else if agent_route_status == "fail" {
         "agent_route_offline"
@@ -3403,6 +3593,26 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "nonterminal_count": facts.nonterminal_sessions,
                 "stale_count": facts.stale_sessions,
             },
+            {
+                // Bounded runtime-queue observation. Never includes argv,
+                // paths, environment, or user output.
+                "id": "runtime_queue",
+                "status": if facts.in_flight_external > 0 || facts.self_reentrant_refusals > 0 {
+                    "warn"
+                } else {
+                    "pass"
+                },
+                "state": if facts.in_flight_external > 0 {
+                    "executing"
+                } else if facts.self_reentrant_refusals > 0 {
+                    "self_reentrant_exec"
+                } else {
+                    "idle"
+                },
+                "provenance": "observed",
+                "observed_at": observed_at,
+                "count": facts.in_flight_external,
+            },
         ],
         "journals": {
             "transition": {
@@ -3467,6 +3677,9 @@ mod system_diagnosis_tests {
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
+            in_flight_external: 0,
+            in_flight_journaled: 0,
+            self_reentrant_refusals: 0,
         };
         let value = system_diagnosis_payload("2026-08-25T00:00:00Z", facts);
         assert_eq!(value["schema"], SYSTEM_DIAGNOSIS_CONTRACT);
@@ -3588,6 +3801,9 @@ mod system_diagnosis_tests {
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
+            in_flight_external: 0,
+            in_flight_journaled: 0,
+            self_reentrant_refusals: 0,
         };
         let cases = [
             (healthy_facts(), "healthy", "none"),
@@ -3636,7 +3852,7 @@ mod system_diagnosis_tests {
             let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
             assert_eq!(value["overall"], overall);
             assert_eq!(value["recommendation"], recommendation);
-            assert_eq!(value["checks"].as_array().map(Vec::len), Some(6));
+            assert_eq!(value["checks"].as_array().map(Vec::len), Some(7));
             let serialized = value.to_string();
             for forbidden in [
                 "token",
@@ -3680,6 +3896,9 @@ mod system_diagnosis_tests {
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
+            in_flight_external: 0,
+            in_flight_journaled: 0,
+            self_reentrant_refusals: 0,
         };
 
         // Retained-expired transition records → fail, actionable.
@@ -3786,12 +4005,9 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["op_journal"]["status"], "degraded");
         assert_eq!(value["journals"]["op_journal"]["degraded"], true);
 
-        // P0-B review: a durable in-progress marker means an operation never
-        // reached its completed receipt (failed or crashed after reserving
-        // the key). Its outcome is uncertain and the key is permanently
-        // non-replayable, so it must NOT be reported healthy — the daemon is
-        // single-op-at-a-time, so a diagnosis cannot observe a genuinely
-        // in-flight operation's marker.
+        // A leftover in-progress marker is not healthy. A live unlocked exec
+        // that reserved that marker is not stuck; a keyless in-flight exec
+        // must not hide a leftover key.
         let value = system_diagnosis_payload(
             "2026-08-13T00:00:00Z",
             SystemDiagnosisFacts {
@@ -3807,6 +4023,30 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["op_journal"]["status"], "warn");
         assert_eq!(value["journals"]["op_journal"]["in_progress"], 1);
         assert_eq!(value["journals"]["op_journal"]["uncertain"], 0);
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: 1,
+                op_journal_in_progress: 1,
+                in_flight_external: 1,
+                in_flight_journaled: 1,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "healthy");
+        assert_eq!(value["checks"][6]["id"], "runtime_queue");
+        assert_eq!(value["checks"][6]["state"], "executing");
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: 1,
+                op_journal_in_progress: 1,
+                in_flight_external: 1,
+                in_flight_journaled: 0,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "op_journal_in_progress");
         // It stays distinct from the uncertain class.
         let value = system_diagnosis_payload(
             "2026-08-13T00:00:00Z",
@@ -3837,7 +4077,7 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["transition"]["status"], "ok");
         assert_eq!(value["journals"]["op_journal"]["status"], "ok");
         assert_eq!(value["profile_discovery"]["status"], "ok");
-        assert_eq!(value["checks"].as_array().map(Vec::len), Some(6));
+        assert_eq!(value["checks"].as_array().map(Vec::len), Some(7));
     }
 
     /// The health payload must stay a fixed allowlisted surface: no
@@ -3863,6 +4103,9 @@ mod system_diagnosis_tests {
             profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
             credential_store: ("warn", Some("preferred(encrypted-file)".into()), 1),
             agent_route: None,
+            in_flight_external: 0,
+            in_flight_journaled: 0,
+            self_reentrant_refusals: 0,
         };
         let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
         let serialized = value.to_string();

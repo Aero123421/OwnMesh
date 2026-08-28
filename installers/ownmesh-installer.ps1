@@ -202,6 +202,137 @@
         }
     }
 
+    # Locale-independent last-run result via the Task Scheduler COM API
+    # (numeric LastTaskResult / State). `schtasks /Query /FO LIST /V` text is
+    # localized and cannot be the readiness authority. $null means the probe
+    # could not run; polling continues rather than inventing a failure.
+    function Get-OwnMeshScheduledTaskRun {
+        foreach ($taskName in @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
+            try {
+                $service = New-Object -ComObject Schedule.Service
+                $service.Connect()
+                if ($taskName.Contains("\")) {
+                    $parts = $taskName.Split("\")
+                    $folder = $service.GetFolder("\" + $parts[0])
+                    $task = $folder.GetTask($parts[1])
+                } else {
+                    $folder = $service.GetFolder("\")
+                    $task = $folder.GetTask($taskName)
+                }
+                return @{
+                    State = [int]$task.State
+                    LastTaskResult = [int64]$task.LastTaskResult
+                }
+            } catch {
+                # Missing task, COM unavailable, or folder mismatch: try the
+                # next well-known name. Never treat a probe failure as a
+                # terminal task result.
+            }
+        }
+        return $null
+    }
+
+    function Test-OwnMeshScheduledTaskTerminalFailure {
+        param(
+            $Run,
+            [bool]$SawRunning = $false
+        )
+        if ($null -eq $Run) { return $false }
+        $state = [int]$Run.State
+        $result = [int64]$Run.LastTaskResult
+        # TASK_STATE_DISABLED = 1: this instance will not start.
+        if ($state -eq 1) { return $true }
+        # TASK_STATE_QUEUED = 2, TASK_STATE_RUNNING = 4: this instance is live.
+        if ($state -eq 2 -or $state -eq 4) { return $false }
+        if ($result -eq 0) { return $false }
+        # Informational scheduler HRESULTs, not action failures:
+        # 0x00041300 SCHED_S_TASK_READY, 0x00041301 SCHED_S_TASK_RUNNING,
+        # 0x00041303 SCHED_S_TASK_HAS_NOT_RUN.
+        # 0x00041306 is SCHED_S_TASK_TERMINATED (completed instance), not
+        # SCHED_S_TASK_DISABLED (0x00041302). Disabled is State = 1 above.
+        if ($result -in @(267008, 267009, 267011)) { return $false }
+        # TASK_STATE_READY (3) with leftover LastTaskResult is the previous
+        # crash/stop, not this instance. Fail only after this poll loop
+        # observed RUNNING.
+        if (-not $SawRunning) { return $false }
+        return $true
+    }
+
+    # Shared with `ownmesh update`: poll authenticated `ownmesh --json status`
+    # until daemon.version matches the installed CLI, or the bounded deadline
+    # elapses. Authenticated status is the readiness authority. COM last-run
+    # is a hint after this instance has been observed running, or when the
+    # task is disabled.
+    function Wait-OwnMeshDaemonReady {
+        param(
+            [Parameter(Mandatory)][string]$OwnMeshPath,
+            [Parameter(Mandatory)][string]$ExpectedVersion,
+            [int]$TimeoutSeconds = 20,
+            [int]$PollMilliseconds = 200
+        )
+        if ($TimeoutSeconds -lt 1) { throw "TimeoutSeconds must be >= 1" }
+        if ($PollMilliseconds -lt 1) { throw "PollMilliseconds must be >= 1" }
+        # Stopwatch is monotonic. A backward wall-clock correction on a newly
+        # imaged or just-booted machine must not silently extend rollback time.
+        $elapsed = [Diagnostics.Stopwatch]::StartNew()
+        $timeoutMilliseconds = [int64]$TimeoutSeconds * 1000
+        $sawRunning = $false
+        # Native stderr is expected while the daemon is starting. Windows
+        # PowerShell 5.1 can wrap it as NativeCommandError, and newer
+        # PowerShell can promote it through this preference variable. Neither
+        # is readiness authority; only exit code plus parsed status is.
+        $previousEap = $ErrorActionPreference
+        $hadNativePreference = Test-Path -LiteralPath variable:PSNativeCommandUseErrorActionPreference
+        $previousNativePreference = $null
+        if ($hadNativePreference) {
+            $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        try {
+            $ErrorActionPreference = "Continue"
+            while ($true) {
+                # Numeric COM state/result only. Localized task text is never
+                # parsed, and a failed COM probe returns $null and merely keeps
+                # polling; it is not authoritative evidence of absence.
+                $run = Get-OwnMeshScheduledTaskRun
+                if ($null -ne $run -and [int]$run.State -eq 4) { $sawRunning = $true }
+                if (Test-OwnMeshScheduledTaskTerminalFailure -Run $run -SawRunning $sawRunning) {
+                    if ([int]$run.State -eq 1) {
+                        throw "Scheduled task is disabled"
+                    }
+                    throw ("Scheduled task action failed with last run result {0}" -f [int64]$run.LastTaskResult)
+                }
+                $statusText = (& $OwnMeshPath --json status 2>$null | Out-String)
+                $statusCode = $LASTEXITCODE
+                if ($statusCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($statusText)) {
+                    try {
+                        $status = $statusText | ConvertFrom-Json -ErrorAction Stop
+                        $daemon = $null
+                        if ($status.PSObject.Properties.Name -contains "daemon") {
+                            $daemon = $status.daemon
+                        }
+                        if ($null -ne $daemon -and
+                            $daemon.PSObject.Properties.Name -contains "version" -and
+                            $daemon.version -eq $ExpectedVersion) {
+                            return
+                        }
+                    } catch {
+                        # Partial JSON while the daemon is still coming up.
+                    }
+                }
+                if ($elapsed.ElapsedMilliseconds -ge $timeoutMilliseconds) {
+                    throw "Updated OwnMesh daemon did not become ready with the expected version"
+                }
+                Start-Sleep -Milliseconds $PollMilliseconds
+            }
+        } finally {
+            $ErrorActionPreference = $previousEap
+            if ($hadNativePreference) {
+                $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+            }
+        }
+    }
+
     function Stop-InstalledOwnMeshProcesses {
         param(
             [Parameter(Mandatory)][string]$TargetDir,
@@ -273,138 +404,6 @@
             throw "OwnMesh processes did not stop before update: $names"
         }
         return $serviceWasRunning
-    }
-
-    function Wait-OwnMeshDaemonReady {
-        param(
-            [Parameter(Mandatory)][string]$OwnMeshPath,
-            [Parameter(Mandatory)][string]$ExpectedVersion,
-            # Kept in lockstep with the allowlist inside Invoke-OwnMeshSchTasks,
-            # which throws on a name it does not know. A binding error here is
-            # far easier to read than that throw surfacing as a rolled-back
-            # upgrade blamed on readiness.
-            [ValidateSet("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")]
-            [string[]]$TaskNames = @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd"),
-            [int]$TimeoutSeconds = 60,
-            [int]$PollMilliseconds = 250
-        )
-
-        # A successful `service start` proves only that the daemon was asked
-        # to start. Readiness is the authenticated daemon status reporting the
-        # version that was just installed, polled to a bounded deadline.
-        #
-        # This used to be one fixed 500 ms sleep and a single status call, so
-        # a healthy daemon that needed longer to initialize — slow disk,
-        # first-run state, AV scanning, a loaded CI or desktop host — was
-        # treated as a failed upgrade and rolled the binaries back. The CLI
-        # already spends up to its own bounded start deadline proving IPC
-        # readiness before `service start` returns; this deadline covers that
-        # window plus the version convergence that follows it.
-        if ($TimeoutSeconds -lt 1) { $TimeoutSeconds = 1 }
-        if ($PollMilliseconds -lt 1) { $PollMilliseconds = 1 }
-        # A monotonic clock, not wall time: a backward NTP correction during
-        # the wait is most likely on exactly the freshly imaged or just-booted
-        # machine whose slow first-run daemon this deadline exists for, and it
-        # would silently extend the deadline by the size of the correction.
-        $elapsed = [Diagnostics.Stopwatch]::StartNew()
-        $timeoutMs = [int64]$TimeoutSeconds * 1000
-        $lastError = "Updated OwnMesh daemon did not become ready"
-        $taskWasPresent = $false
-        # The task probe costs two process spawns and watches a condition that
-        # can transition at most once, so it runs on its own slower cadence
-        # rather than on every readiness poll.
-        $taskProbeIntervalMs = 2000
-        $nextTaskProbeMs = 0
-
-        # A not-yet-ready daemon writes to stderr, and Windows PowerShell 5.1
-        # wraps native stderr as a terminating NativeCommandError under
-        # $ErrorActionPreference Stop. Only the exit code and the parsed
-        # payload are authoritative here.
-        $previousEap = $ErrorActionPreference
-        $previousNative = $null
-        if (Test-Path -LiteralPath variable:PSNativeCommandUseErrorActionPreference) {
-            $previousNative = $PSNativeCommandUseErrorActionPreference
-            $PSNativeCommandUseErrorActionPreference = $false
-        }
-        try {
-            $ErrorActionPreference = "Continue"
-            while ($true) {
-                $statusText = (& $OwnMeshPath --json status 2>$null | Out-String)
-                if ($LASTEXITCODE -eq 0) {
-                    # A partially written or non-JSON reply is a not-ready
-                    # daemon, not an installer failure: keep polling.
-                    $status = $null
-                    try {
-                        $status = $statusText | ConvertFrom-Json -ErrorAction Stop
-                    } catch {
-                        $status = $null
-                    }
-                    if ($null -eq $status) {
-                        $lastError = "Updated OwnMesh daemon returned a status that was not valid JSON"
-                    } else {
-                        # Set-StrictMode is active: probe for the properties
-                        # rather than dereferencing a payload that a partially
-                        # initialized daemon may not have filled in yet.
-                        $reported = $null
-                        if ($status.PSObject.Properties.Name -contains "daemon") {
-                            $daemon = $status.daemon
-                            if ($null -ne $daemon -and
-                                $daemon.PSObject.Properties.Name -contains "version") {
-                                $reported = $daemon.version
-                            }
-                        }
-                        if ($null -ne $reported -and $reported -eq $ExpectedVersion) {
-                            return
-                        }
-                        $lastError = "Updated OwnMesh daemon version did not match the CLI"
-                    }
-                } else {
-                    $lastError = "Updated OwnMesh daemon did not become ready"
-                }
-
-                # A safety net, not the ordinary path: nothing in an upgrade
-                # unregisters the task, so this normally never fires and the
-                # deadline above is what ends a failed wait. It exists for the
-                # case where the task really does disappear underneath us —
-                # then no amount of further waiting can produce a ready daemon.
-                # Exit codes decide that, never task-state text, which is
-                # localized. A task never observed at all is evidence of
-                # nothing and never shortens the deadline.
-                if ($elapsed.ElapsedMilliseconds -ge $nextTaskProbeMs) {
-                    $nextTaskProbeMs = $elapsed.ElapsedMilliseconds + $taskProbeIntervalMs
-                    $taskPresent = $false
-                    foreach ($taskName in $TaskNames) {
-                        try {
-                            if ((Invoke-OwnMeshSchTasks -Action Query -TaskName $taskName) -eq 0) {
-                                $taskPresent = $true
-                                break
-                            }
-                        } catch {
-                            # A probe that could not run is not evidence that
-                            # the task is gone, and must never roll back a
-                            # healthy upgrade. IPC remains the authority.
-                            $taskPresent = $true
-                            break
-                        }
-                    }
-                    if ($taskPresent) {
-                        $taskWasPresent = $true
-                    } elseif ($taskWasPresent) {
-                        throw "OwnMesh scheduled task is no longer registered; the daemon cannot become ready"
-                    }
-                }
-
-                if ($elapsed.ElapsedMilliseconds -ge $timeoutMs) {
-                    throw "$lastError within $TimeoutSeconds seconds"
-                }
-                Start-Sleep -Milliseconds $PollMilliseconds
-            }
-        } finally {
-            $ErrorActionPreference = $previousEap
-            if ($null -ne $previousNative) {
-                $PSNativeCommandUseErrorActionPreference = $previousNative
-            }
-        }
     }
 
     function Restore-OwnMeshBackup {
@@ -930,9 +929,14 @@
                     throw "Updated OwnMesh service did not restart"
                 }
                 $expectedVersion = ($installedVersion -split '\s+')[-1]
+                $readyTimeout = 20
+                if ($env:OWNMESH_DAEMON_READY_TIMEOUT_SECONDS) {
+                    $readyTimeout = [int]$env:OWNMESH_DAEMON_READY_TIMEOUT_SECONDS
+                }
                 Wait-OwnMeshDaemonReady `
                     -OwnMeshPath $ownmeshPath `
-                    -ExpectedVersion $expectedVersion
+                    -ExpectedVersion $expectedVersion `
+                    -TimeoutSeconds $readyTimeout
             }
         } catch {
             $postInstallError = $_.Exception.Message
