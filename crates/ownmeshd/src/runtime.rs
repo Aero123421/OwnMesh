@@ -11564,6 +11564,7 @@ mod broker_intent_tests {
         }
     }
 
+    #[cfg(unix)]
     fn command_ask_policy() -> PolicyDocument {
         let mut policy = preset_document(AccessPreset::FullAccess);
         policy.rules.push(PolicyRule {
