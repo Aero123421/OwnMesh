@@ -697,6 +697,14 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("Wait-OwnMeshDaemonReady", text)
         self.assertIn("Get-OwnMeshScheduledTaskRun", text)
         self.assertIn("OWNMESH_DAEMON_READY_TIMEOUT_SECONDS", text)
+        self.assertIn("[Diagnostics.Stopwatch]::StartNew()", text)
+        self.assertIn("$elapsed.ElapsedMilliseconds", text)
+        self.assertNotIn(
+            "$deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)", text
+        )
+        self.assertIn("PSNativeCommandUseErrorActionPreference", text)
+        self.assertIn("ConvertFrom-Json -ErrorAction Stop", text)
+        self.assertIn("a failed COM probe returns $null", text)
         # A single 500 ms sleep is the race this polling replaces: a healthy
         # daemon that needs longer must not trigger rollback (#154).
         self.assertNotRegex(text, r"(?im)^\s*Start-Sleep\s+-Milliseconds\s+500\b")
@@ -769,18 +777,31 @@ class InstallerAdversarialTests(unittest.TestCase):
         return pwsh
 
     def _write_status_stub(
-        self, directory: Path, *, version: str, delay_ms: int = 0, never_ready: bool = False
+        self,
+        directory: Path,
+        *,
+        version: str,
+        delay_ms: int = 0,
+        never_ready: bool = False,
+        fail_polls: int = 0,
     ) -> Path:
         script = directory / "ownmesh-status-stub.py"
+        counter = directory / "ownmesh-status-count.txt"
         script.write_text(
             "\n".join(
                 [
-                    "import json, os, sys, time",
+                    "import json, pathlib, sys, time",
                     f"delay = {delay_ms} / 1000",
                     "if delay:",
                     "    time.sleep(delay)",
                     "args = sys.argv[1:]",
                     "if args == ['--json', 'status']:",
+                    f"    counter = pathlib.Path({str(counter)!r})",
+                    "    poll = int(counter.read_text() or '0') + 1 if counter.exists() else 1",
+                    "    counter.write_text(str(poll))",
+                    f"    if poll <= {fail_polls}:",
+                    "        print('daemon is not answering yet', file=sys.stderr)",
+                    "        sys.exit(1)",
                     f"    version = '0.0.0-never' if {str(never_ready)} else {version!r}",
                     "    print(json.dumps({'schema_version': 1, 'daemon': {'version': version}}))",
                     "    sys.exit(0)",
@@ -795,6 +816,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             stub.write_text(
                 f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n',
                 encoding="ascii",
+                newline="",
             )
             return stub
         stub = directory / "ownmesh"
@@ -844,7 +866,11 @@ class InstallerAdversarialTests(unittest.TestCase):
     def test_windows_ps1_delayed_daemon_ready_succeeds_without_rollback(self) -> None:
         # #154: a healthy daemon that needs more than 500 ms must not roll back.
         with tempfile.TemporaryDirectory(prefix="ownmesh-ready-delay-") as tmp:
-            stub = self._write_status_stub(Path(tmp), version="1.2.23", delay_ms=800)
+            # The first status call fails noisily on native stderr, then a
+            # later authenticated payload reports the expected version.
+            stub = self._write_status_stub(
+                Path(tmp), version="1.2.23", delay_ms=800, fail_polls=1
+            )
             started = time.monotonic()
             completed = self._run_wait_ready(
                 stub, expected_version="1.2.23", timeout_seconds=5, poll_milliseconds=100

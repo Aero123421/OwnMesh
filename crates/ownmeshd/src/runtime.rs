@@ -115,7 +115,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use structured_adapter::{cancel_protocol_frame, latest_codex_turn_id, StructuredAdapterDriver};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 /// Session IPC method names (owned here; ipc crate methods table is ms1-stable).
@@ -754,6 +754,14 @@ const MAX_CACHED_DESTINATION_TRANSFERS: usize = 256;
 /// Concurrent detached `command.run` jobs per daemon. Fail-closed when full.
 const MAX_DETACHED_COMMANDS: usize = 4;
 static DETACHED_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Ordinary command capacity that remains available even when every detached
+/// slot is occupied. Detached jobs keep their own stricter cap below.
+const MAX_CONCURRENT_COMMANDS: usize = 8;
+const MAX_GLOBAL_COMMANDS: usize = MAX_CONCURRENT_COMMANDS + MAX_DETACHED_COMMANDS;
+/// Global command capacity is acquired before the runtime mutex, admission,
+/// exact-once reservation, or executable preparation. A queued request owns
+/// no authority or custody until it receives a permit.
+static GLOBAL_COMMAND_SLOTS: Semaphore = Semaphore::const_new(MAX_GLOBAL_COMMANDS);
 /// Unlocked `command.run` waits currently outside the runtime mutex.
 static EXTERNAL_EXEC_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Unlocked execs that reserved an exact-once journal marker. Stuck-receipt
@@ -764,34 +772,76 @@ static EXTERNAL_EXEC_JOURNALED: AtomicUsize = AtomicUsize::new(0);
 static SELF_REENTRANT_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 struct ExternalExecGuard {
-    journaled: bool,
+    journaled: usize,
 }
 
 impl Drop for ExternalExecGuard {
     fn drop(&mut self) {
         EXTERNAL_EXEC_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        if self.journaled {
-            EXTERNAL_EXEC_JOURNALED.fetch_sub(1, Ordering::SeqCst);
+        if self.journaled != 0 {
+            EXTERNAL_EXEC_JOURNALED.fetch_sub(self.journaled, Ordering::SeqCst);
         }
     }
 }
 
-fn acquire_external_exec(journaled: bool) -> ExternalExecGuard {
+fn acquire_external_exec(journaled: usize) -> ExternalExecGuard {
     EXTERNAL_EXEC_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
-    if journaled {
-        EXTERNAL_EXEC_JOURNALED.fetch_add(1, Ordering::SeqCst);
+    if journaled != 0 {
+        EXTERNAL_EXEC_JOURNALED.fetch_add(journaled, Ordering::SeqCst);
     }
     ExternalExecGuard { journaled }
 }
 
-/// Policy admission completed; the request is allowed and the exact-once
-/// journal marker (when present) is already reserved.
-struct AllowedWork {
+struct OperationCompletion {
     journal_key: Option<String>,
     operation_id: String,
     capability: String,
     reason: String,
+}
+
+struct ApprovedCompletion {
+    journal_key: Option<String>,
+    operation_id: String,
+    approval_id: String,
+    capability: String,
+    approver: String,
+    granted_scope: Option<Value>,
+    executing_journal_entry: Option<Value>,
+    executing_approval: Option<ApprovalRecord>,
+}
+
+struct ControlPlaneApprovalCompletion {
+    approval_id: String,
+    target_operation_id: Option<String>,
+}
+
+/// Typed commit layers captured during admission. Approval bridges append the
+/// outer approval after the target, so finalization preserves the target's
+/// terminal state even if the bridge's own durable commit fails.
+enum AllowedCompletion {
+    Operation(OperationCompletion),
+    Approval(Box<ApprovedCompletion>),
+    ControlPlaneApproval(ControlPlaneApprovalCompletion),
+}
+
+/// Policy/approval admission completed. Every exact-once marker required by
+/// the typed completion chain is already reserved.
+struct AllowedWork {
     request: PendingRequest,
+    completions: Vec<AllowedCompletion>,
+}
+
+impl AllowedWork {
+    fn journaled_completion_count(&self) -> usize {
+        self.completions
+            .iter()
+            .filter(|completion| match completion {
+                AllowedCompletion::Operation(completion) => completion.journal_key.is_some(),
+                AllowedCompletion::Approval(completion) => completion.journal_key.is_some(),
+                AllowedCompletion::ControlPlaneApproval(_) => false,
+            })
+            .count()
+    }
 }
 
 enum GateOutcome {
@@ -814,6 +864,52 @@ enum DispatchOutcome {
 
 fn pending_request_releases_runtime_lock(request: &PendingRequest) -> bool {
     matches!(request, PendingRequest::Exec(params) if !params.elevated)
+}
+
+fn method_can_execute_command(method: &str) -> bool {
+    matches!(method, methods::OPS_EXEC | methods::APPROVAL_APPROVE)
+}
+
+/// Wait for command capacity without holding the runtime mutex.
+///
+/// Cancellation wins if it races permit delivery. Because this runs before
+/// admission, a cancelled queued command has no journal marker, prepared
+/// executable, or approval transition to reconcile and can never spawn later.
+async fn acquire_command_slot<'a>(
+    slots: &'a Semaphore,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> IpcResult<SemaphorePermit<'a>> {
+    let unavailable = || IpcError::Remote {
+        code: app_error::INTERNAL,
+        message: "command execution capacity is unavailable".into(),
+    };
+    let cancelled = || IpcError::Remote {
+        code: app_error::CONFLICT,
+        message: "command was cancelled before execution started".into(),
+    };
+    let Some(cancel) = cancel else {
+        return slots.acquire().await.map_err(|_| unavailable());
+    };
+    let mut cancel = cancel.clone();
+    if *cancel.borrow_and_update() {
+        return Err(cancelled());
+    }
+    let mut acquire = Box::pin(slots.acquire());
+    loop {
+        tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_err() {
+                    // Closing a watch channel is not a cancellation request.
+                    return (&mut acquire).await.map_err(|_| unavailable());
+                }
+                if *cancel.borrow_and_update() {
+                    return Err(cancelled());
+                }
+            }
+            permit = &mut acquire => return permit.map_err(|_| unavailable()),
+        }
+    }
 }
 
 struct DetachedCommandGuard;
@@ -2570,11 +2666,13 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                     // Read-only observation while the journal is degraded stays
                     // inside the lock: it does not wait on a child.
                     return Ok(GateOutcome::Run(Box::new(AllowedWork {
-                        journal_key: None,
-                        operation_id,
-                        capability: facts.capability,
-                        reason: verdict.reason,
                         request,
+                        completions: vec![AllowedCompletion::Operation(OperationCompletion {
+                            journal_key: None,
+                            operation_id,
+                            capability: facts.capability,
+                            reason: verdict.reason,
+                        })],
                     })));
                 }
                 if let Some(reason) = &self.op_journal_degraded {
@@ -2582,56 +2680,68 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 }
                 self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
                 Ok(GateOutcome::Run(Box::new(AllowedWork {
-                    journal_key,
-                    operation_id,
-                    capability: facts.capability,
-                    reason: verdict.reason,
                     request,
+                    completions: vec![AllowedCompletion::Operation(OperationCompletion {
+                        journal_key,
+                        operation_id,
+                        capability: facts.capability,
+                        reason: verdict.reason,
+                    })],
                 })))
             }
         }
     }
 
     async fn finish_allowed(&mut self, work: AllowedWork) -> IpcResult<Value> {
-        if self.op_journal_degraded.is_some()
-            && work.journal_key.is_none()
-            && pending_request_is_journal_read_only(&work.request)
-        {
-            let result = self.execute_request(&work.request).await?;
-            return Ok(json!({
-                "approval_required": false,
-                "operation_id": work.operation_id,
-                "result": result,
-                "replayed": false,
-                "decision": "allow",
-                "reason": work.reason,
-            }));
-        }
         let executed = self.execute_request(&work.request).await;
         self.finalize_allowed(work, executed)
     }
 
-    /// Reacquire-path finalizer: the in-progress marker written at admission
-    /// is the compare-and-swap target. A raced or already-terminal marker is
-    /// left untouched and the outcome is reported as uncertain (#160).
+    /// Apply the typed completion chain captured at admission. Approval
+    /// bridges finalize their target before the outer bridge, all under the
+    /// reacquired runtime mutex.
     fn finalize_allowed(
         &mut self,
         work: AllowedWork,
         executed: IpcResult<Value>,
     ) -> IpcResult<Value> {
-        if let Some(key) = work.journal_key.as_ref() {
+        let mut outcome = executed;
+        for completion in work.completions {
+            outcome = match completion {
+                AllowedCompletion::Operation(completion) => {
+                    self.finalize_operation_completion(completion, outcome)
+                }
+                AllowedCompletion::Approval(completion) => {
+                    self.finalize_approved_completion(*completion, outcome)
+                }
+                AllowedCompletion::ControlPlaneApproval(completion) => {
+                    outcome.map(|body| Self::control_plane_approval_body(completion, body))
+                }
+            };
+        }
+        outcome
+    }
+
+    /// The in-progress marker written at admission is the compare-and-swap
+    /// target. A raced or already-terminal marker is left untouched and the
+    /// outcome is reported uncertain (#160).
+    fn validate_completion_marker(
+        &self,
+        journal_key: Option<&String>,
+        operation_id: &str,
+    ) -> IpcResult<()> {
+        if let Some(key) = journal_key {
             match self.op_journal.get(key) {
                 Some(entry)
                     if op_journal_entry_state(entry) == OpJournalEntryState::InProgress
                         && entry.get("operation_id").and_then(Value::as_str)
-                            == Some(work.operation_id.as_str()) => {}
+                            == Some(operation_id) => {}
                 Some(_) => {
                     return Err(IpcError::Remote {
                         code: app_error::CONFLICT,
                         message: format!(
-                            "idempotency key for {} changed before result finalization; \
-outcome is uncertain and must not be retried",
-                            work.operation_id
+                            "idempotency key for {operation_id} changed before result finalization; \
+outcome is uncertain and must not be retried"
                         ),
                     });
                 }
@@ -2639,14 +2749,22 @@ outcome is uncertain and must not be retried",
                     return Err(IpcError::Remote {
                         code: app_error::CONFLICT,
                         message: format!(
-                            "idempotency marker for {} is missing at finalization; \
-outcome is uncertain and must not be retried",
-                            work.operation_id
+                            "idempotency marker for {operation_id} is missing at finalization; \
+outcome is uncertain and must not be retried"
                         ),
                     });
                 }
             }
         }
+        Ok(())
+    }
+
+    fn finalize_operation_completion(
+        &mut self,
+        completion: OperationCompletion,
+        executed: IpcResult<Value>,
+    ) -> IpcResult<Value> {
+        self.validate_completion_marker(completion.journal_key.as_ref(), &completion.operation_id)?;
         let result = match executed {
             Ok(result) => result,
             Err(error) => {
@@ -2655,21 +2773,21 @@ outcome is uncertain and must not be retried",
                     _ => (app_error::INTERNAL, error.to_string()),
                 };
                 if let Err(reconcile_error) = self.fail_idempotent(
-                    work.journal_key.as_ref(),
-                    &work.operation_id,
+                    completion.journal_key.as_ref(),
+                    &completion.operation_id,
                     code,
                     &message,
                 ) {
                     eprintln!(
                         "warning: failed to persist terminal failure receipt \
                          {}: {reconcile_error:?}",
-                        work.operation_id
+                        completion.operation_id
                     );
                 }
                 self.append_audit(
                     "operation.failed",
-                    Some(&work.capability),
-                    Some(&work.operation_id),
+                    Some(&completion.capability),
+                    Some(&completion.operation_id),
                     Some("allow"),
                     "execution returned a terminal error; journal marker reconciled",
                 );
@@ -2678,21 +2796,123 @@ outcome is uncertain and must not be retried",
         };
         let body = json!({
             "approval_required": false,
-            "operation_id": work.operation_id,
+            "operation_id": completion.operation_id,
             "result": result,
             "replayed": false,
             "decision": "allow",
-            "reason": work.reason,
+            "reason": completion.reason,
         });
-        self.store_idempotent(work.journal_key.as_ref(), &body)?;
+        self.store_idempotent(completion.journal_key.as_ref(), &body)?;
         self.append_audit(
             "operation.completed",
-            Some(&work.capability),
-            Some(&work.operation_id),
+            Some(&completion.capability),
+            Some(&completion.operation_id),
             Some("allow"),
             "executed",
         );
         Ok(body)
+    }
+
+    fn restore_op_journal_entry(&mut self, key: Option<&String>, previous: Option<&Value>) {
+        let Some(key) = key else {
+            return;
+        };
+        if let Some(previous) = previous {
+            self.op_journal.insert(key.clone(), previous.clone());
+        } else {
+            self.op_journal.remove(key);
+        }
+    }
+
+    fn restore_approval_record(&mut self, approval_id: &str, previous: Option<&ApprovalRecord>) {
+        if let Some(previous) = previous {
+            self.approvals
+                .insert(approval_id.to_owned(), previous.clone());
+        } else {
+            self.approvals.remove(approval_id);
+        }
+    }
+
+    fn finalize_approved_completion(
+        &mut self,
+        completion: ApprovedCompletion,
+        executed: IpcResult<Value>,
+    ) -> IpcResult<Value> {
+        self.validate_completion_marker(completion.journal_key.as_ref(), &completion.operation_id)?;
+        // Approval execution failures remain non-retriable/uncertain just as
+        // before: the durable approval and journal marker stay `executing`.
+        let result = executed?;
+        let mut body = json!({
+            "approval_required": false,
+            "operation_id": completion.operation_id,
+            "approval_id": completion.approval_id,
+            "result": result,
+            "replayed": false,
+            "decision": "allow",
+            "reason": "human approved",
+        });
+        if let Some(grant) = completion.granted_scope {
+            body["grant"] = grant;
+        }
+
+        if let Err(error) = self.store_idempotent(completion.journal_key.as_ref(), &body) {
+            // Never restore whole maps here: another command may have committed
+            // while this child ran without the mutex. Only this approval and
+            // its own marker belong to this completion layer.
+            self.restore_op_journal_entry(
+                completion.journal_key.as_ref(),
+                completion.executing_journal_entry.as_ref(),
+            );
+            self.restore_approval_record(
+                &completion.approval_id,
+                completion.executing_approval.as_ref(),
+            );
+            return Err(error);
+        }
+
+        // Capture only the outer record immediately before changing it. For
+        // an approval bridge the target is a different record and remains in
+        // its terminal state if this persist fails.
+        let pre_terminal_approval = self.approvals.get(&completion.approval_id).cloned();
+        if let Some(record) = self.approvals.get_mut(&completion.approval_id) {
+            record.state = "approved".into();
+            record.result = Some(body.clone());
+            record.decided_by_principal = Some(completion.approver);
+        }
+        if let Err(error) = self.persist_approvals() {
+            self.restore_approval_record(&completion.approval_id, pre_terminal_approval.as_ref());
+            return Err(error);
+        }
+
+        self.append_audit(
+            "approval.approved",
+            Some(&completion.capability),
+            Some(&completion.operation_id),
+            Some("allow"),
+            format!("approved {}", completion.approval_id),
+        );
+        Ok(body)
+    }
+
+    fn control_plane_approval_body(
+        completion: ControlPlaneApprovalCompletion,
+        body: Value,
+    ) -> Value {
+        let target = body
+            .get("operation_id")
+            .cloned()
+            .unwrap_or_else(|| json!(completion.target_operation_id.unwrap_or_default()));
+        let result = body.get("result").cloned().unwrap_or(Value::Null);
+        json!({
+            "approval_decision_applied": true,
+            "replayed": false,
+            "approval_id": completion.approval_id,
+            "target_operation_id": target,
+            "decision": "approve",
+            "state": "approved",
+            "result": result,
+            "execution": body,
+        })
     }
 
     async fn execute_request(&mut self, request: &PendingRequest) -> IpcResult<Value> {
@@ -4390,6 +4610,17 @@ path or install the tool so detection and execution agree",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
+        match self.admit_approval_approve(params, client).await? {
+            GateOutcome::Reply(body) => Ok(body),
+            GateOutcome::Run(work) => self.finish_allowed(*work).await,
+        }
+    }
+
+    async fn admit_approval_approve(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<GateOutcome> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -4505,9 +4736,11 @@ path or install the tool so detection and execution agree",
             None
         };
 
-        let approvals_before = self.approvals.clone();
+        let approval_before = self.approvals.get(&p.id).cloned();
         let grants_before = self.grants.clone();
-        let op_journal_before = self.op_journal.clone();
+        let journal_before = idem_key
+            .as_ref()
+            .and_then(|key| self.op_journal.get(key).cloned());
 
         // The approval record commits `executing` first. Any crash after this
         // point is fail-closed even if later pre-execution preparation has not
@@ -4517,16 +4750,14 @@ path or install the tool so detection and execution agree",
             rec.decided_at_unix = Some(Self::now());
         }
         if let Err(e) = self.persist_approvals() {
-            self.approvals = approvals_before;
+            self.restore_approval_record(&p.id, approval_before.as_ref());
             self.grants = grants_before;
-            self.op_journal = op_journal_before;
             return Err(e);
         }
 
         if let Err(e) = self.begin_idempotent(idem_key.as_ref(), &operation_id) {
-            self.approvals = approvals_before;
+            self.restore_approval_record(&p.id, approval_before.as_ref());
             self.grants = grants_before;
-            self.op_journal = op_journal_before;
             let rollback_errors = self.persist_approvals().err().into_iter().collect();
             return Err(with_rollback_errors(e, rollback_errors));
         }
@@ -4546,9 +4777,9 @@ path or install the tool so detection and execution agree",
         if let Some(grant) = pending_grant {
             self.grants.push(StoredGrant::Temporary(grant));
             if let Err(e) = self.persist_grants() {
-                self.approvals = approvals_before;
+                self.restore_approval_record(&p.id, approval_before.as_ref());
                 self.grants = grants_before;
-                self.op_journal = op_journal_before;
+                self.restore_op_journal_entry(idem_key.as_ref(), journal_before.as_ref());
                 let mut rollback_errors = Vec::new();
                 // Remove the keyed marker before making the approval pending again.
                 if idem_key.is_some() {
@@ -4563,68 +4794,56 @@ path or install the tool so detection and execution agree",
         // never compensated back to pending. An execution error can itself have an
         // uncertain side effect, so retry must be refused just like a final persist
         // failure.
-        let executing_approvals = self.approvals.clone();
-        let executing_op_journal = self.op_journal.clone();
-        let is_approval_bridge = matches!(&request, PendingRequest::AdminApprovalBridge(_));
-        let result = match &request {
-            PendingRequest::Exec(p) => self.execute_exec(p, false).await,
-            PendingRequest::AdminApprovalBridge(p) => {
-                self.execute_approval_bridge(p, &approver).await
+        let completion = AllowedCompletion::Approval(Box::new(ApprovedCompletion {
+            journal_key: idem_key.clone(),
+            operation_id,
+            approval_id: p.id.clone(),
+            capability,
+            approver: approver.clone(),
+            granted_scope,
+            executing_journal_entry: idem_key
+                .as_ref()
+                .and_then(|key| self.op_journal.get(key).cloned()),
+            executing_approval: self.approvals.get(&p.id).cloned(),
+        }));
+        match request.clone() {
+            PendingRequest::Exec(exec) if !exec.elevated => {
+                Ok(GateOutcome::Run(Box::new(AllowedWork {
+                    request,
+                    completions: vec![completion],
+                })))
             }
-            other => self.execute_request(other).await,
-        }?;
-        // A bridge may have durably completed its target approval. Preserve that
-        // terminal target state if finalizing the outer bridge later fails.
-        let post_execution_approvals = is_approval_bridge.then(|| self.approvals.clone());
-        let mut body = json!({
-            "approval_required": false,
-            "operation_id": operation_id,
-            "approval_id": p.id,
-            "result": result,
-            "replayed": false,
-            "decision": "allow",
-            "reason": "human approved",
-        });
-        if let Some(grant) = granted_scope {
-            body["grant"] = grant;
-        }
-
-        if let Err(e) = self.store_idempotent(idem_key.as_ref(), &body) {
-            if !is_approval_bridge {
-                self.op_journal = executing_op_journal;
-                self.approvals = executing_approvals;
+            PendingRequest::AdminApprovalBridge(bridge) => {
+                match self.admit_approval_bridge(&bridge, &approver).await? {
+                    GateOutcome::Reply(result) => {
+                        let work = AllowedWork {
+                            request,
+                            completions: vec![completion],
+                        };
+                        Ok(GateOutcome::Reply(self.finalize_allowed(work, Ok(result))?))
+                    }
+                    GateOutcome::Run(mut work) => {
+                        work.completions.push(completion);
+                        Ok(GateOutcome::Run(work))
+                    }
+                }
             }
-            return Err(e);
+            _ => {
+                let executed = self.execute_request(&request).await;
+                let work = AllowedWork {
+                    request,
+                    completions: vec![completion],
+                };
+                Ok(GateOutcome::Reply(self.finalize_allowed(work, executed)?))
+            }
         }
-
-        if let Some(rec) = self.approvals.get_mut(&p.id) {
-            rec.state = "approved".into();
-            rec.result = Some(body.clone());
-            rec.decided_by_principal = Some(approver);
-        }
-        if let Err(e) = self.persist_approvals() {
-            // The operation ran. Keep the durable and in-memory non-retriable
-            // marker rather than pretending this approval is pending again. A
-            // successfully persisted op-journal completion remains usable.
-            self.approvals = post_execution_approvals.unwrap_or(executing_approvals);
-            return Err(e);
-        }
-
-        self.append_audit(
-            "approval.approved",
-            Some(&capability),
-            Some(&operation_id),
-            Some("allow"),
-            format!("approved {}", p.id),
-        );
-        Ok(body)
     }
 
-    async fn execute_approval_bridge(
+    async fn admit_approval_bridge(
         &mut self,
         params: &AdminApprovalBridgeParams,
         approver: &str,
-    ) -> IpcResult<Value> {
+    ) -> IpcResult<GateOutcome> {
         let target = self
             .approvals
             .get(&params.approval_id)
@@ -4651,7 +4870,7 @@ path or install the tool so detection and execution agree",
         // Box the call because an approval bridge is itself executed from the
         // approval handler. Admission above forbids targeting another admin
         // request, so this indirection cannot form a runtime approval cycle.
-        Box::pin(self.handle_approval_approve(
+        Box::pin(self.admit_approval_approve(
             Some(json!({
                 "id": params.approval_id,
                 "temporary_grant": params.temporary_grant,
@@ -5644,6 +5863,27 @@ path or install the tool so detection and execution agree",
                     Err(error) => DispatchOutcome::Done(Err(error)),
                 }
             }
+        } else if method == methods::APPROVAL_APPROVE {
+            if let Err(error) = self.preflight_authenticated_dispatch(method, client) {
+                DispatchOutcome::Done(Err(error))
+            } else {
+                match self.admit_approval_approve(params, client).await {
+                    Ok(GateOutcome::Reply(value)) => DispatchOutcome::Done(Ok(value)),
+                    Ok(GateOutcome::Run(work))
+                        if pending_request_releases_runtime_lock(&work.request) =>
+                    {
+                        DispatchOutcome::Execute(Box::new(AdmittedExec {
+                            work: *work,
+                            cancel: self.active_cancel.clone(),
+                            runtime_dir: self.paths.runtime_dir.clone(),
+                        }))
+                    }
+                    Ok(GateOutcome::Run(work)) => {
+                        DispatchOutcome::Done(self.finish_allowed(*work).await)
+                    }
+                    Err(error) => DispatchOutcome::Done(Err(error)),
+                }
+            }
         } else {
             DispatchOutcome::Done(self.dispatch(method, params, client).await)
         };
@@ -5669,6 +5909,16 @@ path or install the tool so detection and execution agree",
         &mut self,
         params: Option<Value>,
     ) -> IpcResult<Value> {
+        match self.admit_control_plane_approval_decision(params).await? {
+            GateOutcome::Reply(body) => Ok(body),
+            GateOutcome::Run(work) => self.finish_allowed(*work).await,
+        }
+    }
+
+    async fn admit_control_plane_approval_decision(
+        &mut self,
+        params: Option<Value>,
+    ) -> IpcResult<GateOutcome> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct P {
@@ -5814,7 +6064,7 @@ path or install the tool so detection and execution agree",
         }
         if rec.state != "pending" {
             // Exact-once: already decided/executing — surface durable state, never re-run.
-            return Ok(json!({
+            return Ok(GateOutcome::Reply(json!({
                 "approval_decision_applied": true,
                 "replayed": true,
                 "approval_id": resolved_id,
@@ -5822,7 +6072,7 @@ path or install the tool so detection and execution agree",
                 "decision": decision,
                 "state": rec.state,
                 "result": rec.result.clone(),
-            }));
+            })));
         }
         // E3: fail closed when the original remote action window has elapsed.
         if let Some(exp) = rec.expires_at_unix {
@@ -5887,7 +6137,7 @@ path or install the tool so detection and execution agree",
                     bridge,
                     &canonicalize_principal_key(recovery.principal_key()),
                 )?;
-                return Ok(json!({
+                return Ok(GateOutcome::Reply(json!({
                     "approval_decision_applied": true,
                     "replayed": false,
                     "approval_id": resolved_id,
@@ -5895,10 +6145,10 @@ path or install the tool so detection and execution agree",
                     "decision": "deny",
                     "state": "denied",
                     "result": body,
-                }));
+                })));
             }
             let body = self.handle_approval_deny(Some(json!({ "id": resolved_id })), &recovery)?;
-            return Ok(json!({
+            return Ok(GateOutcome::Reply(json!({
                 "approval_decision_applied": true,
                 "replayed": false,
                 "approval_id": resolved_id,
@@ -5906,30 +6156,34 @@ path or install the tool so detection and execution agree",
                 "decision": "deny",
                 "state": "denied",
                 "result": body,
-            }));
+            })));
         }
 
-        let body = self
-            .handle_approval_approve(
+        match self
+            .admit_approval_approve(
                 Some(json!({ "id": resolved_id, "temporary_grant": false })),
                 &recovery,
             )
-            .await?;
-        let target = body
-            .get("operation_id")
-            .cloned()
-            .unwrap_or_else(|| json!(target_operation_id.clone().unwrap_or_default()));
-        let exec_result = body.get("result").cloned().unwrap_or(Value::Null);
-        Ok(json!({
-            "approval_decision_applied": true,
-            "replayed": false,
-            "approval_id": resolved_id,
-            "target_operation_id": target,
-            "decision": "approve",
-            "state": "approved",
-            "result": exec_result,
-            "execution": body,
-        }))
+            .await?
+        {
+            GateOutcome::Reply(body) => Ok(GateOutcome::Reply(Self::control_plane_approval_body(
+                ControlPlaneApprovalCompletion {
+                    approval_id: resolved_id,
+                    target_operation_id,
+                },
+                body,
+            ))),
+            GateOutcome::Run(mut work) => {
+                work.completions
+                    .push(AllowedCompletion::ControlPlaneApproval(
+                        ControlPlaneApprovalCompletion {
+                            approval_id: resolved_id,
+                            target_operation_id,
+                        },
+                    ));
+                Ok(GateOutcome::Run(work))
+            }
+        }
     }
 
     fn preflight_authenticated_dispatch(
@@ -7483,6 +7737,42 @@ pub async fn dispatch_unlocked(
     remote_device_id: Option<String>,
     remote_principal_credential_generation: Option<u64>,
 ) -> IpcResult<Value> {
+    dispatch_unlocked_with_slots(
+        runtime,
+        method,
+        params,
+        client,
+        cancel,
+        remote_operation_id,
+        remote_expires_at_unix,
+        remote_payload_hash,
+        remote_device_id,
+        remote_principal_credential_generation,
+        &GLOBAL_COMMAND_SLOTS,
+    )
+    .await
+}
+
+async fn dispatch_unlocked_with_slots(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    method: &str,
+    params: Option<Value>,
+    client: &ClientIdentity,
+    cancel: Option<watch::Receiver<bool>>,
+    remote_operation_id: Option<String>,
+    remote_expires_at_unix: Option<i64>,
+    remote_payload_hash: Option<String>,
+    remote_device_id: Option<String>,
+    remote_principal_credential_generation: Option<u64>,
+    command_slots: &Semaphore,
+) -> IpcResult<Value> {
+    // Capacity precedes the runtime mutex and every authority/custody step.
+    // Waiting therefore cannot burn an idempotency key or pin an executable.
+    let _command_slot = if method_can_execute_command(method) {
+        Some(acquire_command_slot(command_slots, cancel.as_ref()).await?)
+    } else {
+        None
+    };
     let outcome = {
         let mut guard = runtime.lock().await;
         guard
@@ -7499,16 +7789,59 @@ pub async fn dispatch_unlocked(
             )
             .await
     };
+    finish_unlocked_outcome(runtime, outcome).await
+}
+
+async fn finish_unlocked_outcome(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    outcome: DispatchOutcome,
+) -> IpcResult<Value> {
     match outcome {
         DispatchOutcome::Done(result) => result,
         DispatchOutcome::Execute(admitted) => {
             let admitted = *admitted;
-            let _inflight = acquire_external_exec(admitted.work.journal_key.is_some());
+            let _inflight = acquire_external_exec(admitted.work.journaled_completion_count());
             let executed = execute_admitted_exec(&admitted).await;
             let mut guard = runtime.lock().await;
             guard.finalize_allowed(admitted.work, executed)
         }
     }
+}
+
+/// Agent-only recovery decision path with the same pre-lock capacity and
+/// admit/execute/finalize split as ordinary command dispatch.
+pub async fn apply_control_plane_approval_decision_unlocked(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    params: Option<Value>,
+) -> IpcResult<Value> {
+    apply_control_plane_approval_decision_with_slots(runtime, params, &GLOBAL_COMMAND_SLOTS).await
+}
+
+async fn apply_control_plane_approval_decision_with_slots(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    params: Option<Value>,
+    command_slots: &Semaphore,
+) -> IpcResult<Value> {
+    // The deferred request type is device-owned approval state, so capacity
+    // is conservatively acquired for every approve/deny decision before the
+    // mutex is taken. Non-command decisions release it immediately.
+    let _command_slot = acquire_command_slot(command_slots, None).await?;
+    let outcome = {
+        let mut guard = runtime.lock().await;
+        match guard.admit_control_plane_approval_decision(params).await {
+            Ok(GateOutcome::Reply(body)) => DispatchOutcome::Done(Ok(body)),
+            Ok(GateOutcome::Run(work)) if pending_request_releases_runtime_lock(&work.request) => {
+                DispatchOutcome::Execute(Box::new(AdmittedExec {
+                    work: *work,
+                    cancel: None,
+                    runtime_dir: guard.paths.runtime_dir.clone(),
+                }))
+            }
+            Ok(GateOutcome::Run(work)) => DispatchOutcome::Done(guard.finish_allowed(*work).await),
+            Err(error) => DispatchOutcome::Done(Err(error)),
+        }
+    };
+    finish_unlocked_outcome(runtime, outcome).await
 }
 
 /// Fail-closed gate for approval decisions at the runtime handler boundary.
@@ -11231,6 +11564,41 @@ mod broker_intent_tests {
         }
     }
 
+    #[cfg(unix)]
+    fn command_ask_policy() -> PolicyDocument {
+        let mut policy = preset_document(AccessPreset::FullAccess);
+        policy.rules.push(PolicyRule {
+            id: "test-ask-command".into(),
+            decision: Decision::Ask,
+            priority: 100,
+            capability: "command.run".into(),
+            when_elevated: None,
+            when_kind: None,
+            path_prefix: None,
+            program_equals: None,
+            when_tag: None,
+            description: Some("test command approval".into()),
+        });
+        policy
+    }
+
+    #[cfg(unix)]
+    fn sleep_command(seconds: u64, idempotency_key: &str) -> Value {
+        let sleep = if Path::new("/bin/sleep").is_file() {
+            "/bin/sleep"
+        } else {
+            "/usr/bin/sleep"
+        };
+        json!({
+            "program": sleep,
+            "args": [seconds.to_string()],
+            "kind": "structured",
+            "workspace_id": "ws_default",
+            "timeout_ms": (seconds + 3) * 1000,
+            "idempotency_key": idempotency_key,
+        })
+    }
+
     /// The shared exec fixture must stay usable by every test that only needs
     /// "some launchable program". If it ever names an OwnMesh binary again,
     /// the self-reentrancy guard refuses it and unrelated tests start failing
@@ -11804,6 +12172,378 @@ mod broker_intent_tests {
         assert_eq!(listed.get("approval_required"), Some(&json!(false)));
         let exec_result = exec.await.expect("join exec").expect("sleep must complete");
         assert_eq!(exec_result.get("approval_required"), Some(&json!(false)));
+    }
+
+    /// The Agent's `approval.decision` route used to bypass `dispatch_unlocked`
+    /// and wait on the approved child while holding the runtime mutex. It must
+    /// now use the same typed admitted-work finalizer as a directly allowed
+    /// command.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn control_plane_approved_command_releases_runtime_lock() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(command_ask_policy());
+        let runtime = Arc::new(Mutex::new(runtime));
+        let requester = ClientIdentity::new("client:remote:test:approval-lock", "test");
+
+        let pending = dispatch_unlocked(
+            &runtime,
+            methods::OPS_EXEC,
+            Some(sleep_command(2, "approved_unlock_1")),
+            &requester,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("command must enter approval");
+        let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+        let approval_runtime = Arc::clone(&runtime);
+        let approval_id_for_task = approval_id.clone();
+        let approval = tokio::spawn(async move {
+            apply_control_plane_approval_decision_unlocked(
+                &approval_runtime,
+                Some(json!({
+                    "approval_id": approval_id_for_task,
+                    "decision": "approve",
+                    "approver_principal": "owner",
+                })),
+            )
+            .await
+        });
+        let started = std::time::Instant::now();
+        loop {
+            let executing = runtime
+                .lock()
+                .await
+                .approvals
+                .get(&approval_id)
+                .is_some_and(|record| record.state == "executing");
+            if executing {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "approved command never reached executing"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!approval.is_finished(), "sleep child must still be running");
+
+        let probe = ClientIdentity::new("approval-lock-probe", "test");
+        let listed = dispatch_unlocked(
+            &runtime,
+            methods::OPS_FS_LIST,
+            Some(json!({ "path": "", "workspace_id": "ws_default" })),
+            &probe,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("unrelated read must complete during approved child wait");
+        assert_eq!(listed["approval_required"], false);
+        assert!(
+            !approval.is_finished(),
+            "read returned only after the approved command finished"
+        );
+
+        let completed = approval
+            .await
+            .expect("join approval")
+            .expect("approval completes");
+        assert_eq!(completed["approval_decision_applied"], true);
+        assert_eq!(completed["result"]["exit_code"], 0);
+        assert_eq!(
+            runtime.lock().await.approvals[&approval_id].state,
+            "approved"
+        );
+    }
+
+    /// Capacity wait happens before admission. Cancelling there cannot reserve
+    /// or burn the key, and releasing capacity afterwards cannot resurrect the
+    /// cancelled request and spawn it late.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_cancel_never_spawns_or_burns_idempotency() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut daemon = DaemonRuntime::open(&paths).unwrap();
+        daemon.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let runtime = Arc::new(Mutex::new(daemon));
+        let slots = Arc::new(Semaphore::new(0));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let client = ClientIdentity::new("capacity-cancel-test", "test");
+        let touch = ["/usr/bin/touch", "/bin/touch"]
+            .into_iter()
+            .find(|candidate| Path::new(candidate).is_file())
+            .expect("a stock touch executable must exist");
+        let spawn_witness = temp.path().join("spawned-after-capacity");
+        let params = json!({
+            "program": touch,
+            "args": [spawn_witness.display().to_string()],
+            "kind": "structured",
+            "workspace_id": "ws_default",
+            "idempotency_key": "capacity_cancel_key",
+        });
+
+        let queued_runtime = Arc::clone(&runtime);
+        let queued_slots = Arc::clone(&slots);
+        let queued_client = client.clone();
+        let queued_params = params.clone();
+        let queued = tokio::spawn(async move {
+            dispatch_unlocked_with_slots(
+                &queued_runtime,
+                methods::OPS_EXEC,
+                Some(queued_params),
+                &queued_client,
+                Some(cancel_rx),
+                None,
+                None,
+                None,
+                None,
+                None,
+                queued_slots.as_ref(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !queued.is_finished(),
+            "zero capacity must queue the command"
+        );
+        assert!(
+            runtime.lock().await.op_journal.is_empty(),
+            "capacity wait must precede journal admission"
+        );
+
+        cancel_tx.send(true).unwrap();
+        let cancelled = queued
+            .await
+            .expect("join queued command")
+            .expect_err("queued command must cancel before admission");
+        assert!(cancelled.to_string().contains("cancelled before execution"));
+        assert!(runtime.lock().await.op_journal.is_empty());
+        assert!(
+            !spawn_witness.exists(),
+            "a command cancelled in the capacity queue must never spawn"
+        );
+
+        // Capacity arriving after cancellation cannot revive the old future.
+        // The same key remains fresh and succeeds only when explicitly sent
+        // again.
+        slots.add_permits(1);
+        let retried = dispatch_unlocked_with_slots(
+            &runtime,
+            methods::OPS_EXEC,
+            Some(params),
+            &client,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            slots.as_ref(),
+        )
+        .await
+        .expect("cancelled capacity wait must leave the key reusable");
+        assert_eq!(retried["result"]["exit_code"], 0);
+        assert_eq!(retried["replayed"], false);
+        assert!(
+            spawn_witness.exists(),
+            "only the explicit retry after capacity is available may spawn"
+        );
+    }
+
+    /// A finalization fault after an unlocked child must restore only this
+    /// approval and marker. Whole-map snapshots would erase updates made by an
+    /// unrelated operation while the child was running.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn approved_finalization_rollback_preserves_interleaved_entries() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut daemon = DaemonRuntime::open(&paths).unwrap();
+        daemon.set_policy_for_test(command_ask_policy());
+        let runtime = Arc::new(Mutex::new(daemon));
+        let requester = ClientIdentity::new("client:remote:test:rollback", "test");
+        let pending = dispatch_unlocked(
+            &runtime,
+            methods::OPS_EXEC,
+            Some(sleep_command(1, "approval_rollback_key")),
+            &requester,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+        let approval_runtime = Arc::clone(&runtime);
+        let approval_id_for_task = approval_id.clone();
+        let approval = tokio::spawn(async move {
+            apply_control_plane_approval_decision_unlocked(
+                &approval_runtime,
+                Some(json!({
+                    "approval_id": approval_id_for_task,
+                    "decision": "approve",
+                    "approver_principal": "owner",
+                })),
+            )
+            .await
+        });
+
+        let started = std::time::Instant::now();
+        loop {
+            let mut guard = runtime.lock().await;
+            if guard
+                .approvals
+                .get(&approval_id)
+                .is_some_and(|record| record.state == "executing")
+            {
+                let unrelated_key = "unrelated\u{1f}journal".to_owned();
+                guard.op_journal.insert(
+                    unrelated_key,
+                    json!({
+                        OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                        "operation_id": "unrelated_operation",
+                    }),
+                );
+                let mut unrelated = guard.approvals[&approval_id].clone();
+                unrelated.id = "apr_unrelated_interleaved".into();
+                unrelated.operation_id = "unrelated_operation".into();
+                unrelated.state = "pending".into();
+                guard.approvals.insert(unrelated.id.clone(), unrelated);
+                guard
+                    .persist_op_journal()
+                    .expect("interleaved journal update must commit");
+                guard
+                    .persist_approvals()
+                    .expect("interleaved approval update must commit");
+                guard.fail_op_journal_persist_on_nth_call_for_test(1);
+                break;
+            }
+            drop(guard);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "approved command never reached executing"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let error = approval
+            .await
+            .expect("join approval")
+            .expect_err("terminal journal persist is fault-injected");
+        assert!(error.to_string().contains("fault-injected"), "{error}");
+        let guard = runtime.lock().await;
+        assert!(guard.op_journal.contains_key("unrelated\u{1f}journal"));
+        assert!(guard.approvals.contains_key("apr_unrelated_interleaved"));
+        assert_eq!(guard.approvals[&approval_id].state, "executing");
+        drop(guard);
+        let reopened = DaemonRuntime::open(&paths).expect("reopen durable interleaved state");
+        assert!(reopened.op_journal.contains_key("unrelated\u{1f}journal"));
+        assert!(reopened.approvals.contains_key("apr_unrelated_interleaved"));
+    }
+
+    /// Approval bridges finalize the target first. If the outer approval's
+    /// terminal persist then fails, rollback is scoped to the outer record and
+    /// must never overwrite the target's already-durable terminal state.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn approval_bridge_outer_failure_preserves_terminal_target() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut daemon = DaemonRuntime::open(&paths).unwrap();
+        daemon.set_policy_for_test(command_ask_policy());
+        let runtime = Arc::new(Mutex::new(daemon));
+        let requester = ClientIdentity::new("client:remote:test:bridge-target", "test");
+        let pending = dispatch_unlocked(
+            &runtime,
+            methods::OPS_EXEC,
+            Some(json!({
+                "program": fixture_executable().display().to_string(),
+                "args": [],
+                "kind": "structured",
+                "workspace_id": "ws_default",
+                "idempotency_key": "bridge_target_key",
+            })),
+            &requester,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("target command must enter approval");
+        let target_id = pending["approval_id"].as_str().unwrap().to_owned();
+        let bridge_id = "apr_bridge_outer_fault".to_owned();
+        {
+            let mut guard = runtime.lock().await;
+            let mut bridge = guard.approvals[&target_id].clone();
+            bridge.id = bridge_id.clone();
+            bridge.operation_id = "op_bridge_outer_fault".into();
+            bridge.capability = "admin.approval.bridge".into();
+            bridge.requester_principal = "client:remote:test:bridge-requester".into();
+            bridge.facts = Some(OperationFacts {
+                capability: bridge.capability.clone(),
+                kind: "admin".into(),
+                ..Default::default()
+            });
+            bridge.request = PendingRequest::AdminApprovalBridge(AdminApprovalBridgeParams {
+                approval_id: target_id.clone(),
+                decision: "approve".into(),
+                temporary_grant: false,
+                grant_seconds: None,
+                idempotency_key: "bridge_outer_key".into(),
+            });
+            guard.approvals.insert(bridge_id.clone(), bridge);
+            guard.persist_approvals().expect("persist bridge fixture");
+            // outer executing, target executing, target terminal, outer terminal
+            guard.fail_approvals_persist_on_nth_call_for_test(4);
+        }
+
+        let error = apply_control_plane_approval_decision_unlocked(
+            &runtime,
+            Some(json!({
+                "approval_id": bridge_id,
+                "decision": "approve",
+                "approver_principal": "owner",
+            })),
+        )
+        .await
+        .expect_err("outer terminal approval persist is fault-injected");
+        assert!(error.to_string().contains("fault-injected"), "{error}");
+
+        let guard = runtime.lock().await;
+        assert_eq!(
+            guard.approvals[&target_id].state, "approved",
+            "the bridge target's terminal state must survive outer rollback"
+        );
+        assert_eq!(guard.approvals["apr_bridge_outer_fault"].state, "executing");
+        drop(guard);
+        let reopened = DaemonRuntime::open(&paths).expect("reopen bridge state");
+        assert_eq!(reopened.approvals[&target_id].state, "approved");
+        assert_eq!(
+            reopened.approvals["apr_bridge_outer_fault"].state,
+            "executing"
+        );
     }
 
     #[test]

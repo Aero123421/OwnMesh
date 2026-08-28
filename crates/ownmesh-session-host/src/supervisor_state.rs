@@ -94,14 +94,11 @@ impl HostedHost {
             Self::Pty(h) => status(h),
             Self::Structured(h) => SupervisorStatus {
                 pid: h.handle.pid,
-                process_birth_id: h
-                    .handle
-                    .pid
-                    .and_then(|pid| ownmesh_ipc::process_birth_id(pid).ok().flatten()),
+                process_birth_id: birth_witness(h.handle.pid),
                 pending_output_bytes: h.pending_output_bytes(),
                 pending_stdout_bytes: h.pending_stdout_bytes(),
                 pending_stderr_bytes: h.pending_stderr_bytes(),
-                exited: h.is_exited(),
+                exited: child_has_exited(h.handle.pid, h.is_exited()),
             },
         }
     }
@@ -722,15 +719,60 @@ fn unix_now() -> i64 {
 fn status(host: &LiveHost) -> SupervisorStatus {
     SupervisorStatus {
         pid: host.handle.pid,
-        process_birth_id: host
-            .handle
-            .pid
-            .and_then(|pid| ownmesh_ipc::process_birth_id(pid).ok().flatten()),
+        process_birth_id: birth_witness(host.handle.pid),
         pending_output_bytes: host.pending_output_bytes(),
         pending_stdout_bytes: host.pending_output_bytes(),
         pending_stderr_bytes: 0,
-        exited: host.is_exited(),
+        exited: child_has_exited(host.handle.pid, host.is_exited()),
     }
+}
+
+/// The durable child identity a restarted daemon compares against a PID.
+///
+/// This is deliberately the plain birth witness: an exited-but-unreaped
+/// process still owns the identity it names, and losing that identity would
+/// let a reused PID be mistaken for the original child.
+fn birth_witness(pid: Option<u32>) -> Option<u64> {
+    pid.and_then(|pid| ownmesh_ipc::process_birth_id(pid).ok().flatten())
+}
+
+/// Whether the hosted child has exited, as attested to the daemon.
+///
+/// #31: a child that exited but has not been reaped keeps its PID slot and
+/// its kernel-recorded start time. `session_open` attests `exited == false`
+/// before it publishes a durable `running` record, so a short-lived child that
+/// finished during that handshake was published as `running` — and then the
+/// close path, reading the same surviving identity, answered "authenticated
+/// child is still alive, refusing PID-only termination" for a process that was
+/// already gone. Folding the OS liveness answer in here keeps the attestation
+/// from outliving the child.
+///
+/// A probe failure is never read as exited: every error stays an `Err` and
+/// leaves the host's own view in charge. `Ok(None)` is not quite the same as
+/// "the OS confirmed an exit", though, and the difference is worth naming
+/// rather than papering over:
+///
+/// - Windows (`WaitForSingleObject` signalled, or `ERROR_INVALID_PARAMETER`)
+///   and macOS (`SZOMB`, `ESRCH`/`ENOENT`) really do only report a genuine
+///   exit or absence; access denial and short replies stay `Err`.
+/// - Linux reads `/proc/<pid>/stat` and treats `NotFound` as absence, which
+///   also covers `/proc` not being mounted, `hidepid`, and a mount-namespace
+///   mismatch — and it reads state `Z` as exited, which a thread-group leader
+///   that called `pthread_exit` while sibling threads run also reports.
+///
+/// Those Linux shapes are pre-existing: the plain birth witness returns
+/// `Ok(None)` for the `NotFound` cases too, and `session.open` already
+/// refuses a child it cannot identify, so they fail closed the same way with
+/// or without this call. The genuinely new exposure is the `pthread_exit`
+/// process, which is now attested exited while it is still serving.
+fn child_has_exited(pid: Option<u32>, host_reports_exited: bool) -> bool {
+    if host_reports_exited {
+        return true;
+    }
+    matches!(
+        pid.map(ownmesh_ipc::running_process_birth_id),
+        Some(Ok(None))
+    )
 }
 
 #[cfg(test)]
@@ -1270,5 +1312,151 @@ mod tests {
             cwd: None,
             env: vec![],
         }
+    }
+
+    /// #31: an exited-but-unreaped child keeps its PID slot and its
+    /// kernel-recorded start time, so the birth witness alone still finds it.
+    /// The supervisor must not turn that surviving identity into "the child is
+    /// alive": that is what published a durable `running` record for a process
+    /// that had already finished, and then made `close` answer "authenticated
+    /// child is still alive, refusing PID-only termination" for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_child_is_attested_as_exited() {
+        let truth = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .find(|candidate| Path::new(candidate).is_file())
+            .expect("a stock true executable must exist");
+        let mut child = std::process::Command::new(truth)
+            .spawn()
+            .expect("spawn the fixture child");
+        let pid = child.id();
+        // Deliberately do NOT reap: wait for the kernel to publish state `Z`.
+        let mut state = String::new();
+        for _ in 0..200 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if let Some(end) = stat.rfind(')') {
+                state = stat
+                    .get(end + 2..)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+            if state == "Z" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(state, "Z", "the fixture child must be an unreaped corpse");
+        // The durable identity survives, which is what PID-reuse protection
+        // needs...
+        assert!(
+            birth_witness(Some(pid)).is_some(),
+            "the birth witness must still name the corpse"
+        );
+        // ...but the daemon must not be told the child is still running.
+        assert!(
+            child_has_exited(Some(pid), false),
+            "an unreaped corpse must attest as exited"
+        );
+        child.wait().expect("reap the fixture child");
+    }
+
+    /// The fail-closed half of the same contract: a genuinely live child is
+    /// never attested as exited, and the host's own view still wins when it
+    /// already knows the child is gone.
+    #[test]
+    fn a_live_child_is_never_attested_as_exited() {
+        let mut child = if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+            std::process::Command::new(format!("{root}\\System32\\PING.EXE"))
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ping")
+        } else {
+            let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+                .into_iter()
+                .find(|candidate| Path::new(candidate).is_file())
+                .expect("a stock sleep executable must exist");
+            std::process::Command::new(sleep)
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep")
+        };
+        let pid = child.id();
+        assert!(
+            !child_has_exited(Some(pid), false),
+            "a running child must not be attested as exited"
+        );
+        assert!(
+            child_has_exited(Some(pid), true),
+            "the host's own exit observation stays authoritative"
+        );
+        child.kill().expect("kill the fixture child");
+        child.wait().expect("reap the fixture child");
+    }
+
+    /// The same contract at the boundary the daemon actually reads:
+    /// `reattach` is the status `session.open` checks before it publishes a
+    /// durable `running` record.
+    ///
+    /// The structured child exits immediately but leaves a descendant holding
+    /// its stdout/stderr pipes open, so neither stream reaches EOF.
+    /// `StructuredProcessHost::is_exited` requires stream EOF *and* a reaped
+    /// child, and short-circuits on the first — so the child is never reaped
+    /// and stays an unreaped corpse whose surviving birth witness reads as
+    /// "still alive". That is the shape #31 reported: the session host still
+    /// running, its attested child in state `Z`, and the session pinned as
+    /// `running` with close refusing to reconcile it.
+    ///
+    /// Structured pipes are the official-profile transport (a Codex
+    /// `app-server` over stdio JSON-RPC), which is where this was first seen.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_exits_behind_held_pipes_attests_as_exited() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let binding = state
+            .spawn_with_io(
+                HostManifest::new(
+                    "ses_shortlived",
+                    "dev",
+                    "ws",
+                    "owner",
+                    1,
+                    unix_now() + 60,
+                    unix_now() + 600,
+                )
+                .unwrap(),
+                PtyCommand {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "sleep 30 & exit 0".into()],
+                    cwd: None,
+                    env: vec![],
+                },
+                PtySize::default(),
+                HostIoMode::StructuredPipes,
+            )
+            .await
+            .unwrap();
+        // Barrier at the attestation boundary: poll the exact status the
+        // daemon reads, bounded so a hang fails loudly instead of spinning.
+        let mut status = state.reattach(&binding).await.unwrap();
+        for _ in 0..200 {
+            if status.exited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            status = state.reattach(&binding).await.unwrap();
+        }
+        assert!(
+            status.exited,
+            "a finished child must attest as exited: {status:?}"
+        );
+        // Identity is still published so a later reconciliation can tell this
+        // child apart from a reused PID.
+        assert!(status.pid.is_some(), "the attested PID must survive");
+        let _ = state.terminate(&binding).await;
     }
 }

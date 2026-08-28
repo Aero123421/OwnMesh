@@ -272,39 +272,64 @@
         )
         if ($TimeoutSeconds -lt 1) { throw "TimeoutSeconds must be >= 1" }
         if ($PollMilliseconds -lt 1) { throw "PollMilliseconds must be >= 1" }
-        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        # Stopwatch is monotonic. A backward wall-clock correction on a newly
+        # imaged or just-booted machine must not silently extend rollback time.
+        $elapsed = [Diagnostics.Stopwatch]::StartNew()
+        $timeoutMilliseconds = [int64]$TimeoutSeconds * 1000
         $sawRunning = $false
-        while ($true) {
-            $run = Get-OwnMeshScheduledTaskRun
-            if ($null -ne $run -and [int]$run.State -eq 4) { $sawRunning = $true }
-            if (Test-OwnMeshScheduledTaskTerminalFailure -Run $run -SawRunning $sawRunning) {
-                if ([int]$run.State -eq 1) {
-                    throw "Scheduled task is disabled"
+        # Native stderr is expected while the daemon is starting. Windows
+        # PowerShell 5.1 can wrap it as NativeCommandError, and newer
+        # PowerShell can promote it through this preference variable. Neither
+        # is readiness authority; only exit code plus parsed status is.
+        $previousEap = $ErrorActionPreference
+        $hadNativePreference = Test-Path -LiteralPath variable:PSNativeCommandUseErrorActionPreference
+        $previousNativePreference = $null
+        if ($hadNativePreference) {
+            $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        try {
+            $ErrorActionPreference = "Continue"
+            while ($true) {
+                # Numeric COM state/result only. Localized task text is never
+                # parsed, and a failed COM probe returns $null and merely keeps
+                # polling; it is not authoritative evidence of absence.
+                $run = Get-OwnMeshScheduledTaskRun
+                if ($null -ne $run -and [int]$run.State -eq 4) { $sawRunning = $true }
+                if (Test-OwnMeshScheduledTaskTerminalFailure -Run $run -SawRunning $sawRunning) {
+                    if ([int]$run.State -eq 1) {
+                        throw "Scheduled task is disabled"
+                    }
+                    throw ("Scheduled task action failed with last run result {0}" -f [int64]$run.LastTaskResult)
                 }
-                throw ("Scheduled task action failed with last run result {0}" -f [int64]$run.LastTaskResult)
-            }
-            $previousEap = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
                 $statusText = (& $OwnMeshPath --json status 2>$null | Out-String)
                 $statusCode = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $previousEap
-            }
-            if ($statusCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($statusText)) {
-                try {
-                    $status = $statusText | ConvertFrom-Json
-                    if ($status.daemon.version -eq $ExpectedVersion) {
-                        return
+                if ($statusCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($statusText)) {
+                    try {
+                        $status = $statusText | ConvertFrom-Json -ErrorAction Stop
+                        $daemon = $null
+                        if ($status.PSObject.Properties.Name -contains "daemon") {
+                            $daemon = $status.daemon
+                        }
+                        if ($null -ne $daemon -and
+                            $daemon.PSObject.Properties.Name -contains "version" -and
+                            $daemon.version -eq $ExpectedVersion) {
+                            return
+                        }
+                    } catch {
+                        # Partial JSON while the daemon is still coming up.
                     }
-                } catch {
-                    # Partial JSON while the daemon is still coming up.
                 }
+                if ($elapsed.ElapsedMilliseconds -ge $timeoutMilliseconds) {
+                    throw "Updated OwnMesh daemon did not become ready with the expected version"
+                }
+                Start-Sleep -Milliseconds $PollMilliseconds
             }
-            if ([DateTime]::UtcNow -ge $deadline) {
-                throw "Updated OwnMesh daemon did not become ready with the expected version"
+        } finally {
+            $ErrorActionPreference = $previousEap
+            if ($hadNativePreference) {
+                $PSNativeCommandUseErrorActionPreference = $previousNativePreference
             }
-            Start-Sleep -Milliseconds $PollMilliseconds
         }
     }
 

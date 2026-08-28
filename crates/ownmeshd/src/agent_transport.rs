@@ -4,7 +4,9 @@
 //! policy-gated [`DaemonRuntime`]. Without a runtime handle the transport stays
 //! fail-closed (`remote_routing_enabled: false`).
 
-use crate::runtime::{dispatch_unlocked, DaemonRuntime};
+use crate::runtime::{
+    apply_control_plane_approval_decision_unlocked, dispatch_unlocked, DaemonRuntime,
+};
 use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
@@ -3871,12 +3873,8 @@ async fn dispatch_remote_operation(
                 }
             }
         }
-        let outcome = {
-            let mut guard = runtime.lock().await;
-            guard
-                .apply_control_plane_approval_decision(Some(decision_params))
-                .await
-        };
+        let outcome =
+            apply_control_plane_approval_decision_unlocked(runtime, Some(decision_params)).await;
         return match outcome {
             Ok(mut body) => {
                 // decisionOpId stays on the envelope so DeviceRoom pending matches;

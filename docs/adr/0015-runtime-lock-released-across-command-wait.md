@@ -48,14 +48,27 @@ moves off the mutex.
    without argv, paths, environment, or user output. Diagnosis subtracts only
    unlocked execs that reserved a journal marker, so a leftover marker plus a
    keyless exec stays visible as stuck.
+6. **Command execution has an explicit global capacity bound.** A permit is
+   acquired before the runtime mutex, policy admission, journal reservation,
+   or executable custody, and held through finalization. Eight ordinary
+   command slots remain available when all four separately capped detached
+   jobs are active. A remote cancellation while queued wins before admission,
+   so it cannot spawn later or consume an idempotency key.
+7. **Approved non-elevated commands use the same typed completion path.**
+   Local and control-plane approval decisions admit under the lock, execute
+   without it, and finalize after reacquiring it. Approval bridges order the
+   target completion before the outer bridge completion. A failed completion
+   restores only its own journal entry and approval record, never a whole-map
+   snapshot that could erase unrelated work committed during the child wait.
 
 ## Consequences
 
 - An IPC-reentrant child, or a long permitted `command.run`, no longer
   starves filesystem, Git, or diagnosis tools for that device.
-- Concurrent `command.run` executions can overlap. Admission remains
-  exclusive; only the child wait is concurrent. Detached-command caps and
-  journal exact-once are unchanged.
+- Concurrent `command.run` executions can overlap within the explicit global
+  bound. Admission remains exclusive; only the child wait is concurrent.
+  The separate detached-command cap and journal exact-once semantics are
+  unchanged.
 - Callers that still invoke `dispatch` / `dispatch_cancellable` on a
   `&mut DaemonRuntime` (unit tests, in-process helpers) execute the same
   plan inline. Production IPC and Agent paths use `dispatch_unlocked`.

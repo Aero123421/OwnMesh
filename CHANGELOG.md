@@ -17,18 +17,32 @@
   that reserved a journal marker is not reported as a stuck receipt; a leftover
   marker plus a keyless in-flight exec stays visible. The unlocked admit path
   still applies lockdown, journal-degraded, and revoked-principal gates before
-  spawn.
+  spawn. A global command semaphore is acquired before the runtime mutex,
+  journal reservation, and executable custody; queued remote commands can be
+  cancelled without later spawning or consuming their idempotency key, while
+  detached jobs retain their separate four-job cap. Control-plane and local
+  approvals use the same unlocked typed finalization path, including approval
+  bridges, and rollback restores only the operation's own journal/approval
+  entries so unrelated concurrent commits are never overwritten.
 - `session.open` will not commit `state=running` unless the OS reports the
   attested child as still running. A short-lived process that is already a
   zombie at the attestation barrier is rolled back instead of poisoning later
-  open/replay/close (#31).
+  open/replay/close. Structured children that exit while a descendant keeps
+  their stdout/stderr pipes open are classified at the supervisor status
+  boundary; the durable birth witness remains the plain PID-reuse witness.
+  Linux `/proc` state `Z` and absence/probe ambiguity are disclosed explicitly
+  rather than overstated as an unambiguous reap result (#31).
 - The Windows portable installer polls authenticated `ownmesh --json status`
   until `daemon.version` matches the installed CLI, using the same 20 s
   bounded deadline as `ownmesh update`. A healthy daemon that needs more than
   500 ms no longer triggers binary rollback. A leftover Task Scheduler
   `LastTaskResult` while the task is READY is not this instance; a terminal
   COM result fails the installer only after this instance was observed
-  running, or when the task is disabled (#154).
+  running, or when the task is disabled. The bounded wait uses a monotonic
+  `Stopwatch`, tolerates native stderr/partial status while startup is in
+  progress, and never treats localized task text or a failed COM probe as
+  authoritative task absence. The supported 20-second default and
+  `OWNMESH_DAEMON_READY_TIMEOUT_SECONDS` override remain unchanged (#154).
 - Setup, `ownmesh doctor`, and the TUI Repair Agent path inspect the same
   config/state/runtime ancestor custody walk the Agent uses at start. A
   group-writable parent such as `~/.local/state` is a dedicated
