@@ -33,3 +33,10 @@ condition = "AND"
 regexTarget = "secret"
 regexes = ['''^d2ViYXV0aG5fb3duZXJfaWQ$''']
 paths = ['''^packages/control-plane/src/owner-auth\.test\.ts$''']
+
+[[rules.allowlists]]
+description = "Frozen MCP input-property SHA-256 digests are public schema fingerprints, not idempotency credentials"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{64}$''']
+paths = ['''^release/mcp-catalog-baseline-v1\.json$''']

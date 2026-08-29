@@ -1,9 +1,10 @@
 #![cfg(unix)]
 
+#[cfg(target_os = "linux")]
+use ownmesh_exec::resolve_executable_invocation_path;
 use ownmesh_exec::{
     pin_executable, pin_shebang_interpreter, prepare_executable, prepare_executable_with_shebang,
-    resolve_executable_invocation_path, run_prepared_command_cancellable, CommandKind,
-    ExecutablePin, RunRequest,
+    run_prepared_command_cancellable, CommandKind, ExecutablePin, RunRequest,
 };
 use std::collections::HashMap;
 use std::io::Write;
