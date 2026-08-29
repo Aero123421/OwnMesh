@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-19
-- Amended: 2026-08-26
+- Amended: 2026-08-28
 - Deciders: OwnMesh runtime maintainers
 
 ## Context
@@ -44,13 +44,25 @@ consumes that capability and keeps custody through the OS image-open step.
 
 Platform implementations are:
 
-- **Linux:** copy the already-verified handle into an anonymous executable
-  memfd, verify the copied digest, apply write/grow/shrink/seal seals, and call
-  `fexecve` on that descriptor with the approved `argv[0]`. Later path or
-  in-place inode changes cannot alter the image. Native images keep close-on-
-  exec; an approved shebang script retains its sealed descriptor across the
-  kernel's interpreter handoff so that the interpreter reads the prepared
-  content rather than the mutable original path.
+- **Linux native images:** hash the exact stream while copying the
+  identity-verified handle into an anonymous executable memfd, compare it with
+  the approved digest, apply write/grow/shrink/seal
+  seals, and call `fexecve` on that descriptor with the approved `argv[0]`.
+  Later path or in-place inode changes cannot alter the image.
+- **Linux shebang scripts:** treat the script and effective interpreter as one
+  compound identity. Admission parses the verified shebang, resolves simple
+  `/usr/bin/env <name>` through OwnMesh's deterministic execution path, and
+  pins the interpreter invocation and canonical backing; unsupported `env`
+  option syntax and nested shebang interpreters fail closed. Preparation
+  re-parses the verified script, revalidates both identities, and executes
+  sealed memfd copies of both interpreter and script. Shell interpreters read
+  the inherited `/proc/self/fd/<n>` directly. Node interpreters use a bounded
+  data-URL loader that maps the sealed bytes to the approved canonical module
+  URL, preserving adjacent relative imports without reopening the mutable
+  script as source. `process.execPath` is bound to `/proc/self/exe`, the
+  kernel-held sealed image, so CLIs can securely spawn Node children. This
+  avoids Node's `lstat '/memfd:… (deleted)'` failure;
+  write, truncate, unlink, and retarget cannot alter the executed script bytes.
 - **macOS:** ordinary user-controlled executables are copied from the verified
   handle into an atomically-created, owner-only private runtime directory. The
   create-new handle is retained, the copy is fsynced and re-hashed, the approved
@@ -91,7 +103,9 @@ path lookup, or policy work occurs after fork in that closure.
 - Proxy dispatch semantics remain compatible when the proxy is unchanged.
 - A backing digest is evidence, not substitute execution authority.
 - Preparation may copy up to the existing executable pin size limit. Linux
-  uses sealed anonymous memory; macOS briefly uses an owner-only private
+  uses sealed anonymous memory for native, interpreter, and script images;
+  Node receives only a bounded loader plus the sealed descriptor. macOS
+  briefly uses an owner-only private
   snapshot for ordinary images and immutable path custody for restricted
   platform images; Windows retains several read-only handles until spawn.
 - macOS binaries that depend on their physical executable directory for

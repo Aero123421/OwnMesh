@@ -7,9 +7,13 @@
 //! narrow exception to private-image execution: their verified system backing
 //! path is immutable to the daemon and is launched with the approved argv0.
 
+#[cfg(target_os = "linux")]
+use super::verify_open_file_metadata_pin;
+#[cfg(not(target_os = "linux"))]
+use super::{open_file_identity, verify_open_file_pin};
 use super::{
-    open_file_identity, verify_open_file_pin, verify_path_entry_pin, CommandKind, ExecError,
-    ExecResult, ExecutablePin, RunRequest,
+    verify_path_entry_pin, CommandKind, ExecError, ExecResult, ExecutablePin, RunRequest,
+    ShebangInterpreterPin,
 };
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
@@ -41,6 +45,14 @@ pub struct PreparedExecutable {
 enum PreparedImage {
     #[cfg(target_os = "linux")]
     Descriptor(File),
+    #[cfg(target_os = "linux")]
+    Script {
+        script: File,
+        script_origin: String,
+        interpreter: File,
+        interpreter_argv0: String,
+        interpreter_args: Vec<String>,
+    },
     #[cfg(windows)]
     LockedPath(WindowsPathCustody),
     #[cfg(target_os = "macos")]
@@ -109,10 +121,11 @@ pub fn prepare_executable(
     backing_pin: &ExecutablePin,
     staging_root: Option<&Path>,
 ) -> ExecResult<PreparedExecutable> {
-    prepare_executable_with_interpreter(
+    prepare_executable_inner(
         invocation_path,
         invocation_pin,
         backing_pin,
+        None,
         None,
         staging_root,
     )
@@ -128,10 +141,44 @@ pub fn prepare_executable_with_interpreter(
     interpreter_pin: Option<&ExecutablePin>,
     staging_root: Option<&Path>,
 ) -> ExecResult<PreparedExecutable> {
-    #[cfg(any(target_os = "linux", windows))]
-    let _ = staging_root;
-    #[cfg(not(windows))]
-    let _ = interpreter_pin;
+    prepare_executable_inner(
+        invocation_path,
+        invocation_pin,
+        backing_pin,
+        interpreter_pin,
+        None,
+        staging_root,
+    )
+}
+
+/// Prepare a shebang script together with the exact effective interpreter
+/// pinned during admission. Linux launches the pinned interpreter image and
+/// retains the original verified script in a sealed inherited descriptor.
+/// Node maps those sealed bytes to the approved module URL through a bounded
+/// loader, preserving its real module directory without trusting the script
+/// pathname as source again.
+pub fn prepare_executable_with_shebang(
+    invocation_path: &Path,
+    invocation_pin: &ExecutablePin,
+    backing_pin: &ExecutablePin,
+    shebang_pin: Option<&ShebangInterpreterPin>,
+    staging_root: Option<&Path>,
+) -> ExecResult<PreparedExecutable> {
+    prepare_executable_inner(
+        invocation_path,
+        invocation_pin,
+        backing_pin,
+        None,
+        shebang_pin,
+        staging_root,
+    )
+}
+
+fn validate_preparation_contract(
+    invocation_path: &Path,
+    invocation_pin: &ExecutablePin,
+    backing_pin: &ExecutablePin,
+) -> ExecResult<()> {
     if !invocation_path.is_absolute()
         || !Path::new(&invocation_pin.path).is_absolute()
         || !Path::new(&backing_pin.path).is_absolute()
@@ -150,6 +197,24 @@ pub fn prepare_executable_with_interpreter(
             "invocation/backing policy classification mismatch".into(),
         ));
     }
+    Ok(())
+}
+
+fn prepare_executable_inner(
+    invocation_path: &Path,
+    invocation_pin: &ExecutablePin,
+    backing_pin: &ExecutablePin,
+    interpreter_pin: Option<&ExecutablePin>,
+    shebang_pin: Option<&ShebangInterpreterPin>,
+    staging_root: Option<&Path>,
+) -> ExecResult<PreparedExecutable> {
+    #[cfg(any(target_os = "linux", windows))]
+    let _ = staging_root;
+    #[cfg(not(windows))]
+    let _ = interpreter_pin;
+    #[cfg(not(target_os = "linux"))]
+    let _ = shebang_pin;
+    validate_preparation_contract(invocation_path, invocation_pin, backing_pin)?;
 
     verify_path_entry_pin(invocation_path, invocation_pin)?;
     verify_path_entry_pin(Path::new(&backing_pin.path), backing_pin)?;
@@ -162,15 +227,25 @@ pub fn prepare_executable_with_interpreter(
     })?;
     #[cfg(windows)]
     let mut ancestors = lock_windows_ancestor_chain(invocation_path)?;
-    let mut invocation = open_execution_target(invocation_path).map_err(|error| {
-        ExecError::Journal(format!(
-            "open approved invocation for preparation failed: {error}"
-        ))
-    })?;
-    verify_open_file_pin(&mut invocation, invocation_path, invocation_pin)?;
-    // The executable object reached through the invocation must be the exact
-    // approved backing object, not merely an object with the same bytes.
-    verify_open_file_pin(&mut invocation, invocation_path, backing_pin)?;
+    let invocation = open_approved_invocation(invocation_path)?;
+    #[cfg(not(target_os = "linux"))]
+    let mut invocation = invocation;
+    #[cfg(target_os = "linux")]
+    {
+        // Linux hashes the exact bytes while copying them into the sealed
+        // memfd below. Metadata checks here bind the opened invocation to both
+        // approved path identities without reading a large runtime three
+        // additional times before the same copy.
+        verify_open_file_metadata_pin(&invocation, invocation_path, invocation_pin)?;
+        verify_open_file_metadata_pin(&invocation, invocation_path, backing_pin)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        verify_open_file_pin(&mut invocation, invocation_path, invocation_pin)?;
+        // The executable object reached through the invocation must be the
+        // exact approved backing object, not merely an object with same bytes.
+        verify_open_file_pin(&mut invocation, invocation_path, backing_pin)?;
+    }
 
     let backing_path = Path::new(&backing_pin.path);
     #[cfg(windows)]
@@ -181,23 +256,33 @@ pub fn prepare_executable_with_interpreter(
     })?;
     #[cfg(windows)]
     ancestors.extend(lock_windows_ancestor_chain(backing_path)?);
-    let mut backing = open_execution_target(backing_path).map_err(|error| {
-        ExecError::Journal(format!(
-            "open approved canonical backing for preparation failed: {error}"
-        ))
-    })?;
-    verify_open_file_pin(&mut backing, backing_path, backing_pin)?;
-    if open_file_identity(&invocation)? != open_file_identity(&backing)? {
-        return Err(ExecError::Journal(
-            "invocation no longer resolves to the approved backing identity".into(),
-        ));
-    }
+    #[cfg(not(target_os = "linux"))]
+    let backing = {
+        let mut backing = open_execution_target(backing_path).map_err(|error| {
+            ExecError::Journal(format!(
+                "open approved canonical backing for preparation failed: {error}"
+            ))
+        })?;
+        verify_open_file_pin(&mut backing, backing_path, backing_pin)?;
+        if open_file_identity(&invocation)? != open_file_identity(&backing)? {
+            return Err(ExecError::Journal(
+                "invocation no longer resolves to the approved backing identity".into(),
+            ));
+        }
+        backing
+    };
 
     verify_path_entry_pin(invocation_path, invocation_pin)?;
     verify_path_entry_pin(backing_path, backing_pin)?;
 
     #[cfg(target_os = "linux")]
-    let image = PreparedImage::Descriptor(stage_linux_memfd(&mut invocation, backing_pin)?);
+    let image = finish_linux_custody(
+        invocation_path,
+        invocation_pin,
+        backing_pin,
+        shebang_pin,
+        invocation,
+    )?;
     #[cfg(windows)]
     let image = finish_windows_custody(
         invocation_path,
@@ -236,17 +321,53 @@ pub fn prepare_executable_with_interpreter(
 }
 
 #[cfg(target_os = "linux")]
-fn stage_linux_memfd(source: &mut File, backing_pin: &ExecutablePin) -> ExecResult<File> {
+fn finish_linux_custody(
+    invocation_path: &Path,
+    invocation_pin: &ExecutablePin,
+    backing_pin: &ExecutablePin,
+    shebang_pin: Option<&ShebangInterpreterPin>,
+    mut invocation: File,
+) -> ExecResult<PreparedImage> {
+    let has_shebang = super::file_has_shebang(&mut invocation)?;
+    if invocation_pin.policy_kind == super::CommandKind::Structured.as_str()
+        && (has_shebang
+            || invocation_path
+                .to_str()
+                .is_some_and(super::script_extension))
+    {
+        return Err(ExecError::Journal(
+            "executable became a script/shebang payload before execution; request must be re-authorized"
+                .into(),
+        ));
+    }
+    if has_shebang {
+        return prepare_linux_script(invocation, backing_pin, shebang_pin);
+    }
+    if shebang_pin.is_some() {
+        return Err(ExecError::Journal(
+            "approved shebang contract no longer matches a native executable".into(),
+        ));
+    }
+    Ok(PreparedImage::Descriptor(stage_linux_memfd(
+        &mut invocation,
+        backing_pin,
+        true,
+    )?))
+}
+
+#[cfg(target_os = "linux")]
+fn stage_linux_memfd(
+    source: &mut File,
+    backing_pin: &ExecutablePin,
+    close_on_exec: bool,
+) -> ExecResult<File> {
     use rustix::fs::{fcntl_add_seals, memfd_create, MemfdFlags, SealFlags};
+    use sha2::{Digest, Sha256};
+    use std::io::{Read as _, Write as _};
     use std::os::unix::fs::PermissionsExt;
 
-    // Linux must keep the descriptor inherited for a shebang script: the
-    // kernel passes an fd-backed pathname to the interpreter, and CLOEXEC
-    // would close it before that second image-open. The descriptor contains
-    // only the sealed approved script image. Native images remain CLOEXEC.
-    let source_is_script = super::file_has_shebang(source)?;
     let mut base_flags = MemfdFlags::ALLOW_SEALING;
-    if !source_is_script {
+    if close_on_exec {
         base_flags |= MemfdFlags::CLOEXEC;
     }
     let descriptor = match memfd_create("ownmesh-prepared", base_flags | MemfdFlags::EXEC) {
@@ -255,27 +376,47 @@ fn stage_linux_memfd(source: &mut File, backing_pin: &ExecutablePin) -> ExecResu
             .map_err(|error| ExecError::Io(error.into()))?,
         Err(error) => return Err(ExecError::Io(error.into())),
     };
+    if backing_pin.len > super::MAX_EXECUTABLE_PIN_BYTES {
+        return Err(ExecError::ResourceLimit(format!(
+            "executable exceeds {} byte preparation budget: {}",
+            super::MAX_EXECUTABLE_PIN_BYTES,
+            backing_pin.path
+        )));
+    }
     let mut image = File::from(descriptor);
     source.seek(SeekFrom::Start(0))?;
-    let copied = std::io::copy(source, &mut image)?;
-    if copied != backing_pin.len || copied > super::MAX_EXECUTABLE_PIN_BYTES {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied = copied.saturating_add(count as u64);
+        if copied > super::MAX_EXECUTABLE_PIN_BYTES {
+            return Err(ExecError::ResourceLimit(format!(
+                "executable exceeded {} byte preparation budget: {}",
+                super::MAX_EXECUTABLE_PIN_BYTES,
+                backing_pin.path
+            )));
+        }
+        hasher.update(&buffer[..count]);
+        image.write_all(&buffer[..count])?;
+    }
+    if copied != backing_pin.len {
         return Err(ExecError::Journal(
             "prepared Linux image length does not match the approved pin".into(),
         ));
     }
-    image.sync_all()?;
-    image.set_permissions(std::fs::Permissions::from_mode(0o500))?;
-    let digest = super::hash_open_file_bounded(
-        &mut image,
-        Path::new(&backing_pin.path),
-        backing_pin.len,
-        super::MAX_EXECUTABLE_PIN_BYTES,
-    )?;
+    let digest = hex::encode(hasher.finalize());
     if digest != backing_pin.content_sha256 {
         return Err(ExecError::Journal(
             "prepared Linux image content does not match the approved executable".into(),
         ));
     }
+    image.sync_all()?;
+    image.set_permissions(std::fs::Permissions::from_mode(0o500))?;
     fcntl_add_seals(
         &image,
         SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
@@ -283,6 +424,83 @@ fn stage_linux_memfd(source: &mut File, backing_pin: &ExecutablePin) -> ExecResu
     .map_err(|error| ExecError::Io(error.into()))?;
     image.seek(SeekFrom::Start(0))?;
     Ok(image)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_script(
+    mut script: File,
+    script_pin: &ExecutablePin,
+    shebang_pin: Option<&ShebangInterpreterPin>,
+) -> ExecResult<PreparedImage> {
+    let shebang = shebang_pin.ok_or_else(|| {
+        ExecError::Journal(
+            "shebang script lacks an approved interpreter identity; request must be re-authorized"
+                .into(),
+        )
+    })?;
+    if shebang.script_content_sha256 != script_pin.content_sha256 {
+        return Err(ExecError::Journal(
+            "shebang interpreter was approved for different script content".into(),
+        ));
+    }
+    let Some((parsed_interpreter, parsed_args)) =
+        super::parse_shebang_interpreter_from_file(&mut script)?
+    else {
+        return Err(ExecError::Journal(
+            "approved shebang contract no longer matches a script".into(),
+        ));
+    };
+    if parsed_interpreter != Path::new(&shebang.invocation.path) || parsed_args != shebang.args {
+        return Err(ExecError::Journal(
+            "approved shebang interpreter contract does not match the verified script bytes".into(),
+        ));
+    }
+    super::verify_path_entry_pin(Path::new(&shebang.invocation.path), &shebang.invocation)?;
+    super::verify_path_entry_pin(Path::new(&shebang.backing.path), &shebang.backing)?;
+    let mut interpreter =
+        open_execution_target(Path::new(&shebang.invocation.path)).map_err(|error| {
+            ExecError::Journal(format!("open approved shebang interpreter failed: {error}"))
+        })?;
+    super::verify_open_file_metadata_pin(
+        &interpreter,
+        Path::new(&shebang.invocation.path),
+        &shebang.invocation,
+    )?;
+    super::verify_open_file_metadata_pin(
+        &interpreter,
+        Path::new(&shebang.invocation.path),
+        &shebang.backing,
+    )?;
+    super::verify_path_entry_pin(Path::new(&shebang.invocation.path), &shebang.invocation)?;
+    super::verify_path_entry_pin(Path::new(&shebang.backing.path), &shebang.backing)?;
+    if super::file_has_shebang(&mut interpreter)? {
+        return Err(ExecError::Journal(
+            "nested shebang interpreter changed before execution".into(),
+        ));
+    }
+    let prepared_interpreter = stage_linux_memfd(&mut interpreter, &shebang.backing, true)?;
+    // Script bytes stay in a separately sealed descriptor inherited by the
+    // interpreter. Unlike a filesystem lease, memfd seals cannot be timed out
+    // or broken by another process. Node receives a loader below that maps the
+    // sealed bytes to the approved original module URL, preserving relative
+    // imports without reopening the mutable script as source.
+    let prepared_script = stage_linux_memfd(&mut script, script_pin, false)?;
+
+    Ok(PreparedImage::Script {
+        script: prepared_script,
+        script_origin: script_pin.path.clone(),
+        interpreter: prepared_interpreter,
+        interpreter_argv0: shebang.invocation.path.clone(),
+        interpreter_args: shebang.args.clone(),
+    })
+}
+
+fn open_approved_invocation(path: &Path) -> ExecResult<File> {
+    open_execution_target(path).map_err(|error| {
+        ExecError::Journal(format!(
+            "open approved invocation for preparation failed: {error}"
+        ))
+    })
 }
 
 #[cfg(not(windows))]
@@ -672,7 +890,7 @@ fn open_snapshot_file(path: &Path) -> ExecResult<File> {
 pub(super) struct PreparedCommand {
     pub command: Command,
     #[cfg(target_os = "linux")]
-    _descriptor: File,
+    _descriptors: Vec<File>,
     #[cfg(not(target_os = "linux"))]
     _custody: PreparedImage,
 }
@@ -687,11 +905,34 @@ pub(super) fn build_prepared_command(
 ) -> ExecResult<PreparedCommand> {
     let args = effective_args(req);
     #[cfg(target_os = "linux")]
-    let (mut command, descriptor) = match prepared.image {
+    let (mut command, descriptors) = match prepared.image {
         PreparedImage::Descriptor(image) => {
             let command =
                 linux_descriptor_command(&image, &prepared.approved_argv0, &args, &req.env)?;
-            (command, image)
+            (command, vec![image])
+        }
+        PreparedImage::Script {
+            script,
+            script_origin,
+            interpreter,
+            interpreter_argv0,
+            interpreter_args,
+        } => {
+            let interpreter_args = linux_script_args(
+                &script,
+                &script_origin,
+                &interpreter_argv0,
+                interpreter_args,
+                args,
+                &prepared.approved_argv0,
+            )?;
+            let command = linux_descriptor_command(
+                &interpreter,
+                &interpreter_argv0,
+                &interpreter_args,
+                &req.env,
+            )?;
+            (command, vec![script, interpreter])
         }
     };
     #[cfg(windows)]
@@ -755,10 +996,94 @@ pub(super) fn build_prepared_command(
     Ok(PreparedCommand {
         command,
         #[cfg(target_os = "linux")]
-        _descriptor: descriptor,
+        _descriptors: descriptors,
         #[cfg(not(target_os = "linux"))]
         _custody: custody,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_script_args(
+    script: &File,
+    script_origin: &str,
+    interpreter_argv0: &str,
+    mut interpreter_args: Vec<String>,
+    request_args: Vec<String>,
+    approved_script_argv0: &str,
+) -> ExecResult<Vec<String>> {
+    use std::os::fd::AsRawFd;
+
+    let descriptor_path = format!("/proc/self/fd/{}", script.as_raw_fd());
+    let interpreter_name = super::program_basename(interpreter_argv0);
+    if interpreter_name.eq_ignore_ascii_case("node")
+        || interpreter_name.eq_ignore_ascii_case("nodejs")
+    {
+        let module_url = linux_file_url(script_origin);
+        let target = serde_json::to_string(&module_url)
+            .map_err(|error| ExecError::Spawn(format!("encode Node module URL: {error}")))?;
+        let source_path = serde_json::to_string(&descriptor_path)
+            .map_err(|error| ExecError::Spawn(format!("encode Node script fd: {error}")))?;
+        let loader_source = format!(
+            "import{{readFileSync}}from'node:fs';const t={target},s=readFileSync({source_path});\
+export async function load(u,c,n){{return u===t?{{format:c.format||'module',source:s,shortCircuit:true}}:n(u,c)}}"
+        );
+        let loader_url = format!(
+            "data:text/javascript,{}",
+            percent_encode(&loader_source, false)
+        );
+        let encoded_loader_url = serde_json::to_string(&loader_url)
+            .map_err(|error| ExecError::Spawn(format!("encode Node loader URL: {error}")))?;
+        let register_source = format!(
+            "import{{register}}from'node:module';register({encoded_loader_url},import.meta.url)"
+        );
+        let register_url = format!(
+            "data:text/javascript,{}",
+            percent_encode(&register_source, false)
+        );
+        // The interpreter itself is a sealed memfd, so Node's discovered
+        // process.execPath would otherwise be a non-reopenable `(deleted)`
+        // name. `/proc/self/exe` remains a kernel-held reference to that same
+        // sealed image and preserves secure child-process spawning by CLIs.
+        let eval_source = format!("process.execPath='/proc/self/exe';await import({target})");
+        interpreter_args.extend([
+            "--import".into(),
+            register_url,
+            "--input-type=module".into(),
+            "--eval".into(),
+            eval_source,
+            "--".into(),
+            approved_script_argv0.to_owned(),
+        ]);
+        interpreter_args.extend(request_args);
+        return Ok(interpreter_args);
+    }
+
+    interpreter_args.push(descriptor_path);
+    interpreter_args.extend(request_args);
+    Ok(interpreter_args)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_file_url(path: &str) -> String {
+    format!("file://{}", percent_encode(path, true))
+}
+
+#[cfg(target_os = "linux")]
+fn percent_encode(value: &str, keep_slash: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && byte == b'/')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
 }
 
 fn effective_args(req: &RunRequest) -> Vec<String> {

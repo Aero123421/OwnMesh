@@ -38,10 +38,16 @@ moves off the mutex.
 3. **Request-scoped cancel/remote facts are snapshotted into the admitted
    plan** before the mutex is released, so a concurrent dispatch cannot
    clobber `active_cancel` / `active_remote_*` for the in-flight child.
-4. **Elevated broker execution, session supervisor RPCs, and other methods
-   still serialize on the mutex.** Those waits are not the reproduced
-   deadlock. They remain eligible for the same split later; they must not
-   be mixed into this change.
+4. **Elevated broker execution uses the same split (2026-08-28 amendment).**
+   Request-scoped operation id, payload hash, device, principal, credential
+   generation, expiry, cancellation receiver, executable pins, and immutable
+   broker facts are captured during admission. Broker connect/write/wait,
+   cancellation delivery, output collection, and post-response custody
+   re-attestation run after the runtime mutex is released; finalization still
+   compares and commits only this operation's marker. Session supervisor RPCs
+   remain bounded by the IPC client's five-second request timeout but still
+   serialize on the runtime mutex; moving session transitions to a narrower
+   state owner remains separate work and is not claimed complete here.
 5. **The self-reentrant pre-spawn guard stays.** A typed refusal is still
    better than spawning a known-deadly child. `system.diagnose` exposes a
    bounded `runtime_queue` check (`idle` / `executing` / `self_reentrant_exec`)
@@ -72,9 +78,8 @@ moves off the mutex.
 - Callers that still invoke `dispatch` / `dispatch_cancellable` on a
   `&mut DaemonRuntime` (unit tests, in-process helpers) execute the same
   plan inline. Production IPC and Agent paths use `dispatch_unlocked`.
-- Session open/close still hold the mutex across supervisor RPCs. That is
-  an accepted remainder of #160, not a claim that every external wait has
-  been moved.
+- Session open/close still hold the mutex across bounded supervisor RPCs. That
+  is a disclosed remainder, not a claim that every external wait has moved.
 
 ## Alternatives considered
 

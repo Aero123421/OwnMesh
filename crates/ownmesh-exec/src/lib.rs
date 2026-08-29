@@ -18,7 +18,10 @@
 
 mod prepared;
 
-pub use prepared::{prepare_executable, prepare_executable_with_interpreter, PreparedExecutable};
+pub use prepared::{
+    prepare_executable, prepare_executable_with_interpreter, prepare_executable_with_shebang,
+    PreparedExecutable,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -183,6 +186,26 @@ pub struct ExecutablePin {
     pub policy_kind: String,
 }
 
+/// Approval-time identity for a shebang script's effective interpreter.
+///
+/// A script is a compound executable: its bytes select an interpreter, and
+/// `/usr/bin/env` may select a second executable through `PATH`. OwnMesh
+/// resolves that indirection during admission and pins both the exact
+/// invocation entry and canonical backing image. Preparation re-parses the
+/// verified script and refuses any mismatch before spawning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShebangInterpreterPin {
+    /// Digest of the script pin this interpreter was derived from.
+    pub script_content_sha256: String,
+    /// Exact interpreter invocation (possibly a symlink/proxy).
+    pub invocation: ExecutablePin,
+    /// Canonical interpreter backing image.
+    pub backing: ExecutablePin,
+    /// Interpreter arguments selected by the shebang, before the script path.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// Flags that turn a shell binary into an arbitrary command interpreter.
 /// Kept for diagnostics / callers; classification no longer depends on them.
 const SHELL_EXEC_FLAGS: &[&str] = &["-c", "/c", "/k", "-command", "-encodedcommand", "-enc"];
@@ -334,6 +357,138 @@ fn file_has_shebang(file: &mut File) -> ExecResult<bool> {
     let read = file.read(&mut magic)?;
     file.seek(SeekFrom::Start(0))?;
     Ok(read == 2 && magic == *b"#!")
+}
+
+const MAX_SHEBANG_BYTES: usize = 4096;
+
+/// Parse and pin the effective interpreter selected by a verified shebang
+/// script. `#!/usr/bin/env name` is resolved through OwnMesh's deterministic
+/// service/user-local search path rather than deferred to a mutable child
+/// `PATH`. Complex `env` option syntax is refused fail-closed; it can be added
+/// only with an exact, source-backed argv parser.
+///
+/// # Errors
+///
+/// Returns an error when the script changed, the shebang is malformed, or the
+/// effective interpreter cannot be resolved and pinned.
+pub fn pin_shebang_interpreter(
+    script_path: &Path,
+    script_pin: &ExecutablePin,
+) -> ExecResult<Option<ShebangInterpreterPin>> {
+    verify_executable_pin(Path::new(&script_pin.path), script_pin)?;
+    let mut script = File::open(script_path)?;
+    let Some((interpreter_path, args)) = parse_shebang_interpreter_from_file(&mut script)? else {
+        return Ok(None);
+    };
+    if !is_launchable_file(&interpreter_path) {
+        return Err(ExecError::Journal(format!(
+            "shebang interpreter is not launchable: {}",
+            interpreter_path.display()
+        )));
+    }
+    let canonical = std::fs::canonicalize(&interpreter_path).map_err(|error| {
+        ExecError::Journal(format!(
+            "canonicalize shebang interpreter {} failed: {error}",
+            interpreter_path.display()
+        ))
+    })?;
+    if path_has_shebang(&canonical) {
+        return Err(ExecError::Journal(
+            "nested shebang interpreters are unsupported; request must be re-authorized".into(),
+        ));
+    }
+    // Hash the canonical interpreter once, then bind the invocation entry to
+    // that exact open-file identity. Large runtimes such as Node can exceed
+    // 100 MiB; hashing an invocation symlink and its canonical target
+    // separately adds no authority because both pins must name one inode.
+    let backing = pin_executable(&canonical, CommandKind::RawShell)?;
+    let invocation =
+        pin_invocation_for_backing(&interpreter_path, &backing, CommandKind::RawShell)?;
+    verify_executable_pin(Path::new(&script_pin.path), script_pin)?;
+    let current_script = pin_executable(script_path, CommandKind::RawShell)?;
+    if current_script.content_sha256 != script_pin.content_sha256
+        || current_script.device != script_pin.device
+        || current_script.inode != script_pin.inode
+    {
+        return Err(ExecError::Journal(
+            "script changed while pinning its interpreter; retry authorization".into(),
+        ));
+    }
+    Ok(Some(ShebangInterpreterPin {
+        script_content_sha256: script_pin.content_sha256.clone(),
+        invocation,
+        backing,
+        args,
+    }))
+}
+
+fn parse_shebang_interpreter_from_file(
+    script: &mut File,
+) -> ExecResult<Option<(PathBuf, Vec<String>)>> {
+    script.seek(SeekFrom::Start(0))?;
+    let mut prefix = vec![0_u8; MAX_SHEBANG_BYTES + 1];
+    let count = script.read(&mut prefix)?;
+    script.seek(SeekFrom::Start(0))?;
+    if !prefix[..count].starts_with(b"#!") {
+        return Ok(None);
+    }
+    let line_end = prefix[..count]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| {
+            if count > MAX_SHEBANG_BYTES {
+                ExecError::Journal("shebang line exceeds the executable identity budget".into())
+            } else {
+                ExecError::Journal("shebang script has no bounded newline terminator".into())
+            }
+        })?;
+    let raw = std::str::from_utf8(&prefix[2..line_end])
+        .map_err(|_| ExecError::Journal("shebang is not valid UTF-8".into()))?
+        .trim();
+    if raw.is_empty() || raw.chars().any(|character| character == '\0') {
+        return Err(ExecError::Journal(
+            "shebang interpreter is empty or invalid".into(),
+        ));
+    }
+    parse_effective_shebang_interpreter(raw).map(Some)
+}
+
+fn parse_effective_shebang_interpreter(raw: &str) -> ExecResult<(PathBuf, Vec<String>)> {
+    let (first, remainder) = raw
+        .split_once(char::is_whitespace)
+        .map_or((raw, ""), |(first, rest)| (first, rest.trim()));
+    let first_path = PathBuf::from(first);
+    if !first_path.is_absolute() {
+        return Err(ExecError::Journal(
+            "shebang interpreter path must be absolute".into(),
+        ));
+    }
+    if first_path.file_name().is_some_and(|name| name == "env") {
+        let mut words = remainder.split_ascii_whitespace();
+        let command = words
+            .next()
+            .ok_or_else(|| ExecError::Journal("env shebang omitted its command".into()))?;
+        if command.starts_with('-') || words.next().is_some() {
+            return Err(ExecError::Journal(
+                "env shebang options/arguments are unsupported by secure interpreter pinning"
+                    .into(),
+            ));
+        }
+        let invocation = resolve_executable_invocation_path(command, None).ok_or_else(|| {
+            ExecError::Journal(format!(
+                "env shebang interpreter `{command}` was not found in the deterministic execution path"
+            ))
+        })?;
+        return Ok((invocation, Vec::new()));
+    }
+    let args = if remainder.is_empty() {
+        Vec::new()
+    } else {
+        // Linux passes the text after the interpreter path as one argument,
+        // rather than shell-splitting it. Preserve that exact behavior.
+        vec![remainder.to_owned()]
+    };
+    Ok((first_path, args))
 }
 
 #[cfg(unix)]
@@ -523,7 +678,52 @@ fn verify_path_entry_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
     Ok(())
 }
 
-fn verify_open_file_pin(file: &mut File, path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
+fn pin_invocation_for_backing(
+    path: &Path,
+    backing: &ExecutablePin,
+    policy_kind: CommandKind,
+) -> ExecResult<ExecutablePin> {
+    let (path_device, path_inode) = path_entry_identity(path)?;
+    let link_target = current_link_target(path)?;
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(ExecError::Journal(format!(
+            "executable pin requires a regular file: {}",
+            path.display()
+        )));
+    }
+    let (device, inode) = open_file_identity(&file)?;
+    if meta.len() != backing.len || device != backing.device || inode != backing.inode {
+        return Err(ExecError::Journal(
+            "executable invocation does not resolve to the pinned backing identity".into(),
+        ));
+    }
+    if path_entry_identity(path)? != (path_device, path_inode)
+        || current_link_target(path)? != link_target
+    {
+        return Err(ExecError::Journal(
+            "executable invocation entry changed while pinning; retry authorization".into(),
+        ));
+    }
+    Ok(ExecutablePin {
+        path: path.to_string_lossy().into_owned(),
+        content_sha256: backing.content_sha256.clone(),
+        len: backing.len,
+        device,
+        inode,
+        path_device,
+        path_inode,
+        link_target,
+        policy_kind: policy_kind.as_str().to_owned(),
+    })
+}
+
+pub(crate) fn verify_open_file_metadata_pin(
+    file: &File,
+    path: &Path,
+    pin: &ExecutablePin,
+) -> ExecResult<()> {
     let meta = file.metadata().map_err(|e| {
         ExecError::Journal(format!(
             "executable handle revalidation failed for {}: {e}",
@@ -551,8 +751,13 @@ fn verify_open_file_pin(file: &mut File, path: &Path, pin: &ExecutablePin) -> Ex
                 .into(),
         ));
     }
+    Ok(())
+}
+
+fn verify_open_file_pin(file: &mut File, path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
+    verify_open_file_metadata_pin(file, path, pin)?;
     let digest =
-        hash_open_file_bounded(file, path, meta.len(), MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
+        hash_open_file_bounded(file, path, pin.len, MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
             ExecError::Journal(format!(
                 "executable content revalidation failed for {}: {e}",
                 path.display()
