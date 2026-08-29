@@ -53,12 +53,14 @@ use ownmesh_broker_client::{
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use ownmesh_broker_client::{connect_and_execute_v2, connect_and_execute_v2_cancellable};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
+#[cfg(target_os = "linux")]
+use ownmesh_exec::pin_shebang_interpreter;
 use ownmesh_exec::{
     classify_from_request_in_dir, pin_executable, prepare_executable,
-    prepare_executable_with_interpreter, resolve_executable_invocation_path,
-    resolve_executable_path, run_prepared_command_cancellable, verify_executable_pin, CommandKind,
-    ExecutablePin, IdempotencyJournal, PreparedExecutable, RunRequest, RunResult,
-    HARD_MAX_TIMEOUT_MS,
+    prepare_executable_with_interpreter, prepare_executable_with_shebang,
+    resolve_executable_invocation_path, resolve_executable_path, run_prepared_command_cancellable,
+    verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, PreparedExecutable,
+    RunRequest, RunResult, ShebangInterpreterPin, HARD_MAX_TIMEOUT_MS,
 };
 use ownmesh_fs::{
     git_diff, git_head_oid, git_status, looks_sensitive, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
@@ -158,6 +160,9 @@ const LOCAL_PRINCIPAL: &str = "prin_local";
 const DEFAULT_GRANT_SECS: i64 = 3600;
 const OP_JOURNAL_STATE_FIELD: &str = "__ownmesh_operation_state";
 const OP_JOURNAL_IN_PROGRESS: &str = "in_progress";
+const OP_JOURNAL_RECOVERY_STATE_FIELD: &str = "__ownmesh_recovery_state";
+const OP_JOURNAL_RECOVERED_UNIX_FIELD: &str = "__ownmesh_recovered_unix";
+const OP_JOURNAL_RECOVERABLE_ORPHANED: &str = "recoverable_orphaned";
 
 fn review_page_limit() -> usize {
     48 * 1024
@@ -441,6 +446,11 @@ pub struct ExecParams {
     /// object is the only image authorized to interpret it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_pin: Option<ExecutablePin>,
+    /// Server-computed compound identity for a shebang script's effective
+    /// interpreter. This is derived from the pinned script bytes; client
+    /// values are always discarded before admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shebang_pin: Option<ShebangInterpreterPin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -855,6 +865,20 @@ struct AdmittedExec {
     work: AllowedWork,
     cancel: Option<watch::Receiver<bool>>,
     runtime_dir: PathBuf,
+    /// Request-scoped remote authority captured during admission. Broker I/O
+    /// must never read the runtime's mutable `active_remote_*` slots after the
+    /// global mutex is released.
+    remote_authority: RemoteExecutionAuthority,
+}
+
+#[derive(Clone, Default)]
+struct RemoteExecutionAuthority {
+    operation_id: Option<String>,
+    expires_at_unix: Option<i64>,
+    payload_hash: Option<String>,
+    device_id: Option<String>,
+    principal: Option<String>,
+    principal_credential_generation: Option<u64>,
 }
 
 enum DispatchOutcome {
@@ -863,7 +887,7 @@ enum DispatchOutcome {
 }
 
 fn pending_request_releases_runtime_lock(request: &PendingRequest) -> bool {
-    matches!(request, PendingRequest::Exec(params) if !params.elevated)
+    matches!(request, PendingRequest::Exec(_))
 }
 
 fn method_can_execute_command(method: &str) -> bool {
@@ -1003,13 +1027,23 @@ fn prepare_admitted_exec(
                 code: app_error::EXECUTABLE_IDENTITY_DRIFT,
                 message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: structured backing pin is missing; request must be re-authorized".into(),
             })?;
-            prepare_executable_with_interpreter(
-                Path::new(&p.program),
-                invocation,
-                backing,
-                p.shell_pin.as_ref(),
-                Some(runtime_dir),
-            )
+            if p.shebang_pin.is_some() {
+                prepare_executable_with_shebang(
+                    Path::new(&p.program),
+                    invocation,
+                    backing,
+                    p.shebang_pin.as_ref(),
+                    Some(runtime_dir),
+                )
+            } else {
+                prepare_executable_with_interpreter(
+                    Path::new(&p.program),
+                    invocation,
+                    backing,
+                    p.shell_pin.as_ref(),
+                    Some(runtime_dir),
+                )
+            }
         }
         CommandKind::RawShell => {
             let shell = p.shell_pin.as_ref().ok_or_else(|| IpcError::Remote {
@@ -1056,7 +1090,28 @@ async fn execute_admitted_exec(admitted: &AdmittedExec) -> IpcResult<Value> {
     } else {
         None
     };
-    run_prepared_exec(params, prepared, kind, None, admitted.cancel.clone()).await
+    if params.elevated {
+        let _ = (prepared, kind);
+        let mut result = DaemonRuntime::try_broker_elevated_with_authority(
+            params,
+            &admitted.remote_authority,
+            admitted.cancel.clone(),
+        )
+        .await?;
+        result
+            .as_object_mut()
+            .expect("broker result serializes as an object")
+            .insert("workspace_id".into(), json!(params.workspace_id));
+        if params.detach {
+            result
+                .as_object_mut()
+                .expect("broker result serializes as an object")
+                .insert("detached".into(), json!(true));
+        }
+        Ok(result)
+    } else {
+        run_prepared_exec(params, prepared, kind, None, admitted.cancel.clone()).await
+    }
 }
 
 fn journal_degraded_error(reason: &str) -> IpcError {
@@ -2318,11 +2373,18 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         // state are both uncertain — replaying them as completed could hide
         // an unfinished side effect (P0-B).
         if is_op_journal_uncertain(entry) {
+            let message = if is_op_journal_recoverable_orphan(entry) {
+                format!(
+                    "OWNMESH_E_OPERATION_ORPHANED: idempotency key {key} was accepted by a prior daemon process but has no durable terminal result; operator investigation and reconciliation are required and automatic retry is refused"
+                )
+            } else {
+                format!(
+                    "idempotency key {key} has an in-progress or uncertain outcome; retry refused"
+                )
+            };
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
-                message: format!(
-                    "idempotency key {key} has an in-progress or uncertain outcome; retry refused"
-                ),
+                message,
             });
         }
         // Retention-window synchronization (P0-B / control plane): the
@@ -2953,6 +3015,17 @@ outcome is uncertain and must not be retried"
         }
     }
 
+    fn remote_execution_authority(&self) -> RemoteExecutionAuthority {
+        RemoteExecutionAuthority {
+            operation_id: self.active_remote_operation_id.clone(),
+            expires_at_unix: self.active_remote_expires_at_unix,
+            payload_hash: self.active_remote_payload_hash.clone(),
+            device_id: self.active_remote_device_id.clone(),
+            principal: self.active_remote_principal.clone(),
+            principal_credential_generation: self.active_remote_principal_credential_generation,
+        }
+    }
+
     async fn execute_exec(&mut self, p: &ExecParams, use_exec_journal: bool) -> IpcResult<Value> {
         let (prepared, kind) = prepare_admitted_exec(p, &self.paths.runtime_dir)?;
         let _detached_guard = if p.detach {
@@ -2987,21 +3060,30 @@ outcome is uncertain and must not be retried"
     }
 
     async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
-        #[cfg(target_os = "linux")]
+        Self::try_broker_elevated_with_authority(
+            p,
+            &self.remote_execution_authority(),
+            self.active_cancel.clone(),
+        )
+        .await
+    }
+
+    async fn try_broker_elevated_with_authority(
+        p: &ExecParams,
+        authority: &RemoteExecutionAuthority,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> IpcResult<Value> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            return self.try_unix_broker_elevated(p).await;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            return self.try_unix_broker_elevated(p).await;
+            return Self::try_unix_broker_elevated(p, authority, cancel).await;
         }
         #[cfg(windows)]
         {
-            return self.try_windows_broker_elevated(p).await;
+            return Self::try_windows_broker_elevated(p, authority, cancel).await;
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
-            let _ = p;
+            let _ = (p, authority, cancel);
             Err(IpcError::Remote {
                 code: app_error::INTERNAL,
                 message: "unsupported: elevated execution has no native broker implementation on this platform".into(),
@@ -3010,7 +3092,11 @@ outcome is uncertain and must not be retried"
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn try_unix_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
+    async fn try_unix_broker_elevated(
+        p: &ExecParams,
+        authority: &RemoteExecutionAuthority,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> IpcResult<Value> {
         let running_image = std::env::current_exe().map_err(|_| IpcError::Remote {
             code: app_error::INTERNAL,
             message: "elevated execution cannot resolve the running daemon image (fail-closed)"
@@ -3027,8 +3113,9 @@ outcome is uncertain and must not be retried"
             code: app_error::INTERNAL,
             message: "unsupported: elevated execution requires a custody-attested installed native broker; broker unavailable or custody validation failed (fail-closed; no local exec)".into(),
         })?;
-        let execute = self.build_broker_execute_intent(p, &broker.secret)?;
-        let response = if let Some(mut cancel) = self.active_cancel.clone() {
+        let execute =
+            Self::build_broker_execute_intent_from_authority(p, &broker.secret, authority)?;
+        let response = if let Some(mut cancel) = cancel {
             connect_and_execute_v2_cancellable(
                 &broker.endpoint,
                 &broker.secret,
@@ -3074,7 +3161,11 @@ outcome is uncertain and must not be retried"
     }
 
     #[cfg(windows)]
-    async fn try_windows_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
+    async fn try_windows_broker_elevated(
+        p: &ExecParams,
+        authority: &RemoteExecutionAuthority,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> IpcResult<Value> {
         let running_image = std::env::current_exe().map_err(|_| IpcError::Remote {
             code: app_error::INTERNAL,
             message:
@@ -3088,9 +3179,9 @@ outcome is uncertain and must not be retried"
             code: app_error::INTERNAL,
             message: "unsupported: elevated execution requires the fixed LocalSystem Windows broker custody installation; broker unavailable or custody validation failed (fail-closed; no local exec)".into(),
         })?;
-        let execute = self.build_broker_execute_intent(p, &broker.secret)?;
-        let response = self
-            .execute_windows_broker_with_cancel(&broker, &execute)
+        let execute =
+            Self::build_broker_execute_intent_from_authority(p, &broker.secret, authority)?;
+        let response = Self::execute_windows_broker_with_cancel(&broker, &execute, cancel)
             .await
             .map_err(Self::broker_client_error)?;
         if response.request_id != execute.request_id {
@@ -3120,11 +3211,11 @@ outcome is uncertain and must not be retried"
 
     #[cfg(windows)]
     async fn execute_windows_broker_with_cancel(
-        &self,
         broker: &broker_runtime::WindowsBrokerClient,
         execute: &ExecuteIntentV2,
+        cancel: Option<watch::Receiver<bool>>,
     ) -> Result<ownmesh_broker_client::BrokerResponseV2, BrokerV2ClientError> {
-        let Some(mut cancel) = self.active_cancel.clone() else {
+        let Some(mut cancel) = cancel else {
             return connect_and_execute_v2_windows(&broker.endpoint, &broker.trust, execute).await;
         };
         if *cancel.borrow_and_update() {
@@ -3230,42 +3321,55 @@ outcome is uncertain and must not be retried"
         })
     }
 
+    #[cfg(test)]
     fn build_broker_execute_intent(
         &self,
         p: &ExecParams,
         secret: &ownmesh_broker_client::BrokerSecret,
     ) -> IpcResult<ExecuteIntentV2> {
-        let operation_id = self
-            .active_remote_operation_id
+        Self::build_broker_execute_intent_from_authority(
+            p,
+            secret,
+            &self.remote_execution_authority(),
+        )
+    }
+
+    fn build_broker_execute_intent_from_authority(
+        p: &ExecParams,
+        secret: &ownmesh_broker_client::BrokerSecret,
+        authority: &RemoteExecutionAuthority,
+    ) -> IpcResult<ExecuteIntentV2> {
+        let operation_id = authority
+            .operation_id
             .as_deref()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| broker_binding_error("remote operation id is required"))?;
-        let payload_hash = self
-            .active_remote_payload_hash
+        let payload_hash = authority
+            .payload_hash
             .as_deref()
             .filter(|value| is_lower_sha256(value))
             .ok_or_else(|| broker_binding_error("server exact payload hash is required"))?;
-        let device_id = self
-            .active_remote_device_id
+        let device_id = authority
+            .device_id
             .as_deref()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| broker_binding_error("verified remote device id is required"))?;
-        let principal = self
-            .active_remote_principal
+        let principal = authority
+            .principal
             .as_deref()
             .ok_or_else(|| broker_binding_error("verified remote principal is required"))?;
         let (tenant_id, principal_id) = split_remote_principal(principal)
             .ok_or_else(|| broker_binding_error("verified remote principal shape is invalid"))?;
-        let principal_credential_generation = self
-            .active_remote_principal_credential_generation
+        let principal_credential_generation = authority
+            .principal_credential_generation
             .filter(|generation| *generation > 0)
             .ok_or_else(|| {
                 broker_binding_error(
                     "server-derived principal credential generation is required for elevation",
                 )
             })?;
-        let expires_at_unix = self
-            .active_remote_expires_at_unix
+        let expires_at_unix = authority
+            .expires_at_unix
             .filter(|expiry| *expiry > Self::now())
             .ok_or_else(|| broker_binding_error("unexpired remote operation is required"))?;
         let executable = p.executable_pin.as_ref().ok_or_else(|| {
@@ -3490,6 +3594,7 @@ outcome is uncertain and must not be retried"
         p.executable_pin = None;
         p.invocation_pin = None;
         p.shell_pin = None;
+        p.shebang_pin = None;
         p.policy_kind = None;
         if p.elevated
             && (self.policy.preset != AccessPreset::FullAccess
@@ -3620,6 +3725,19 @@ path or install the tool so detection and execution agree",
                     message: format!("unable to pin invocation identity: {e}"),
                 }
             })?);
+            #[cfg(target_os = "linux")]
+            {
+                p.shebang_pin = pin_shebang_interpreter(
+                    Path::new(&invocation),
+                    p.executable_pin
+                        .as_ref()
+                        .expect("backing pin was installed immediately above"),
+                )
+                .map_err(|error| IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!("unable to pin shebang interpreter identity: {error}"),
+                })?;
+            }
         } else if matches!(requested_kind, CommandKind::Structured)
             && matches!(kind, CommandKind::Structured)
         {
@@ -3634,7 +3752,7 @@ path or install the tool so detection and execution agree",
                     );
             }
         }
-        if matches!(kind, CommandKind::RawShell) {
+        if matches!(kind, CommandKind::RawShell) && p.shebang_pin.is_none() {
             #[cfg(windows)]
             let shell_path = PathBuf::from(ownmesh_exec::windows_system_cmd_exe(
                 std::env::var("SystemRoot").ok().as_deref(),
@@ -4807,12 +4925,10 @@ path or install the tool so detection and execution agree",
             executing_approval: self.approvals.get(&p.id).cloned(),
         }));
         match request.clone() {
-            PendingRequest::Exec(exec) if !exec.elevated => {
-                Ok(GateOutcome::Run(Box::new(AllowedWork {
-                    request,
-                    completions: vec![completion],
-                })))
-            }
+            PendingRequest::Exec(_) => Ok(GateOutcome::Run(Box::new(AllowedWork {
+                request,
+                completions: vec![completion],
+            }))),
             PendingRequest::AdminApprovalBridge(bridge) => {
                 match self.admit_approval_bridge(&bridge, &approver).await? {
                     GateOutcome::Reply(result) => {
@@ -5855,6 +5971,7 @@ path or install the tool so detection and execution agree",
                             work: *work,
                             cancel: self.active_cancel.clone(),
                             runtime_dir: self.paths.runtime_dir.clone(),
+                            remote_authority: self.remote_execution_authority(),
                         }))
                     }
                     Ok(GateOutcome::Run(work)) => {
@@ -5876,6 +5993,7 @@ path or install the tool so detection and execution agree",
                             work: *work,
                             cancel: self.active_cancel.clone(),
                             runtime_dir: self.paths.runtime_dir.clone(),
+                            remote_authority: self.remote_execution_authority(),
                         }))
                     }
                     Ok(GateOutcome::Run(work)) => {
@@ -7835,6 +7953,7 @@ async fn apply_control_plane_approval_decision_with_slots(
                     work: *work,
                     cancel: None,
                     runtime_dir: guard.paths.runtime_dir.clone(),
+                    remote_authority: guard.remote_execution_authority(),
                 }))
             }
             Ok(GateOutcome::Run(work)) => DispatchOutcome::Done(guard.finish_allowed(*work).await),
@@ -8311,6 +8430,14 @@ fn legacy_completed_body(object: &serde_json::Map<String, Value>) -> bool {
 
 fn is_op_journal_in_progress(value: &Value) -> bool {
     op_journal_entry_state(value) == OpJournalEntryState::InProgress
+}
+
+fn is_op_journal_recoverable_orphan(value: &Value) -> bool {
+    is_op_journal_in_progress(value)
+        && value
+            .get(OP_JOURNAL_RECOVERY_STATE_FIELD)
+            .and_then(Value::as_str)
+            == Some(OP_JOURNAL_RECOVERABLE_ORPHANED)
 }
 
 /// Fail-closed protection predicate: in-progress markers and unknown states
@@ -11119,6 +11246,22 @@ fn bound_op_journal(journal: HashMap<String, Value>) -> Result<HashMap<String, V
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     for value in journal.values_mut() {
+        // Any durable in-progress marker loaded here was reserved by a prior
+        // daemon process. Preserve the exact-once fence, but classify it
+        // explicitly as recoverable/orphaned instead of displaying an eternal
+        // live `pending` operation after restart. This additive marker never
+        // makes the operation retriable and is persisted by `load_op_journal`.
+        if op_journal_entry_state(value) == OpJournalEntryState::InProgress
+            && value.get(OP_JOURNAL_RECOVERY_STATE_FIELD).is_none()
+        {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    OP_JOURNAL_RECOVERY_STATE_FIELD.into(),
+                    json!(OP_JOURNAL_RECOVERABLE_ORPHANED),
+                );
+                object.insert(OP_JOURNAL_RECOVERED_UNIX_FIELD.into(), json!(now));
+            }
+        }
         // Stamp legacy completed entries (pre-1.2.13) so the bounded lifecycle
         // can age them for eviction; in-progress/unknown markers keep no stamp
         // and are never evicted.
@@ -11584,19 +11727,40 @@ mod broker_intent_tests {
 
     #[cfg(unix)]
     fn sleep_command(seconds: u64, idempotency_key: &str) -> Value {
-        let sleep = if Path::new("/bin/sleep").is_file() {
-            "/bin/sleep"
-        } else {
-            "/usr/bin/sleep"
-        };
+        // Run through the pinned platform shell so this lock-scope test does
+        // not depend on whether the host packages coreutils as one multicall
+        // image that dispatches through /proc/self/exe rather than argv[0].
         json!({
-            "program": sleep,
+            "program": "sleep",
             "args": [seconds.to_string()],
-            "kind": "structured",
+            "kind": "raw_shell",
             "workspace_id": "ws_default",
             "timeout_ms": (seconds + 3) * 1000,
             "idempotency_key": idempotency_key,
         })
+    }
+
+    #[test]
+    fn elevated_exec_is_selected_for_off_lock_broker_execution() {
+        let request = PendingRequest::Exec(Box::new(ExecParams {
+            kind: Some("structured".into()),
+            policy_kind: Some("structured".into()),
+            program: "/irrelevant/pinned-program".into(),
+            args: Vec::new(),
+            cwd: None,
+            workspace_id: Some("ws_default".into()),
+            env: HashMap::new(),
+            timeout_ms: Some(1),
+            idempotency_key: Some("offlock-elevated".into()),
+            max_output_bytes: Some(1),
+            elevated: true,
+            detach: false,
+            executable_pin: None,
+            invocation_pin: None,
+            shell_pin: None,
+            shebang_pin: None,
+        }));
+        assert!(pending_request_releases_runtime_lock(&request));
     }
 
     /// The shared exec fixture must stay usable by every test that only needs
@@ -11650,6 +11814,7 @@ mod broker_intent_tests {
                 executable_pin: Some(pin),
                 invocation_pin: None,
                 shell_pin: None,
+                shebang_pin: None,
             },
         )
     }
@@ -12262,7 +12427,7 @@ mod broker_intent_tests {
             .expect("join approval")
             .expect("approval completes");
         assert_eq!(completed["approval_decision_applied"], true);
-        assert_eq!(completed["result"]["exit_code"], 0);
+        assert_eq!(completed["result"]["exit_code"], 0, "{completed}");
         assert_eq!(
             runtime.lock().await.approvals[&approval_id].state,
             "approved"
@@ -12283,15 +12448,11 @@ mod broker_intent_tests {
         let slots = Arc::new(Semaphore::new(0));
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let client = ClientIdentity::new("capacity-cancel-test", "test");
-        let touch = ["/usr/bin/touch", "/bin/touch"]
-            .into_iter()
-            .find(|candidate| Path::new(candidate).is_file())
-            .expect("a stock touch executable must exist");
         let spawn_witness = temp.path().join("spawned-after-capacity");
         let params = json!({
-            "program": touch,
+            "program": "touch",
             "args": [spawn_witness.display().to_string()],
-            "kind": "structured",
+            "kind": "raw_shell",
             "workspace_id": "ws_default",
             "idempotency_key": "capacity_cancel_key",
         });
@@ -12357,7 +12518,7 @@ mod broker_intent_tests {
         )
         .await
         .expect("cancelled capacity wait must leave the key reusable");
-        assert_eq!(retried["result"]["exit_code"], 0);
+        assert_eq!(retried["result"]["exit_code"], 0, "{retried}");
         assert_eq!(retried["replayed"], false);
         assert!(
             spawn_witness.exists(),
@@ -15558,6 +15719,11 @@ mod journal_lifecycle_tests {
         assert_eq!(done["durable_receipt"], true);
         assert_eq!(done["operation_id"], "op_done");
         assert!(journal["prin\u{1f}op_inflight"]["__ownmesh_operation_state"] == "in_progress");
+        assert_eq!(
+            journal["prin\u{1f}op_inflight"][OP_JOURNAL_RECOVERY_STATE_FIELD],
+            OP_JOURNAL_RECOVERABLE_ORPHANED
+        );
+        assert!(journal["prin\u{1f}op_inflight"][OP_JOURNAL_RECOVERED_UNIX_FIELD].is_i64());
         // The recovered state is the new primary and the backup is gone.
         assert!(
             !bak.exists(),

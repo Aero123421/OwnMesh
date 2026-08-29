@@ -256,6 +256,11 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
             .values()
             .filter(|value| super::is_op_journal_in_progress(value))
             .count();
+        let op_journal_recoverable_orphaned = self
+            .op_journal
+            .values()
+            .filter(|value| super::is_op_journal_recoverable_orphan(value))
+            .count();
         // P1-F: entries the runtime refuses to replay/compact/evict (unknown
         // forward-version state, malformed state values, or non-object
         // entries) are fail-closed state and must not be reported healthy.
@@ -293,6 +298,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 op_journal_entries,
                 op_journal_durable_bytes,
                 op_journal_in_progress,
+                op_journal_recoverable_orphaned,
                 op_journal_uncertain,
                 op_journal_degraded: self.op_journal_degraded.is_some(),
                 profile_discovery,
@@ -3286,6 +3292,7 @@ struct SystemDiagnosisFacts {
     op_journal_entries: usize,
     op_journal_durable_bytes: usize,
     op_journal_in_progress: usize,
+    op_journal_recoverable_orphaned: usize,
     op_journal_uncertain: usize,
     op_journal_degraded: bool,
     profile_discovery: (&'static str, Vec<String>),
@@ -3510,6 +3517,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "op_journal_pressure"
     } else if facts.op_journal_uncertain > 0 {
         "op_journal_uncertain"
+    } else if facts.op_journal_recoverable_orphaned > 0 {
+        "op_journal_recoverable_orphaned"
     } else if facts
         .op_journal_in_progress
         .saturating_sub(facts.in_flight_journaled)
@@ -3536,6 +3545,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "transition_journal_issues"
         | "op_journal_pressure"
         | "op_journal_uncertain"
+        | "op_journal_recoverable_orphaned"
         | "op_journal_in_progress"
         | "agent_route_offline"
         | "credential_store_issues"
@@ -3628,6 +3638,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "durable_bytes": facts.op_journal_durable_bytes,
                 "max_bytes": super::MAX_OP_JOURNAL_FILE_BYTES,
                 "in_progress": facts.op_journal_in_progress,
+                "recoverable_orphaned": facts.op_journal_recoverable_orphaned,
                 "uncertain": facts.op_journal_uncertain,
                 "degraded": facts.op_journal_degraded,
             },
@@ -3672,6 +3683,7 @@ mod system_diagnosis_tests {
             op_journal_entries: 0,
             op_journal_durable_bytes: 0,
             op_journal_in_progress: 0,
+            op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
@@ -3796,6 +3808,7 @@ mod system_diagnosis_tests {
             op_journal_entries: 0,
             op_journal_durable_bytes: 0,
             op_journal_in_progress: 0,
+            op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
@@ -3836,6 +3849,15 @@ mod system_diagnosis_tests {
                 },
                 "workspace_selection_required",
                 "select_workspace",
+            ),
+            (
+                SystemDiagnosisFacts {
+                    op_journal_in_progress: 1,
+                    op_journal_recoverable_orphaned: 1,
+                    ..healthy_facts()
+                },
+                "op_journal_recoverable_orphaned",
+                "run_local_doctor",
             ),
             (
                 // #141: a daemon whose Agent route is offline must not look
@@ -3891,6 +3913,7 @@ mod system_diagnosis_tests {
             op_journal_entries: 0,
             op_journal_durable_bytes: 0,
             op_journal_in_progress: 0,
+            op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
@@ -4098,6 +4121,7 @@ mod system_diagnosis_tests {
             op_journal_entries: super::super::MAX_OP_JOURNAL_ENTRIES,
             op_journal_durable_bytes: super::super::MAX_OP_JOURNAL_FILE_BYTES,
             op_journal_in_progress: 0,
+            op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
             profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),

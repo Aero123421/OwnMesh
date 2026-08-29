@@ -73,20 +73,14 @@ def codex() -> None:
 
 def acp() -> None:
     expected = ["--acp"] if PROFILE in {"qwen-code", "qoder"} else ["acp"]
-    if PROFILE == "kimi-code" and ARGS == ["acp", "--session", "native_kimi_code"]:
-        pass
-    elif PROFILE == "hermes-agent" and ARGS == ["acp", "--resume", "native_hermes_agent"]:
-        pass
-    else:
-        require(ARGS == expected, f"argv {ARGS!r}")
+    require(ARGS == expected, f"argv {ARGS!r}")
     first = read()
     params = first.get("params") if isinstance(first.get("params"), dict) else {}
     require(first.get("jsonrpc") == "2.0" and first.get("id") == 1 and first.get("method") == "initialize", "ACP initialize")
     require(params.get("protocolVersion") == 1 and isinstance(params.get("clientCapabilities"), dict) and isinstance(params.get("clientInfo"), dict), "ACP v1 facts")
-    # Negotiate loadSession for documented negotiated adapters. Kimi/Hermes
-    # resumed children consume their native session in argv, so they still use
-    # session/new here and must not double-resume through ACP.
-    can_load = PROFILE in {"opencode", "qwen-code", "qoder"}
+    # Every official ACP adapter uses capability-negotiated session/load for
+    # native resume. None consume a second, hidden argv resume contract.
+    can_load = True
     emit({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": can_load}}})
     session = read()
     params2 = session.get("params") if isinstance(session.get("params"), dict) else {}
@@ -104,7 +98,17 @@ def acp() -> None:
     prompt = read()
     require(prompt.get("jsonrpc") == "2.0" and prompt.get("id") == 3 and prompt.get("method") == "session/prompt", "ACP prompt")
     time.sleep(DELAYED_COMPLETION_SECONDS if PROFILE == "kimi-code" else 0.05)
-    emit({"type": "message", "text": f"{PROFILE}-output", "native_session_id": native})
+    emit({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": native,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": f"{PROFILE}-output"},
+            },
+        },
+    })
     emit({"jsonrpc": "2.0", "id": 3, "result": {"stopReason": "end_turn"}})
     time.sleep(60)
 
@@ -113,7 +117,10 @@ def pi() -> None:
     require(ARGS == ["--mode", "rpc"], f"argv {ARGS!r}")
     prompt = read()
     require(prompt == {"id": "ownmesh-prompt-1", "type": "prompt", "message": prompt.get("message")}, "strict Pi prompt")
-    emit({"type": "message", "text": "pi-output", "native_session_id": "native_pi"})
+    emit({
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "delta": "pi-output"},
+    })
     time.sleep(60)
 
 
@@ -129,7 +136,20 @@ def stream_json() -> None:
             require(resume_at + 1 < len(ARGS) and ARGS[resume_at + 1] == "native_claude_code", "Claude resume id")
     else:
         require(len(ARGS) >= 4 and ARGS[0] == "--print" and "--output-format" in ARGS and "stream-json" in ARGS, f"argv {ARGS!r}")
-    emit({"type": "message", "text": f"{PROFILE}-output", "native_session_id": f"native_{PROFILE.replace('-', '_')}"})
+    native = f"native_{PROFILE.replace('-', '_')}"
+    if PROFILE == "claude-code":
+        emit({
+            "type": "assistant",
+            "session_id": native,
+            "message": {"content": [{"type": "text", "text": "claude-code-output"}]},
+        })
+    else:
+        emit({
+            "type": "message",
+            "role": "assistant",
+            "content": "agy-output",
+            "session_id": native,
+        })
     time.sleep(60)
 
 

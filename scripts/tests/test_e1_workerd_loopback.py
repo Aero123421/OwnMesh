@@ -197,6 +197,12 @@ def main() -> int:
                 "RUST_LOG": "ownmeshd=info",
             }
         )
+        artifact_dir_raw = os.environ.get("OWNMESH_E2E_ARTIFACT_DIR")
+        artifact_dir = Path(artifact_dir_raw).resolve() if artifact_dir_raw else None
+        if artifact_dir and not (artifact_dir / "ownmeshd").is_file():
+            raise RuntimeError(f"release artifact directory lacks ownmeshd: {artifact_dir}")
+        if artifact_dir:
+            base_env["PATH"] = str(artifact_dir) + os.pathsep + base_env.get("PATH", "")
 
         try:
             run_checked([cargo, "build", "-p", "ownmeshd", "--bin", "ownmeshd", "--example", "e1_loopback_provision"], cwd=ROOT, env=base_env)
@@ -275,7 +281,7 @@ def main() -> int:
             wrangler_log.close()
             wait_for_health(issuer, wrangler_process)
 
-            binary = ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
+            binary = artifact_dir / "ownmeshd" if artifact_dir else ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
             states: list[dict[str, object]] = []
             for attempt in range(2):
                 log_path = temp / f"ownmeshd-{attempt}.log"

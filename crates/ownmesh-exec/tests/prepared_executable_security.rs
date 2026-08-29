@@ -1,8 +1,10 @@
 #![cfg(unix)]
 
+#[cfg(target_os = "linux")]
+use ownmesh_exec::resolve_executable_invocation_path;
 use ownmesh_exec::{
-    pin_executable, prepare_executable, run_prepared_command_cancellable, CommandKind,
-    ExecutablePin, RunRequest,
+    pin_executable, pin_shebang_interpreter, prepare_executable, prepare_executable_with_shebang,
+    run_prepared_command_cancellable, CommandKind, ExecutablePin, RunRequest,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -173,15 +175,134 @@ async fn approved_shebang_script_keeps_its_prepared_contents() {
     std::fs::write(&script, b"#!/bin/sh\nprintf approved-script-ran\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (invocation, backing) = proxy_pins(&script, CommandKind::RawShell);
-    let prepared = prepare_executable(&script, &invocation, &backing, Some(temp.path())).unwrap();
+    let shebang = pin_shebang_interpreter(&script, &backing)
+        .unwrap()
+        .expect("script has a shebang");
+    let prepared = prepare_executable_with_shebang(
+        &script,
+        &invocation,
+        &backing,
+        Some(&shebang),
+        Some(temp.path()),
+    )
+    .unwrap();
 
-    std::fs::write(&script, b"#!/bin/sh\nprintf replaced-script-ran\n").unwrap();
+    // Path replacement after preparation cannot alter the sealed script memfd.
+    // `/bin/sh` reads the inherited proc-fd and therefore sees approved bytes.
+    let replacement = temp.path().join("replacement-script");
+    std::fs::write(&replacement, b"#!/bin/sh\nprintf replaced-script-ran\n").unwrap();
+    std::fs::rename(&replacement, &script).unwrap();
     let result = run_prepared_command_cancellable(&request(&script, &[]), prepared, None, None)
         .await
         .unwrap();
 
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout, "approved-script-ran");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn env_node_script_uses_pinned_interpreter_and_real_module_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(node) = resolve_executable_invocation_path("node", None) else {
+        eprintln!("node is unavailable; skipping Node shebang regression");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let package = temp.path().join("package with spaces");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let sibling = package.join("sibling.mjs");
+    let script_target = package.join("cli.mjs");
+    let script = bin.join("pi");
+    std::fs::write(&sibling, b"export const marker = 'node-shebang-ran';\n").unwrap();
+    let approved_argv0 = serde_json::to_string(&script.to_string_lossy()).unwrap();
+    std::fs::write(
+        &script_target,
+        format!(
+            "#!/usr/bin/env node\n\
+             import {{ spawnSync }} from 'node:child_process';\n\
+             import {{ marker }} from './sibling.mjs';\n\
+             if (process.argv[1] !== {approved_argv0}) throw new Error('approved argv0 was not preserved');\n\
+             const child = spawnSync(process.execPath, ['--version'], {{ encoding: 'utf8' }});\n\
+             if (child.status !== 0 || !child.stdout.startsWith('v')) throw new Error('sealed Node image could not spawn a child');\n\
+             console.log(marker);\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script_target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(PathBuf::from("../package with spaces/cli.mjs"), &script).unwrap();
+    let (invocation, backing) = proxy_pins(&script, CommandKind::RawShell);
+    let shebang = pin_shebang_interpreter(&script, &backing)
+        .unwrap()
+        .expect("script has a shebang");
+    assert_eq!(
+        std::fs::canonicalize(&shebang.backing.path).unwrap(),
+        std::fs::canonicalize(node).unwrap()
+    );
+    let prepared = prepare_executable_with_shebang(
+        &script,
+        &invocation,
+        &backing,
+        Some(&shebang),
+        Some(temp.path()),
+    )
+    .unwrap();
+
+    // Preserve Node's real module base without trusting the pathname again:
+    // the loader must execute sealed main-module bytes even if that path is
+    // replaced after preparation, while resolving the approved relative import
+    // from the original package directory.
+    let replacement = package.join("replacement.mjs");
+    std::fs::write(&replacement, b"console.log('replacement-ran');\n").unwrap();
+    std::fs::rename(&replacement, &script_target).unwrap();
+
+    let result = run_prepared_command_cancellable(&request(&script, &[]), prepared, None, None)
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
+    assert_eq!(result.stdout.trim(), "node-shebang-ran", "{result:?}");
+    assert!(result.stderr.is_empty(), "{result:?}");
+    assert!(result.duration_ms < 5_000, "{result:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interpreter_replacement_after_admission_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let interpreter = temp.path().join("interpreter");
+    std::fs::copy("/bin/sh", &interpreter).unwrap();
+    std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = temp.path().join("script");
+    std::fs::write(
+        &script,
+        format!("#!{}\nprintf never\n", interpreter.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (invocation, backing) = proxy_pins(&script, CommandKind::RawShell);
+    let shebang = pin_shebang_interpreter(&script, &backing)
+        .unwrap()
+        .expect("script has a shebang");
+
+    let replacement = temp.path().join("replacement-interpreter");
+    std::fs::copy(false_program(), &replacement).unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::rename(replacement, interpreter).unwrap();
+    let error = prepare_executable_with_shebang(
+        &script,
+        &invocation,
+        &backing,
+        Some(&shebang),
+        Some(temp.path()),
+    )
+    .err()
+    .expect("interpreter drift must fail closed");
+    assert!(error.to_string().contains("identity"), "{error}");
 }
 
 #[tokio::test]

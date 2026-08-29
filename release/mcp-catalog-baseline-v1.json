@@ -1,0 +1,1276 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "release": "v1.2.24",
+  "catalog_revision": "6e288bf5533c7fec",
+  "tools": [
+    {
+      "name": "ownmesh_list_devices",
+      "required": [],
+      "properties": {
+        "cursor": "a0218afe9606734ef3202fe8afb2bc9bffbbe3414ad20967a0b8087155bea953",
+        "limit": "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "max_bytes": "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_device",
+      "required": [
+        "device_id"
+      ],
+      "properties": {
+        "device_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_system_diagnose",
+      "required": [
+        "device_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "212d3de6bf53e02442d7f3debf8a3000df554632e5df98bc364fbfbb5e92916b"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_policy_show",
+      "required": [
+        "device_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_policy_preset",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "name"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "name": "6e846b5ad3409cf6658fd1df0f8a865447b34648b8b024ac83d1da58bb0e2ac9",
+        "delegate_remote_mcp": "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_policy_rule_add",
+      "required": [
+        "capability",
+        "device_id",
+        "id",
+        "idempotency_key",
+        "rule_decision"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "id": "8f655530afd983ca97a5bac1810d344d5e5c2ef53a5b376d27befca94afafee1",
+        "rule_decision": "76c833aedf8f8ff972b578c646df4035b3cadb041e0bdf90a98e1b52e932b7df",
+        "capability": "4876df4b78eb1afc7ac90fb6402d0b389ef50847c2f866a746227ada5aa44d98",
+        "priority": "1d49c2a324a2f2e607e6438717f2a72fb1c46a18ca0f77cef67c482af081ce8c",
+        "when_elevated": "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "when_kind": "9be01fcd4cdff142838b72fd31c7545a6c19663f092e7154df406661f40ba353",
+        "path_prefix": "d1c441e03e7f6707b5bf93bd7906e7d80acefd6a461a48750d6cc5b64be0416f",
+        "program_equals": "8358cadf116c10bee998c7adfdf128ea6d2055b3ddcbd4b324085039cb294655",
+        "description": "8358cadf116c10bee998c7adfdf128ea6d2055b3ddcbd4b324085039cb294655",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_policy_rule_remove",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "id": "8f655530afd983ca97a5bac1810d344d5e5c2ef53a5b376d27befca94afafee1",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_daemon_unlock",
+      "required": [
+        "device_id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_token_revoke",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "target_principal"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "target_principal": "8358cadf116c10bee998c7adfdf128ea6d2055b3ddcbd4b324085039cb294655",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_request_approval",
+      "required": [
+        "approval_id",
+        "device_id",
+        "idempotency_key",
+        "requested_decision",
+        "temporary_grant"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "approval_id": "47f3faa6f024b71da699146a7d29c62701968c732a338d870e66f0bca864513c",
+        "requested_decision": "7c4c6ec95986d3bcc5f3bff34a5dfba8916ba5691621bf4595d148d1f39428cd",
+        "temporary_grant": "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "grant_seconds": "6e8af5da59ddf1604e4d88a79e312c4a54eba9b700375a8d791eee7c3364ea28",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_grants_mint",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "tools",
+        "ttl_seconds"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "tools": "6bc65eb85f4cbaf9b6c43cc6349f31af74682893ea734e684ca7de9c2b1a04d8",
+        "ttl_seconds": "b69ce6ad0eb1ad42d247f258a0c96e913500b1b420fc5a6889587b30cab48e8d",
+        "max_uses": "83e78c15ef73a7d3ceb62219df948e50b1535b2833c19d2bf8a780b78b478f75",
+        "workspace_id": "c51e0a9b62f9658aa2f71f14feb42a7f67c1c6bf2ce2e2fb2d373bda4f994af1",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_grants_list",
+      "required": [
+        "device_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_grants_revoke",
+      "required": [
+        "device_id",
+        "id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "id": "c51e0a9b62f9658aa2f71f14feb42a7f67c1c6bf2ce2e2fb2d373bda4f994af1"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_list_profiles",
+      "required": [],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "cursor": "a0218afe9606734ef3202fe8afb2bc9bffbbe3414ad20967a0b8087155bea953",
+        "limit": "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "max_bytes": "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_profile_show",
+      "required": [
+        "device_id",
+        "id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_list",
+      "required": [
+        "device_id",
+        "path",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "cursor": "a0218afe9606734ef3202fe8afb2bc9bffbbe3414ad20967a0b8087155bea953",
+        "limit": "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "max_bytes": "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1",
+        "max_entries": "a56ef1497d5ac1afd3abdb546bb1b8bbcbeddb0121df349a325b355a311554d5"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_read",
+      "required": [
+        "device_id",
+        "path",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "cursor": "456d1b4c2062af0caee22c32f64764b40ee628c4fc3097ee404522623bd730ba",
+        "limit": "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "max_bytes": "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1",
+        "offset": "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_write",
+      "required": [
+        "content",
+        "device_id",
+        "idempotency_key",
+        "path",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "content": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d11cfb445a9a6f0904d0a8f6c1f63670adcb39e058793ee1a4fe4d9fd913610a"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_fs_stat",
+      "required": [
+        "device_id",
+        "path",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "hash": "d6562426576609bd6617372aee543cbf92534028f7ea8803360d8c24855733e7",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "idempotency_key": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_delete",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "path",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "recursive": "d6562426576609bd6617372aee543cbf92534028f7ea8803360d8c24855733e7",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "idempotency_key": "3a145d85564be42e3a92611f86064faadce04a25e95022f39ac8c70e724edf14"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_fs_patch",
+      "required": [
+        "content",
+        "device_id",
+        "idempotency_key",
+        "path",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "content": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "expected_sha256": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "patch_format": "e35fe4a8caf6392c5f2b80c63ba909372dac2d1181bbed9fedca73f72fb63258",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "idempotency_key": "9286cb6f790b399c7107739f2d7fe10e9b8063fb86df78b0a985805292a23c60"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_command_run",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "program",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "program": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "args": "d7a19ad6de43b74d74eee1584d61d8a1cd8e3460563dc8378a32bea8f4cbeb1e",
+        "cwd": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "16d583e0b4cc46d423f3838c23045228be96bda3794582ba068674c5b8851554",
+        "timeout_ms": "0233a0275c8f3a9a6c303f34a2eae1011922dc5ddf041f4657de1f5762ff84ea",
+        "max_output_bytes": "a2a05936abee445f1cac9eac55b081d92fb6c65d1adae3f3b26e320300676dad",
+        "env": "b1af3b612b81a0deabc54c3c330e94ad7f0ea60bb58f5ac51e4a39900f2cf52f",
+        "elevated": "80a17d2b910d316de586c62726d7f30a60c0353e3434460c2b9fc1770f7a2dbf",
+        "detach": "9d8c5df32237046b437b4b33b9b12643bd9cf7cfc19a7dfd46d8d2b5f9ad471b"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_command_shell",
+      "required": [
+        "command",
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "command": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "cwd": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "09cbcc599ad2147c4520599bf64d44820ddffd67625a417f482855b97442a956",
+        "timeout_ms": "0233a0275c8f3a9a6c303f34a2eae1011922dc5ddf041f4657de1f5762ff84ea",
+        "max_output_bytes": "a2a05936abee445f1cac9eac55b081d92fb6c65d1adae3f3b26e320300676dad",
+        "env": "b1af3b612b81a0deabc54c3c330e94ad7f0ea60bb58f5ac51e4a39900f2cf52f"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_open",
+      "required": [
+        "device_id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "title": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "program": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "args": "d7a19ad6de43b74d74eee1584d61d8a1cd8e3460563dc8378a32bea8f4cbeb1e",
+        "profile_id": "68f5f3a4e47fc4854c03da7af408963e7dbcbb6c1f0e3d6e17f5f25c59b88ca5",
+        "prompt": "bcd6b756f49a494e87cbbf51f1cab619471e364a551a1774a053b187aacd844c",
+        "native_session_id": "d6a1179fd1e181ab8c4439d21c68b7256fbfccebe42d9433f167c09732876705",
+        "adapter_mode": "7e0f48aab398303011466af6c134ad80864d60ba1b1ee3de02d9088f48c5c93f",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "768989b3d6265aa73544b0ee01bd05a9c3e1c04350fa99aa654fcae9b858e69b"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_attach",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "role",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "role": "34640f1706eb221861f41705ebc31eafd48fac7fae6db5a3a775f690f31c4a18",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "e8a4596d51a2e72945ccff98f54c88477570eee88af29de300eca826ed16aece"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_write",
+      "required": [
+        "controller_epoch",
+        "data",
+        "device_id",
+        "idempotency_key",
+        "input_seq",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "data": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "input_seq": "489afb365fea584a18fc53db46239968b86c4dca3c7a3420452c8a20ac7253fd",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "idempotency_key": "32b4bcbe8161fef278298ed71189179192a33c00b2a3ffcaae20d812f8eb8501"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_resize",
+      "required": [
+        "cols",
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "resize_seq",
+        "rows",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "cols": "a492f76ad1b65340f191cefd9809d2675869f7eb8778fdb1b3517be3e0d54b1f",
+        "rows": "a492f76ad1b65340f191cefd9809d2675869f7eb8778fdb1b3517be3e0d54b1f",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "resize_seq": "82c9f88dd6b0e6fa906a7f391f03372b3300de9c6a93a3bd23a14ee58aca5e7f",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "idempotency_key": "1c0802661ce407e7a58880e52ae5d587bda346de4117139213f23d528c9854f1"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_replay",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "from_seq": "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "sidecar_cursor": "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "raw_sidecar": "d6562426576609bd6617372aee543cbf92534028f7ea8803360d8c24855733e7",
+        "limit": "6d892361aa31ee8d9b24f2664292e55b80ec39d415f24249d2d8cfe58d469b4d",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "f39480055976f4a0b5ebb9d5bff16f715e1f23f8f577625321690a14e36e3190"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_cancel",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_close",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_list",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_show",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_claim",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "9372e19fe3a5728d5af69a6fadaebec0c7c728dce2f4416275f099b11476866f"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_renew",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "ttl_secs",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "ttl_secs": "07ad65f14ecf1553d1bf4282bcdaad18c8750030292342c47cb095190d41d55f",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_detach",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_give",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "to",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "to": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "e3cea944fe93110b521b50caaa724857eaaeb289bc7f0d91e71563da4db2a448"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_terminate",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "session_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "lease_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "controller_epoch": "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_git_status",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "cursor": "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "limit": "6d892361aa31ee8d9b24f2664292e55b80ec39d415f24249d2d8cfe58d469b4d",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_git_diff",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "pathspec": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "staged": "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "workspace_id": "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "cursor": "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "limit": "660728f94b437c00351c1fc12c87f6f6487a0bee41b9d2e730fb0fe96139d78b",
+        "max_bytes": "0e1ba20d2b435ee22bd686cc5f04d00e82349daa7084b239d0164df5666acbe5",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_review_start",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "tests",
+        "workspace_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "command": "b3ee1d079b6182127b38fbb006094137be1f4c805c9529f88590923be8ead663",
+        "tests": "1fe7f89eb78cc571d09b0085b86bebd058b1f2e35e11860a3117bc2134a838ff",
+        "idempotency_key": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_review_show",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "review_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "review_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_review_page",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "review_id"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "review_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "cursor": "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "max_bytes": "5a4223d309dc00fcf19d49d1e972626b932fa9a6c01fba62c5182a85eb7daf36",
+        "idempotency_key": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_list",
+      "required": [
+        "device_id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_show",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_add",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "path"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "label": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "200b69f48657a9e634817552677abf46083657dccb21f6173a71e89229856f71"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_update",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "label": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_remove",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "properties": {
+        "device_id": "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "async": "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_operation",
+      "required": [
+        "operation_id"
+      ],
+      "properties": {
+        "operation_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "device_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "wait_ms": "871d7ea392f0ae5359e1f951109d17ad01b4190e7e51c48497169fddc63a48e6",
+        "include_diagnostics": "f39e63450410945388f2fa4d532972e9b62aff1a60793418788af865a54aa757"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_cancel_operation",
+      "required": [
+        "operation_id"
+      ],
+      "properties": {
+        "operation_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "device_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "c18315417125b92556d92c612393cf18baec82ec4e691a9cf1da6eb0898c0c06"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_plan",
+      "required": [
+        "destination_device_id",
+        "destination_path",
+        "destination_workspace_id",
+        "idempotency_key",
+        "source_device_id",
+        "source_path",
+        "source_workspace_id"
+      ],
+      "properties": {
+        "source_device_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "destination_device_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "source_workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "destination_workspace_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "source_path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "destination_path": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "ttl_seconds": "64580224374d66c9b26bf0c0ffaa17d4df916043edd23ef221792d9fb6debe4f",
+        "overwrite_expected_sha256": "8b98d16d1105073871a93221b6426407723c125a287c3d37cd7de6cdeea486fb",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_send",
+      "required": [
+        "idempotency_key",
+        "transfer_id"
+      ],
+      "properties": {
+        "transfer_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_get",
+      "required": [
+        "transfer_id"
+      ],
+      "properties": {
+        "transfer_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "offset": "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "max_bytes": "5a56d2a1e62afa684bb1d2a4e8c51cec19f8662b92d0c02002f8829e1d493420"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_list",
+      "required": [],
+      "properties": {
+        "cursor": "a0218afe9606734ef3202fe8afb2bc9bffbbe3414ad20967a0b8087155bea953",
+        "limit": "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "max_bytes": "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_status",
+      "required": [
+        "transfer_id"
+      ],
+      "properties": {
+        "transfer_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_cancel",
+      "required": [
+        "idempotency_key",
+        "transfer_id"
+      ],
+      "properties": {
+        "transfer_id": "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "idempotency_key": "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      },
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    }
+  ]
+}

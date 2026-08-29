@@ -289,6 +289,40 @@ def http_json(url: str, *, method: str = "GET", headers: dict[str, str] | None =
         return error.code, parsed
 
 
+def modern_mcp_request(
+    issuer: str,
+    method: str,
+    params: dict[str, object] | None = None,
+    *,
+    token: str | None = None,
+    rpc_id: int = 1,
+    surface: str = "all",
+) -> dict[str, object]:
+    params = dict(params or {})
+    params["_meta"] = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "ownmesh-workerd-e2e", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+    headers = {
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": method,
+    }
+    if method == "tools/call" and isinstance(params.get("name"), str):
+        headers["mcp-name"] = str(params["name"])
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    status, body = http_json(
+        f"{issuer}/mcp?surface={surface}",
+        method="POST",
+        headers=headers,
+        body={"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params},
+    )
+    if status != 200 or not isinstance(body, dict) or not isinstance(body.get("result"), dict):
+        raise RuntimeError(f"modern MCP {method} failed: HTTP={status} body={body}")
+    return body["result"]
+
+
 def mcp_call(issuer: str, token: str, name: str, arguments: dict[str, object], rpc_id: int = 1) -> dict[str, object]:
     status, body = http_json(
         f"{issuer}/mcp",
@@ -534,7 +568,15 @@ def main() -> int:
                 "RUST_LOG": "ownmeshd=info",
             }
         )
-        base_env["PATH"] = str(fixture_bin_dir) + os.pathsep + base_env.get("PATH", "")
+        artifact_dir_raw = os.environ.get("OWNMESH_E2E_ARTIFACT_DIR")
+        artifact_dir = Path(artifact_dir_raw).resolve() if artifact_dir_raw else None
+        if artifact_dir and not (artifact_dir / "ownmeshd").is_file():
+            raise RuntimeError(f"release artifact directory lacks ownmeshd: {artifact_dir}")
+        path_parts = [str(fixture_bin_dir)]
+        if artifact_dir:
+            path_parts.append(str(artifact_dir))
+        path_parts.append(base_env.get("PATH", ""))
+        base_env["PATH"] = os.pathsep.join(path_parts)
         log_path = temp / "ownmeshd-0.log"
 
         try:
@@ -543,11 +585,12 @@ def main() -> int:
                 cwd=ROOT,
                 env=base_env,
             )
-            run_checked(
-                [cargo, "build", "-p", "ownmesh-session-host", "--bin", "ownmesh-session-host"],
-                cwd=ROOT,
-                env=base_env,
-            )
+            if artifact_dir is None:
+                run_checked(
+                    [cargo, "build", "-p", "ownmesh-session-host", "--bin", "ownmesh-session-host"],
+                    cwd=ROOT,
+                    env=base_env,
+                )
             public_key = run_checked(
                 [cargo, "run", "-q", "-p", "ownmeshd", "--example", "e1_loopback_provision", "--", "provision"],
                 cwd=ROOT,
@@ -669,7 +712,19 @@ def main() -> int:
             wrangler_log.close()
             wait_for_health(issuer, wrangler_process)
 
-            binary = ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
+            # Real HTTP/workerd conformance for the stateless modern adapter,
+            # separate from the legacy initialize/session compatibility calls
+            # used by existing ChatGPT fixtures below.
+            discovered = modern_mcp_request(issuer, "server/discover", rpc_id=90)
+            if discovered.get("resultType") != "complete" or "2026-07-28" not in discovered.get("supportedVersions", []):
+                raise RuntimeError(f"modern server/discover contract mismatch: {discovered}")
+            modern_tools = modern_mcp_request(issuer, "tools/list", rpc_id=91, surface="core")
+            if modern_tools.get("resultType") != "complete" or modern_tools.get("cacheScope") != "public":
+                raise RuntimeError(f"modern tools/list cache contract mismatch: {modern_tools}")
+            if not isinstance(modern_tools.get("tools"), list) or not modern_tools["tools"]:
+                raise RuntimeError("modern core surface returned no tools")
+
+            binary = artifact_dir / "ownmeshd" if artifact_dir else ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
             daemon_process = start_daemon(binary, base_env, log_path)
             state0 = wait_for_ready(daemon_process, log_path)
 
