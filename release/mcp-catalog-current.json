@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "catalog_revision": "6e288bf5533c7fec",
+  "source": "packages/control-plane/src/mcp.ts:PUBLISHED_MCP_TOOLS"
+}

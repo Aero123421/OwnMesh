@@ -1212,6 +1212,17 @@ acp = false
 - 通常 Chat から利用する。
 - ChatGPT 固有のモード切替を OwnMesh の必須条件にしない。
 
+> **実装状況（post-v1.2.24 / [ADR 0017](./docs/adr/0017-dual-era-mcp-and-frozen-catalog-compatibility.md)）**
+> 共通の tool registry・scope・action binding・device policy route の前に、
+> `2025-03-26` legacy adapter（`initialize` / 任意 session id）と
+> `2026-07-28` modern adapter（stateless request metadata、mirrored HTTP
+> headers、`server/discover`、typed version/header error、cache hint）を置く。
+> 既存 ChatGPT client を壊す flag-day replacement は行わない。公開済み
+> ChatGPT plugin の metadata は OpenAI の review snapshot であり、server deploy
+> だけでは更新されないため、Scan Tools → submit → publish を別の operator
+> workflow として扱う。catalog v1 は旧名を `tools/call` で 1.x の間受理し、
+> CI が過去 snapshot に対する required parameter/property/effect 互換を検査する。
+
 ## 14.2 Tool 命名
 
 実装名は衝突を避けるため `ownmesh_` prefix + snake_case とする。

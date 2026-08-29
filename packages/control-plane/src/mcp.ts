@@ -3,7 +3,9 @@
  *
  * Spec authority:
  * - OWNMESH_SPECIFICATION.ja.md §14 (tools, annotations, envelopes, async)
- * - MCP Streamable HTTP transport (2025-03-26):
+ * - MCP modern Streamable HTTP transport (2026-07-28):
+ *   https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
+ * - MCP legacy compatibility transport (2025-03-26):
  *   https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
  * - ChatGPT developer mode / MCP apps:
  *   https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt-beta
@@ -1757,6 +1759,48 @@ export const PUBLISHED_MCP_TOOLS: readonly McpToolDef[] = MCP_TOOLS.filter(
   (tool) => !tool.aliasOf && !tool.hidden,
 );
 
+/** Catalog compatibility contract for frozen ChatGPT/plugin snapshots. */
+export const MCP_CATALOG_VERSION = 1;
+export const MCP_CATALOG_COMPATIBILITY = {
+  min_version: 1,
+  max_version: 1,
+  deprecated_aliases_callable_through: "1.x",
+} as const;
+
+export type McpCatalogSurface = "all" | "core" | "admin" | "agents";
+
+function canonicalToolName(tool: McpToolDef): string {
+  return tool.aliasOf || tool.name;
+}
+
+function toolSurface(tool: McpToolDef): Exclude<McpCatalogSurface, "all"> {
+  const name = canonicalToolName(tool);
+  if (
+    name.startsWith("ownmesh_policy_")
+    || name.startsWith("ownmesh_grants_")
+    || name === "ownmesh_request_approval"
+    || name === "ownmesh_daemon_unlock"
+    || name === "ownmesh_token_revoke"
+  ) return "admin";
+  if (name.startsWith("ownmesh_profile_") || name.startsWith("ownmesh_review_")) {
+    return "agents";
+  }
+  return "core";
+}
+
+export function mcpToolsForSurface(surface: McpCatalogSurface): readonly McpToolDef[] {
+  return surface === "all"
+    ? PUBLISHED_MCP_TOOLS
+    : PUBLISHED_MCP_TOOLS.filter((tool) => toolSurface(tool) === surface);
+}
+
+function requestedMcpSurface(url: URL): McpCatalogSurface | null {
+  const value = url.searchParams.get("surface") || "all";
+  return value === "all" || value === "core" || value === "admin" || value === "agents"
+    ? value
+    : null;
+}
+
 /**
  * Deterministic revision of the published tool catalog (#158).
  *
@@ -1939,7 +1983,14 @@ function validateAdminToolArgs(
   return "unknown admin tool";
 }
 
-export const MCP_PROTOCOL_VERSION = "2025-03-26";
+export const MCP_LEGACY_PROTOCOL_VERSION = "2025-03-26";
+export const MCP_MODERN_PROTOCOL_VERSION = "2026-07-28";
+/** Legacy export retained for existing clients/tests. */
+export const MCP_PROTOCOL_VERSION = MCP_LEGACY_PROTOCOL_VERSION;
+export const MCP_SUPPORTED_PROTOCOL_VERSIONS = [
+  MCP_MODERN_PROTOCOL_VERSION,
+  MCP_LEGACY_PROTOCOL_VERSION,
+] as const;
 
 // ---------------------------------------------------------------------------
 // Result envelopes
@@ -2522,6 +2573,9 @@ export function normalizeSystemDiagnosis(
   const opJournalUncertain = opJournal && Number.isSafeInteger(opJournal.uncertain)
     ? Number(opJournal.uncertain) > 0
     : false;
+  const opJournalRecoverableOrphaned = opJournal && Number.isSafeInteger(opJournal.recoverable_orphaned)
+    ? Number(opJournal.recoverable_orphaned) > 0
+    : false;
   const profileDiscovery = source?.profile_discovery && typeof source.profile_discovery === "object" && !Array.isArray(source.profile_discovery)
     ? source.profile_discovery as Record<string, unknown>
     : undefined;
@@ -2545,6 +2599,8 @@ export function normalizeSystemDiagnosis(
           ? "op_journal_uncertain"
           : opJournalStatus === "critical" || opJournalStatus === "malformed"
             ? "op_journal_pressure"
+            : opJournalRecoverableOrphaned
+              ? "op_journal_recoverable_orphaned"
             : profileDiscoveryStatus === "warn" || profileDiscoveryStatus === "malformed"
               ? "profile_discovery_issues"
               : sessionsCheck?.state === "stale" || staleCount > 0
@@ -2566,7 +2622,7 @@ export function normalizeSystemDiagnosis(
         ? "repair_op_journal_locally"
         : overall === "agent_contract_drift"
         ? "upgrade_control_plane"
-        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues" || overall === "agent_route_offline"
+        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "op_journal_recoverable_orphaned" || overall === "profile_discovery_issues" || overall === "agent_route_offline"
         ? "run_local_doctor"
         : overall === "stale_sessions"
           ? "reconcile_stale_sessions"
@@ -2600,6 +2656,9 @@ export function normalizeSystemDiagnosis(
         status: opJournalStatus,
         ...(opJournal?.entries !== undefined ? { entries: countField(opJournal.entries, 1_000_000) } : {}),
         ...(opJournal?.in_progress !== undefined ? { in_progress: countField(opJournal.in_progress, 1_000_000) } : {}),
+        ...(opJournal?.recoverable_orphaned !== undefined
+          ? { recoverable_orphaned: countField(opJournal.recoverable_orphaned, 1_000_000) }
+          : {}),
         ...(opJournal?.uncertain !== undefined ? { uncertain: countField(opJournal.uncertain, 1_000_000) } : {}),
         ...(opJournal?.degraded === true || opJournalStatus === "degraded" ? { degraded: true } : {}),
       },
@@ -5342,9 +5401,128 @@ async function buildTransferPreflightOperation(opts: {
 }
 
 // ---------------------------------------------------------------------------
-// Handler
+// Protocol adapters + handler
 // ---------------------------------------------------------------------------
 
+type McpRequestContext = {
+  era: "legacy" | "modern";
+  body?: JsonRpc;
+};
+
+function mcpHttpError(
+  id: string | number | null | undefined,
+  status: number,
+  code: number,
+  message: string,
+  data?: unknown,
+): Response {
+  return json(
+    { jsonrpc: "2.0", id: id ?? null, error: { code, message, data } },
+    { status, noStore: true },
+  );
+}
+
+function modernRequestMeta(body: JsonRpc): Record<string, unknown> | null {
+  const meta = body.params?._meta;
+  return meta && typeof meta === "object" && !Array.isArray(meta)
+    ? meta as Record<string, unknown>
+    : null;
+}
+
+function decodeMcpHeaderValue(value: string): string | null {
+  if (!value.startsWith("=?base64?") || !value.endsWith("?=")) return value;
+  try {
+    const bytes = Uint8Array.from(atob(value.slice(9, -2)), (character) => character.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function validateModernRequest(req: Request, body: JsonRpc): Response | null {
+  const id = body.id ?? null;
+  const meta = modernRequestMeta(body);
+  const headerVersion = req.headers.get("mcp-protocol-version");
+  const bodyVersion = meta?.["io.modelcontextprotocol/protocolVersion"];
+  const requested = typeof bodyVersion === "string" ? bodyVersion : headerVersion;
+  if (requested && !MCP_SUPPORTED_PROTOCOL_VERSIONS.includes(requested as typeof MCP_SUPPORTED_PROTOCOL_VERSIONS[number])) {
+    return mcpHttpError(id, 400, -32022, "Unsupported protocol version", {
+      supported: [...MCP_SUPPORTED_PROTOCOL_VERSIONS],
+      requested,
+    });
+  }
+  if (headerVersion !== MCP_MODERN_PROTOCOL_VERSION || bodyVersion !== MCP_MODERN_PROTOCOL_VERSION) {
+    return mcpHttpError(id, 400, -32020, "Header mismatch", {
+      header: "MCP-Protocol-Version",
+      expected: MCP_MODERN_PROTOCOL_VERSION,
+      received: headerVersion,
+      body: bodyVersion,
+    });
+  }
+  const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
+  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+    return mcpHttpError(id, 400, -32602, "Invalid params", {
+      missing_required_field: "params._meta.io.modelcontextprotocol/clientCapabilities",
+    });
+  }
+  const methodHeader = req.headers.get("mcp-method");
+  if (!body.method || methodHeader !== body.method) {
+    return mcpHttpError(id, 400, -32020, "Header mismatch", {
+      header: "Mcp-Method",
+      expected: body.method || null,
+      received: methodHeader,
+    });
+  }
+  if (body.method === "tools/call" || body.method === "prompts/get" || body.method === "resources/read") {
+    const name = body.method === "resources/read" ? body.params?.uri : body.params?.name;
+    const headerName = req.headers.get("mcp-name");
+    const decoded = headerName === null ? null : decodeMcpHeaderValue(headerName);
+    if (typeof name !== "string" || decoded === null || decoded !== name) {
+      return mcpHttpError(id, 400, -32020, "Header mismatch", {
+        header: "Mcp-Name",
+        expected: typeof name === "string" ? name : null,
+        received: decoded,
+      });
+    }
+  }
+  return null;
+}
+
+async function modernizeMcpResponse(response: Response, method: string): Promise<Response> {
+  if (!(response.headers.get("content-type") || "").includes("application/json")) return response;
+  let payload: Record<string, unknown>;
+  try {
+    payload = await response.clone().json() as Record<string, unknown>;
+  } catch {
+    return response;
+  }
+  const result = payload.result;
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const modern = result as Record<string, unknown>;
+    modern.resultType ??= "complete";
+    const meta = modern._meta && typeof modern._meta === "object" && !Array.isArray(modern._meta)
+      ? modern._meta as Record<string, unknown>
+      : {};
+    meta["io.modelcontextprotocol/serverInfo"] = { name: SERVICE_NAME, version: SERVICE_VERSION };
+    modern._meta = meta;
+    if (method === "tools/list" || method === "server/discover") {
+      modern.ttlMs ??= 300_000;
+      modern.cacheScope ??= "public";
+    }
+  }
+  const headers = new Headers(response.headers);
+  headers.delete("mcp-session-id");
+  headers.set("content-type", "application/json; charset=utf-8");
+  const code = (payload.error as { code?: unknown } | undefined)?.code;
+  const status = code === -32601 ? 404 : response.status;
+  return new Response(JSON.stringify(payload), { status, headers });
+}
+
+/**
+ * Dual-era MCP entry point. Modern 2026-07-28 validation happens before the
+ * shared registry/authorization/invocation core; legacy 2025-03-26 requests
+ * retain their initialize/session compatibility adapter.
+ */
 export async function handleMcp(
   req: Request,
   store: ControlPlaneStore,
@@ -5352,8 +5530,76 @@ export async function handleMcp(
   router?: OperationRouter,
   opts: McpHandleOptions = {},
 ): Promise<Response> {
+  let context: McpRequestContext = { era: "legacy" };
+  if (req.method === "GET" || req.method === "DELETE") {
+    const headerVersion = req.headers.get("mcp-protocol-version");
+    if (headerVersion === MCP_MODERN_PROTOCOL_VERSION) {
+      return new Response(null, { status: 405, headers: { allow: "POST" } });
+    }
+    if (headerVersion !== null && headerVersion !== MCP_LEGACY_PROTOCOL_VERSION) {
+      return mcpHttpError(null, 400, -32022, "Unsupported protocol version", {
+        supported: [...MCP_SUPPORTED_PROTOCOL_VERSIONS],
+        requested: headerVersion,
+      });
+    }
+  }
+  if (req.method === "POST") {
+    let body: JsonRpc;
+    try {
+      body = await readRequestJsonLimited<JsonRpc>(req.clone(), MAX_REQUEST_BODY_BYTES);
+    } catch (error) {
+      const modernHint = req.headers.has("mcp-protocol-version")
+        || req.headers.has("mcp-method")
+        || req.headers.has("mcp-name");
+      if (error instanceof BodyTooLargeError) {
+        const data = { max_bytes: MAX_REQUEST_BODY_BYTES };
+        return modernHint
+          ? mcpHttpError(null, 400, -32600, "request body too large", data)
+          : mcpError(null, -32600, "request body too large", data);
+      }
+      return modernHint
+        ? mcpHttpError(null, 400, -32700, "parse error")
+        : mcpError(null, -32700, "parse error");
+    }
+    const metaVersion = modernRequestMeta(body)?.["io.modelcontextprotocol/protocolVersion"];
+    const headerVersion = req.headers.get("mcp-protocol-version");
+    const modern = body.method === "server/discover"
+      || typeof metaVersion === "string"
+      || req.headers.has("mcp-method")
+      || req.headers.has("mcp-name")
+      || (headerVersion !== null && headerVersion !== MCP_LEGACY_PROTOCOL_VERSION);
+    context = { era: modern ? "modern" : "legacy", body };
+    if (modern) {
+      const invalid = validateModernRequest(req, body);
+      if (invalid) return invalid;
+      if (body.method === "initialize" || body.method === "ping") {
+        return mcpHttpError(body.id, 404, -32601, `Method not found: ${body.method}`);
+      }
+    }
+  }
+  const response = await handleMcpCore(req, store, url, router, opts, context);
+  return context.era === "modern"
+    ? modernizeMcpResponse(response, context.body?.method || "")
+    : response;
+}
+
+async function handleMcpCore(
+  req: Request,
+  store: ControlPlaneStore,
+  url: URL,
+  router: OperationRouter | undefined,
+  opts: McpHandleOptions,
+  requestContext: McpRequestContext,
+): Promise<Response> {
   const tracker = opts.tracker || defaultOpTracker;
   const issuer = opts.issuer || url.origin;
+  const catalogSurface = requestedMcpSurface(url);
+  if (!catalogSurface) {
+    return mcpHttpError(null, 400, -32602, "unsupported_catalog_surface", {
+      supported: ["all", "core", "admin", "agents"],
+    });
+  }
+  const publishedTools = mcpToolsForSurface(catalogSurface);
   const toolContent = (
     envelope: OwnMeshResultEnvelope & Partial<TrackedOperation>,
     includeDiagnostics = false,
@@ -5377,7 +5623,10 @@ export async function handleMcp(
       path: url.pathname,
       transport: "streamable-http",
       protocolVersion: MCP_PROTOCOL_VERSION,
-      tools: PUBLISHED_MCP_TOOLS.length,
+      tools: publishedTools.length,
+      catalog_surface: catalogSurface,
+      catalog_version: MCP_CATALOG_VERSION,
+      catalog_compatibility: MCP_CATALOG_COMPATIBILITY,
       // #158: comparable without a bearer, so an operator or a synthetic
       // probe can tell which catalog generation this deployment publishes.
       service_version: SERVICE_VERSION,
@@ -5391,17 +5640,8 @@ export async function handleMcp(
   }
 
   const token = bearer(req) ?? undefined;
-  let body: JsonRpc;
-  try {
-    body = await readRequestJsonLimited<JsonRpc>(req, MAX_REQUEST_BODY_BYTES);
-  } catch (err) {
-    if (err instanceof BodyTooLargeError) {
-      return mcpError(null, -32600, "request body too large", {
-        max_bytes: MAX_REQUEST_BODY_BYTES,
-      });
-    }
-    return mcpError(null, -32700, "parse error");
-  }
+  const body = requestContext.body;
+  if (!body) return mcpHttpError(null, 400, -32600, "request body is required");
   const method = body.method || "";
   const id = body.id ?? null;
 
@@ -5425,6 +5665,23 @@ export async function handleMcp(
 
   const catalogRevision = await mcpCatalogRevision();
 
+  if (requestContext.era === "modern" && method === "server/discover") {
+    return mcpResult(id, {
+      supportedVersions: [...MCP_SUPPORTED_PROTOCOL_VERSIONS],
+      capabilities: { tools: { listChanged: false } },
+      _meta: {
+        "io.modelcontextprotocol/serverInfo": { name: SERVICE_NAME, version: SERVICE_VERSION },
+        "ownmesh/catalog_revision": catalogRevision,
+        "ownmesh/tool_count": publishedTools.length,
+        "ownmesh/catalog_surface": catalogSurface,
+        "ownmesh/catalog_version": MCP_CATALOG_VERSION,
+        "ownmesh/catalog_compatibility": MCP_CATALOG_COMPATIBILITY,
+      },
+      instructions:
+        "OwnMesh exposes device capabilities; authenticated scopes and device-local policy remain the authority. Poll ownmesh_get_operation for asynchronous work.",
+    });
+  }
+
   // #158: a long-lived MCP session that was established against an older
   // catalog is stale the moment a deployment changes the published tools.
   // This transport has no server->client push (`listChanged` stays false
@@ -5436,7 +5693,12 @@ export async function handleMcp(
   // invents its own session id is never locked out.
   const presentedSession = req.headers.get("mcp-session-id");
   const presentedRevision = mcpSessionCatalogRevision(presentedSession);
-  if (method !== "initialize" && presentedRevision && presentedRevision !== catalogRevision) {
+  if (
+    requestContext.era === "legacy"
+    && method !== "initialize"
+    && presentedRevision
+    && presentedRevision !== catalogRevision
+  ) {
     return json(
       {
         error: "mcp_session_expired",
@@ -5449,6 +5711,9 @@ export async function handleMcp(
   }
 
   if (method === "initialize") {
+    // Preserve the legacy negotiation rule: answer with the supported legacy
+    // version even when an older initialization client proposed another one.
+    // Typed unsupported-version errors belong to the modern stateless adapter.
     const sessionId = mcpSessionId(catalogRevision);
     return mcpResult(
       id,
@@ -5465,7 +5730,10 @@ export async function handleMcp(
         serverInfo: { name: SERVICE_NAME, version: SERVICE_VERSION },
         _meta: {
           "ownmesh/catalog_revision": catalogRevision,
-          "ownmesh/tool_count": PUBLISHED_MCP_TOOLS.length,
+          "ownmesh/tool_count": publishedTools.length,
+          "ownmesh/catalog_surface": catalogSurface,
+          "ownmesh/catalog_version": MCP_CATALOG_VERSION,
+          "ownmesh/catalog_compatibility": MCP_CATALOG_COMPATIBILITY,
         },
         instructions:
           "OwnMesh exposes device capabilities over MCP for ChatGPT-centered PC control. " +
@@ -5489,7 +5757,7 @@ export async function handleMcp(
 
   if (method === "tools/list") {
     return mcpResult(id, {
-      tools: PUBLISHED_MCP_TOOLS.map((t) => ({
+      tools: publishedTools.map((t) => ({
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema,
@@ -5497,7 +5765,12 @@ export async function handleMcp(
       })),
       // #158: the revision covers exactly these bytes, so a client snapshot
       // and this deployment can be compared without diffing tool names.
-      _meta: { "ownmesh/catalog_revision": catalogRevision },
+      _meta: {
+        "ownmesh/catalog_revision": catalogRevision,
+        "ownmesh/catalog_surface": catalogSurface,
+        "ownmesh/catalog_version": MCP_CATALOG_VERSION,
+        "ownmesh/catalog_compatibility": MCP_CATALOG_COMPATIBILITY,
+      },
     });
   }
 
@@ -5517,6 +5790,12 @@ export async function handleMcp(
     const args = (params.arguments || {}) as Record<string, unknown>;
     const tool = findTool(name);
     if (!tool) return mcpError(id, -32601, `unknown tool: ${name}`);
+    if (catalogSurface !== "all" && toolSurface(tool) !== catalogSurface) {
+      return mcpError(id, -32601, `tool is not available on the ${catalogSurface} surface: ${name}`, {
+        code: "OWNMESH_E_TOOL_SURFACE",
+        surface: catalogSurface,
+      });
+    }
 
     if (!scopeOk(rec.scope, tool)) {
       return mcpError(id, -32003, "insufficient_scope", {

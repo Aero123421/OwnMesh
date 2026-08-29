@@ -81,6 +81,9 @@ class WorkerAnswersAreNotBlamedOnTheEdge(unittest.TestCase):
 
     def test_successful_discovery(self) -> None:
         self.assert_worker(200, JSON_CT, b'{"result":{"tools":[]}}')
+        large = b'{"result":{"tools":["' + (b"x" * 8192) + b'"]}}'
+        layer, detail = probe.classify(200, JSON_CT, large)
+        self.assertEqual((layer, detail), ("worker", "HTTP 200"))
 
     def test_worker_5xx_stays_the_worker(self) -> None:
         self.assert_worker(500, JSON_CT, b'{"error":"internal"}')
@@ -89,6 +92,59 @@ class WorkerAnswersAreNotBlamedOnTheEdge(unittest.TestCase):
         layer, detail = probe.classify(200, JSON_CT, b"{not json")
         self.assertEqual(layer, "worker")
         self.assertIn("malformed", detail)
+
+
+class MachineCategoriesAreStable(unittest.TestCase):
+    def test_transport_failures_are_distinguished(self) -> None:
+        cases = [
+            (b"Could not resolve host", "dns_failure"),
+            (b"certificate verify failed", "tls_failure"),
+            (b"operation timed out", "connect_timeout"),
+            (b"connection refused", "connect_failure"),
+        ]
+        for body, expected in cases:
+            self.assertEqual(probe.category_for(None, "transport", "no response", body), expected)
+
+    def test_worker_and_edge_categories_are_machine_readable(self) -> None:
+        self.assertEqual(probe.category_for(403, "edge", "Cloudflare Error 1010", b""), "edge_1010")
+        self.assertEqual(
+            probe.category_for(
+                401,
+                "worker",
+                "HTTP 401 with Bearer challenge (correct refresh contract)",
+                b"",
+            ),
+            "worker_auth_contract",
+        )
+        self.assertEqual(
+            probe.category_for(401, "worker", "HTTP 401 without challenge", b""),
+            "worker_protocol_4xx",
+        )
+        self.assertEqual(probe.category_for(422, "worker", "schema", b""), "worker_protocol_4xx")
+        self.assertEqual(probe.category_for(503, "worker", "failure", b""), "worker_5xx")
+
+
+    def test_anonymous_discovery_cannot_pass_as_the_invalid_bearer_contract(self) -> None:
+        def challenge(*_args: object, **_kwargs: object) -> tuple[int, dict[str, str], bytes]:
+            return (
+                401,
+                {"content-type": "application/json", "www-authenticate": "Bearer"},
+                b'{"error":"invalid_token"}',
+            )
+
+        original_urllib, original_curl = probe.request_urllib, probe.request_curl
+        probe.request_urllib = challenge
+        probe.request_curl = challenge
+        try:
+            results = probe.probe("https://cp.test")
+        finally:
+            probe.request_urllib = original_urllib
+            probe.request_curl = original_curl
+        invalid = next(result for result in results if result.name == "invalid bearer [urllib]")
+        anonymous = next(result for result in results if result.name.startswith("tools/list"))
+        self.assertTrue(invalid.ok)
+        self.assertFalse(anonymous.ok)
+        self.assertEqual(anonymous.category, "worker_protocol_4xx")
 
 
 class UnknownStaysUnknown(unittest.TestCase):

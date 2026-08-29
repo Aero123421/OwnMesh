@@ -28,6 +28,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, asdict
@@ -63,13 +64,16 @@ class ProbeResult:
     path: str
     status: int | None
     layer: str
+    category: str
     detail: str
+    attempts: int = 1
+    retry_exhausted: bool = False
     cf_ray: str | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return self.layer == "worker"
+        return self.layer == "worker" and self.category in {"ok", "worker_auth_contract"}
 
 
 def classify(status: int | None, headers: dict[str, str], body: bytes) -> tuple[str, str]:
@@ -116,11 +120,46 @@ def classify(status: int | None, headers: dict[str, str], body: bytes) -> tuple[
         return "worker", f"Worker {status}"
     if is_json:
         try:
-            json.loads(text)
-        except json.JSONDecodeError:
+            # Shape detection is bounded above, but protocol validation must
+            # parse the complete body: a normal tools/list is larger than the
+            # 4 KiB HTML-sniff prefix and truncating it creates a false outage.
+            json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return "worker", f"HTTP {status} with malformed JSON body"
         return "worker", f"HTTP {status}"
     return "unknown", f"HTTP {status} ({content_type or 'no content-type'})"
+
+
+def category_for(
+    status: int | None, layer: str, detail: str, body: bytes
+) -> str:
+    """Stable monitoring category, separate from human-readable detail."""
+    text = body[:4096].decode("utf-8", "replace").lower()
+    if status is None:
+        if any(value in text for value in ("timed out", "timeout")):
+            return "connect_timeout"
+        if any(value in text for value in ("name or service not known", "nodename nor servname", "could not resolve", "temporary failure in name resolution")):
+            return "dns_failure"
+        if any(value in text for value in ("certificate", "ssl", "tls", "wrong version number")):
+            return "tls_failure"
+        return "connect_failure"
+    if layer == "edge":
+        if "1010" in detail:
+            return "edge_1010"
+        if 520 <= status <= 527:
+            return "edge_origin_failure"
+        return "edge_denial"
+    if layer == "worker":
+        if status == 401 and "correct refresh contract" in detail:
+            return "worker_auth_contract"
+        if 400 <= status < 500:
+            return "worker_protocol_4xx"
+        if status >= 500:
+            return "worker_5xx"
+        if "malformed" in detail:
+            return "malformed_jsonrpc"
+        return "ok"
+    return "unknown_response"
 
 
 def request_urllib(
@@ -134,8 +173,10 @@ def request_urllib(
             return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
     except urllib.error.HTTPError as error:
         return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read()
-    except urllib.error.URLError:
-        return None, {}, b""
+    except urllib.error.URLError as error:
+        return None, {}, str(error.reason).encode("utf-8", "replace")
+    except TimeoutError as error:
+        return None, {}, str(error).encode("utf-8", "replace")
 
 
 def request_curl(
@@ -161,53 +202,89 @@ def request_curl(
     if proc.returncode != 0:
         return None, {}, proc.stderr
     raw = proc.stdout
-    head, _, payload = raw.partition(b"\r\n\r\n")
-    lines = head.decode("utf-8", "replace").splitlines()
-    if not lines:
+    # Proxies and interim responses can prepend more than one HTTP header
+    # block. Use the last consecutive block; parsing only the first can mistake
+    # `200 Connection established` for the Worker response.
+    parts = raw.split(b"\r\n\r\n")
+    index = 0
+    last_lines: list[str] = []
+    while index < len(parts) - 1:
+        lines = parts[index].decode("utf-8", "replace").splitlines()
+        if not lines or not lines[0].startswith("HTTP/"):
+            break
+        last_lines = lines
+        index += 1
+    payload = b"\r\n\r\n".join(parts[index:])
+    if not last_lines:
         return None, {}, payload
     try:
-        status = int(lines[0].split()[1])
+        status = int(last_lines[0].split()[1])
     except (IndexError, ValueError):
         return None, {}, payload
     parsed: dict[str, str] = {}
-    for line in lines[1:]:
+    for line in last_lines[1:]:
         key, _, value = line.partition(":")
         if value:
             parsed[key.strip().lower()] = value.strip()
     return status, parsed, payload
 
 
-def probe(origin: str) -> list[ProbeResult]:
+def probe(
+    origin: str,
+    *,
+    expected_catalog_revision: str | None = None,
+    max_attempts: int = 1,
+) -> list[ProbeResult]:
     origin = origin.rstrip("/")
     results: list[ProbeResult] = []
 
     def record(
         name: str, method: str, path: str, sender: Any, headers: dict[str, str], body: bytes | None
     ) -> None:
-        status, response_headers, payload = sender(
-            f"{origin}{path}", method=method, body=body, headers=headers
-        )
+        attempts = 0
+        while True:
+            attempts += 1
+            status, response_headers, payload = sender(
+                f"{origin}{path}", method=method, body=body, headers=headers
+            )
+            if status is not None or attempts >= max_attempts:
+                break
+            time.sleep(0.25 * attempts)
         layer, detail = classify(status, response_headers, payload)
+        category = category_for(status, layer, detail, payload)
+        if category == "worker_auth_contract" and not name.startswith("invalid bearer"):
+            category = "worker_protocol_4xx"
+            detail = "unexpected Bearer challenge on an anonymous machine endpoint"
         result = ProbeResult(
             name=name,
             method=method,
             path=path,
             status=status,
             layer=layer,
+            category=category,
             detail=detail,
+            attempts=attempts,
+            retry_exhausted=status is None and attempts >= max_attempts and max_attempts > 1,
             cf_ray=response_headers.get("cf-ray"),
         )
         if layer == "worker" and path == "/mcp" and method == "POST" and status == 200:
             try:
-                tools = json.loads(payload).get("result", {}).get("tools", [])
-                meta = json.loads(payload).get("result", {}).get("_meta", {})
+                decoded = json.loads(payload)
+                tools = decoded.get("result", {}).get("tools", [])
+                meta = decoded.get("result", {}).get("_meta", {})
                 result.notes.append(f"tools={len(tools)}")
                 revision = meta.get("ownmesh/catalog_revision")
-                if revision:
+                if isinstance(revision, str) and revision:
                     # #158: comparable against the client's loaded catalog.
                     result.notes.append(f"catalog_revision={revision}")
-            except (json.JSONDecodeError, AttributeError):
+                if expected_catalog_revision and revision != expected_catalog_revision:
+                    result.category = "catalog_digest_mismatch"
+                    result.detail = (
+                        "published catalog revision is missing or differs from expected release"
+                    )
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
                 result.layer = "worker"
+                result.category = "malformed_jsonrpc"
                 result.detail = "HTTP 200 with malformed JSON-RPC body"
         results.append(result)
 
@@ -247,11 +324,35 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("origin", help="Control plane origin, e.g. https://ownmesh.example.workers.dev")
     parser.add_argument("--json", action="store_true", help="emit machine-readable results")
+    parser.add_argument(
+        "--expected-catalog-revision",
+        help="classify a successful tools/list with a different digest as catalog_digest_mismatch",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=1,
+        choices=range(1, 4),
+        metavar="1..3",
+        help="bounded attempts for transport failures (default: 1)",
+    )
     args = parser.parse_args()
 
-    results = probe(args.origin)
+    results = probe(
+        args.origin,
+        expected_catalog_revision=args.expected_catalog_revision,
+        max_attempts=args.attempts,
+    )
     if args.json:
-        print(json.dumps([asdict(r) for r in results], indent=2))
+        categories: dict[str, int] = {}
+        for result in results:
+            categories[result.category] = categories.get(result.category, 0) + 1
+        print(json.dumps({
+            "schema_version": 1,
+            "ok": all(result.ok for result in results),
+            "categories": categories,
+            "results": [asdict(result) for result in results],
+        }, indent=2))
     else:
         width = max(len(r.name) for r in results)
         for r in results:
@@ -259,7 +360,7 @@ def main() -> int:
             mark = "ok  " if r.ok else "FAIL"
             notes = f"  {' '.join(r.notes)}" if r.notes else ""
             ray = f"  cf-ray={r.cf_ray}" if r.cf_ray and not r.ok else ""
-            print(f"{mark} {r.name:<{width}}  {status:>4}  {r.layer:<9} {r.detail}{notes}{ray}")
+            print(f"{mark} {r.name:<{width}}  {status:>4}  {r.layer:<9} {r.category:<24} {r.detail}{notes}{ray}")
 
     blocked = [r for r in results if r.layer == "edge"]
     failed = [r for r in results if not r.ok]

@@ -75,6 +75,8 @@ export type OAuthRequestSecurity = {
   principal?: AuthenticatedPrincipal;
   allowDevBypass?: boolean;
   allowDynamicRegistration?: boolean;
+  /** Test seam for bounded CIMD retrieval; production always uses global fetch. */
+  fetchClientMetadata?: typeof fetch;
 };
 
 // Request identity is the capability: only the Worker entrypoint that receives
@@ -186,6 +188,8 @@ export function oauthMetadata(
     code_challenge_methods_supported: ["S256"],
     // Public clients + PKCE only. client_secret_post is neither advertised nor accepted.
     token_endpoint_auth_methods_supported: ["none"],
+    client_id_metadata_document_supported: true,
+    authorization_response_iss_parameter_supported: true,
   };
   // Only advertise DCR when the operator explicitly enables it. Production
   // defaults keep registration_disabled so ChatGPT setup must use a pre-provisioned
@@ -229,9 +233,133 @@ export function isAllowedDcrRedirectUri(uri: string): boolean {
   } catch {
     return false;
   }
+  if (parsed.username || parsed.password || parsed.hash) return false;
   if (parsed.protocol === "https:") return true;
   if (parsed.protocol === "http:" && isLoopbackRedirectHost(parsed.hostname)) return true;
   return false;
+}
+
+const CIMD_MAX_BYTES = 16 * 1024;
+const CIMD_TIMEOUT_MS = 3_000;
+
+type ClientMetadataDocument = {
+  client_id: string;
+  client_name: string;
+  redirect_uris: string[];
+  token_endpoint_auth_method?: string;
+  grant_types?: string[];
+  response_types?: string[];
+};
+
+/** URL-form client identifiers allowed to trigger a bounded metadata fetch. */
+export function isAllowedCimdClientId(clientId: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(clientId);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.hash || url.pathname === "/") {
+    return false;
+  }
+  if (url.port && url.port !== "443") return false;
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (
+    isLoopbackRedirectHost(host)
+    || host.endsWith(".localhost")
+    || host.endsWith(".local")
+    || host === "0.0.0.0"
+    || host === "::"
+  ) return false;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.some((part) => part > 255)) return false;
+    const [a, b] = octets;
+    if (
+      a === 0 || a === 10 || a === 127 || a! >= 224
+      || (a === 100 && b! >= 64 && b! <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b! >= 16 && b! <= 31)
+      || (a === 192 && (b === 0 || b === 2 || b === 168))
+      || (a === 198 && (b === 18 || b === 19 || b === 51))
+      || (a === 203 && b === 0 && octets[2] === 113)
+    ) return false;
+  }
+  if (host.includes(":")) {
+    // Literal IPv6 client IDs are unnecessary for current interoperability;
+    // refusing all avoids loopback/link-local/ULA parser ambiguity and DNS
+    // rebinding through alternate textual forms.
+    return false;
+  }
+  return true;
+}
+
+async function readBoundedClientMetadata(response: Response): Promise<unknown> {
+  const declared = Number(response.headers.get("content-length") || "0");
+  if (Number.isFinite(declared) && declared > CIMD_MAX_BYTES) throw new Error("metadata_too_large");
+  if (!response.body) throw new Error("metadata_body_missing");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > CIMD_MAX_BYTES) throw new Error("metadata_too_large");
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+}
+
+async function fetchClientMetadataDocument(
+  clientId: string,
+  fetcher: typeof fetch,
+): Promise<ClientMetadataDocument> {
+  if (!isAllowedCimdClientId(clientId)) throw new Error("invalid_client_id_metadata_url");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CIMD_TIMEOUT_MS);
+  let raw: unknown;
+  try {
+    const response = await fetcher(clientId, {
+      method: "GET",
+      redirect: "error",
+      signal: controller.signal,
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok || !(response.headers.get("content-type") || "").toLowerCase().includes("application/json")) {
+      throw new Error("client_metadata_unavailable");
+    }
+    raw = await readBoundedClientMetadata(response);
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid_client_metadata");
+  const document = raw as Partial<ClientMetadataDocument>;
+  if (
+    document.client_id !== clientId
+    || typeof document.client_name !== "string"
+    || document.client_name.length < 1
+    || document.client_name.length > 256
+    || !Array.isArray(document.redirect_uris)
+    || document.redirect_uris.length < 1
+    || document.redirect_uris.length > 8
+    || document.redirect_uris.some((uri) => typeof uri !== "string" || !isAllowedDcrRedirectUri(uri))
+    || document.token_endpoint_auth_method !== "none"
+    || (document.response_types !== undefined && (!Array.isArray(document.response_types) || document.response_types.some((value) => value !== "code")))
+    || (document.grant_types !== undefined && (!Array.isArray(document.grant_types) || document.grant_types.some((value) => value !== "authorization_code" && value !== "refresh_token")))
+  ) throw new Error("invalid_client_metadata");
+  return document as ClientMetadataDocument;
 }
 
 /**
@@ -260,6 +388,7 @@ export async function handleRegister(
     token_endpoint_auth_method?: string;
     grant_types?: string[];
     response_types?: string[];
+    application_type?: "native" | "web";
   };
   try {
     body = await readRequestJsonLimited(req, 16 * 1024);
@@ -292,6 +421,15 @@ export async function handleRegister(
     if (typeof u !== "string" || !isAllowedDcrRedirectUri(u)) {
       return json({ error: "invalid_redirect_uri", uri: u }, { status: 400 });
     }
+  }
+  if (body.application_type !== undefined && body.application_type !== "native" && body.application_type !== "web") {
+    return json({ error: "invalid_client_metadata", error_description: "invalid application_type" }, { status: 400 });
+  }
+  if (body.application_type === "native" && redirectUris.some((uri) => new URL(uri).protocol !== "http:")) {
+    return json({ error: "invalid_client_metadata", error_description: "native clients require loopback http redirect_uris" }, { status: 400 });
+  }
+  if (body.application_type === "web" && redirectUris.some((uri) => new URL(uri).protocol !== "https:")) {
+    return json({ error: "invalid_client_metadata", error_description: "web clients require https redirect_uris" }, { status: 400 });
   }
 
   // ChatGPT discovers this endpoint from OAuth metadata before it has an
@@ -357,11 +495,10 @@ export async function handleRegister(
         "urn:ietf:params:oauth:grant-type:device_code",
       ],
       response_types: ["code"],
-      // CIMD (Client ID Metadata Document) policy: not required; DCR is supported.
-      client_id_metadata_document_supported: false,
+      client_id_metadata_document_supported: true,
       policy: {
         dynamic_client_registration: "supported",
-        client_id_metadata_document: "optional_future",
+        client_id_metadata_document: "preferred",
         redirect_uri_match: "exact",
       },
     },
@@ -375,7 +512,6 @@ export async function handleAuthorize(
   issuer: string,
   security: OAuthRequestSecurity = {},
 ): Promise<Response> {
-  void issuer;
   // The Worker records GET receipt before form parsing/authentication. Direct
   // internal callers have no forged-clock seam and fall back to handler entry.
   const requestReceivedAt = authorizeRequestReceipts.get(req) ?? Date.now();
@@ -413,9 +549,34 @@ export async function handleAuthorize(
       );
     }
 
+    // A consent transaction is a snapshot, but URL client metadata can change
+    // during the human review. Re-fetch before either redirect so removal or
+    // substitution after GET cannot turn a once-valid destination into an
+    // unreviewed callback. The transaction is already consumed fail-closed.
+    if (isAllowedCimdClientId(tx.client_id)) {
+      try {
+        const metadata = await fetchClientMetadataDocument(
+          tx.client_id,
+          security.fetchClientMetadata || fetch,
+        );
+        if (!metadata.redirect_uris.includes(tx.redirect_uri)) {
+          return json(
+            { error: "invalid_request", error_description: "redirect_uri no longer matches client metadata" },
+            { status: 400 },
+          );
+        }
+      } catch {
+        return json(
+          { error: "unauthorized_client", error_description: "client metadata revalidation failed" },
+          { status: 401 },
+        );
+      }
+    }
+
     if (decision !== "approve") {
       const dest = new URL(tx.redirect_uri);
       dest.searchParams.set("error", "access_denied");
+      dest.searchParams.set("iss", issuer);
       if (tx.state) dest.searchParams.set("state", tx.state);
       return Response.redirect(dest.toString(), 302);
     }
@@ -434,6 +595,7 @@ export async function handleAuthorize(
     });
     const dest = new URL(tx.redirect_uri);
     dest.searchParams.set("code", code);
+    dest.searchParams.set("iss", issuer);
     if (tx.state) dest.searchParams.set("state", tx.state);
     return Response.redirect(dest.toString(), 302);
   }
@@ -463,7 +625,7 @@ export async function handleAuthorize(
   await store.ensureBootstrap();
   let client = await store.getClient(clientId);
   // For a known client, reject an altered redirect before authentication.
-  if (client && !client.redirect_uris.includes(redirect)) {
+  if (client && !isAllowedCimdClientId(clientId) && !client.redirect_uris.includes(redirect)) {
     return json(
       {
         error: "invalid_request",
@@ -487,6 +649,42 @@ export async function handleAuthorize(
       { status: 403 },
     );
   }
+  // CIMD is fetched only after owner authentication and tenant validation, is
+  // bounded/no-redirect/no-credential, and must bind its exact URL as client_id.
+  // Re-fetch URL clients on authorization so metadata substitution or redirect
+  // removal cannot be hidden behind a stale D1 registration.
+  if (isAllowedCimdClientId(clientId)) {
+    let metadata: ClientMetadataDocument;
+    try {
+      metadata = await fetchClientMetadataDocument(
+        clientId,
+        security.fetchClientMetadata || fetch,
+      );
+    } catch {
+      return json(
+        { error: "unauthorized_client", error_description: "client metadata validation failed" },
+        { status: 401 },
+      );
+    }
+    if (!metadata.redirect_uris.includes(redirect)) {
+      return json(
+        { error: "invalid_request", error_description: "redirect_uri does not exactly match client metadata" },
+        { status: 400 },
+      );
+    }
+    if (client && client.tenant_id !== authenticated.tenant_id) {
+      return json({ error: "unauthorized_client" }, { status: 403 });
+    }
+    client = {
+      client_id: clientId,
+      tenant_id: authenticated.tenant_id,
+      client_name: metadata.client_name,
+      redirect_uris: metadata.redirect_uris,
+      created_at: client?.created_at || nowIso(),
+    };
+    await store.putClient(client);
+  }
+
   // ChatGPT provides a per-connector callback slug. A signed-in owner may bind
   // the matching deterministic client id on first use; anonymous auto-registration
   // remains impossible and every later redirect still requires exact match.
@@ -535,6 +733,7 @@ export async function handleAuthorize(
     });
     const dest = new URL(redirect);
     dest.searchParams.set("code", code);
+    dest.searchParams.set("iss", issuer);
     if (state) dest.searchParams.set("state", state);
     return Response.redirect(dest.toString(), 302);
   }

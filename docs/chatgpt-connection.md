@@ -14,17 +14,23 @@ ChatGPT (Personal Plugin / custom MCP app)
 
 | Topic | Source |
 |---|---|
-| MCP Streamable HTTP transport | [modelcontextprotocol.io — Transports (2025-03-26)](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports) |
+| MCP modern Streamable HTTP | [MCP 2026-07-28 Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) |
+| MCP legacy compatibility | [MCP 2025-03-26 transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports) |
+| Published ChatGPT metadata snapshots | [OpenAI plugin submission](https://developers.openai.com/plugins/deploy/submission#how-published-mcp-metadata-versions-work) |
 | ChatGPT developer mode / MCP apps | [OpenAI Help: Developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt-beta) |
 | OwnMesh tools / envelopes | `OWNMESH_SPECIFICATION.ja.md` §14 |
 | Deploy Worker | [deploy-cloudflare.md](./deploy-cloudflare.md) |
 
 Streamable HTTP notes that matter for OwnMesh:
 
-- Single MCP endpoint: `POST`/`GET`/`DELETE` on `/mcp`
-- JSON-RPC body on `POST`; optional SSE when `Accept` includes `text/event-stream`
-- Session id may be returned as `Mcp-Session-Id` on `initialize`
-- OwnMesh uses OAuth bearer tokens on tool calls (`Authorization: Bearer …`)
+- One registry/authorization path serves two protocol adapters (ADR 0017).
+- Legacy `2025-03-26` uses `initialize` and may receive `Mcp-Session-Id`.
+- Modern `2026-07-28` is stateless: each POST carries required `_meta`,
+  `MCP-Protocol-Version`, `Mcp-Method`, and applicable `Mcp-Name`; it uses
+  `server/discover`, not `initialize`, and receives no protocol session id.
+- Version/header errors are typed and modern discovery/list results include
+  `resultType`, `ttlMs`, and `cacheScope`.
+- OwnMesh uses OAuth bearer tokens on tool calls (`Authorization: Bearer …`).
 
 ChatGPT notes that matter:
 
@@ -257,28 +263,31 @@ curl -s https://<worker>/mcp | jq '{tools, catalog_revision, service_version}'
 curl -s https://<worker>/health | jq .mcp_catalog
 ```
 
-`catalog_revision` is a SHA-256 over exactly the bytes `tools/list` returns, so
-it changes whenever a tool name, description, annotation, or `inputSchema`
-changes — including changes that do not move the release version. It is also
-returned in `initialize._meta["ownmesh/catalog_revision"]` and on every
-`tools/list` response.
+`catalog_revision` is a SHA-256 over exactly the default published
+`tools/list` bytes, so it changes whenever a tool name, description,
+annotation, or `inputSchema` changes. `catalog_version`, its 1.x compatibility
+range, selected surface, and digest are returned in discovery metadata.
 
-Recovery, in order:
+First determine which OpenAI lifecycle owns the metadata:
 
 1. **Confirm the deployment is current.** If `service_version` is behind the
    release you installed, the deploy did not take effect. `pnpm run
-   deploy:guided` now refuses to report success in that case.
-2. **Start a new chat.** The Worker binds the catalog revision into the MCP
-   session id and answers `HTTP 404` to any request carrying a session minted
-   under a different revision, which is MCP's signal to re-`initialize`. A new
-   conversation therefore picks up the current catalog without touching the
-   connector.
-3. Only if a fresh session still shows the old set, disconnect and reconnect the
-   connector.
+   deploy:guided` refuses to report success in that case.
+2. **Developer-mode MCP connection:** open the connection in ChatGPT Plugins,
+   select **Refresh**, confirm the metadata, then start a new conversation.
+3. **Published plugin:** OpenAI uses the reviewed metadata snapshot. In the
+   publisher portal select **Scan Tools**, submit a new plugin version for
+   review, and publish the approved version. A Worker deploy, a new chat, or an
+   MCP 404 cannot rewrite that approved snapshot.
+4. Legacy sessions are still catalog-revision fenced with HTTP 404 so clients
+   that actually rediscover on re-initialize converge. Modern clients use the
+   list TTL and request-local metadata. Neither mechanism substitutes for the
+   published-plugin workflow above.
 
-You never need to guess which individual tools are stale: if
-`catalog_revision` matches between the deployment and a freshly initialized
-session, the catalogs are identical.
+Snapshot clients remain safe during the catalog 1.x window: old names and
+required argument semantics stay callable even when deprecated aliases are
+hidden from the newest list. CI compares every release to
+`release/mcp-catalog-baseline-v1.json` and blocks unversioned breaking changes.
 
 ---
 

@@ -6,6 +6,11 @@ import test from "node:test";
 import {
   MCP_TOOLS,
   MCP_PROTOCOL_VERSION,
+  MCP_MODERN_PROTOCOL_VERSION,
+  MCP_SUPPORTED_PROTOCOL_VERSIONS,
+  MCP_CATALOG_VERSION,
+  MCP_CATALOG_COMPATIBILITY,
+  mcpToolsForSurface,
   MCP_GET_OPERATION_WAIT_SATURATED_WARNING,
   MCP_COMMAND_TIMEOUT_DETACH_HINT,
   MCP_COMMAND_TIMEOUT_DETACH_WARNING,
@@ -61,6 +66,38 @@ function rpc(
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+}
+
+function modernRpc(
+  method: string,
+  params: Record<string, unknown> = {},
+  token?: string,
+  overrides: Record<string, string> = {},
+): Request {
+  const fullParams = {
+    ...params,
+    _meta: {
+      "io.modelcontextprotocol/protocolVersion": MCP_MODERN_PROTOCOL_VERSION,
+      "io.modelcontextprotocol/clientInfo": { name: "ownmesh-test", version: "1" },
+      "io.modelcontextprotocol/clientCapabilities": {},
+    },
+  };
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+    "mcp-protocol-version": MCP_MODERN_PROTOCOL_VERSION,
+    "mcp-method": method,
+    ...overrides,
+  };
+  if (typeof params.name === "string" && method === "tools/call") {
+    headers["mcp-name"] = params.name;
+  }
+  if (token) headers.authorization = `Bearer ${token}`;
+  return new Request("https://cp.test/mcp", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: "modern-1", method, params: fullParams }),
   });
 }
 
@@ -123,6 +160,200 @@ async function callTool(
 // ---------------------------------------------------------------------------
 // Catalog / annotations
 // ---------------------------------------------------------------------------
+
+test("modern MCP is stateless, discoverable, cache-hinted, and shares the legacy registry", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const discover = await handleMcp(
+    modernRpc("server/discover"),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(discover.status, 200);
+  assert.equal(discover.headers.has("mcp-session-id"), false);
+  const discovered = (await discover.json()) as {
+    result: {
+      resultType: string;
+      supportedVersions: string[];
+      capabilities: { tools: unknown };
+      ttlMs: number;
+      cacheScope: string;
+      _meta: Record<string, unknown>;
+    };
+  };
+  assert.equal(discovered.result.resultType, "complete");
+  assert.deepEqual(discovered.result.supportedVersions, [...MCP_SUPPORTED_PROTOCOL_VERSIONS]);
+  assert.equal(discovered.result.ttlMs, 300_000);
+  assert.equal(discovered.result.cacheScope, "public");
+  assert.ok(discovered.result._meta["io.modelcontextprotocol/serverInfo"]);
+
+  const listed = await handleMcp(
+    modernRpc("tools/list"),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  const body = (await listed.json()) as {
+    result: { resultType: string; tools: unknown[]; ttlMs: number; cacheScope: string };
+  };
+  assert.equal(body.result.resultType, "complete");
+  assert.equal(body.result.tools.length, PUBLISHED_MCP_TOOLS.length);
+  assert.equal(body.result.ttlMs, 300_000);
+  assert.equal(body.result.cacheScope, "public");
+  assert.equal(listed.headers.has("mcp-session-id"), false);
+});
+
+test("modern MCP rejects missing, mismatched, and unsupported request metadata with typed errors", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const missingMethod = await handleMcp(
+    modernRpc("tools/list", {}, undefined, { "mcp-method": "" }),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(missingMethod.status, 400);
+  assert.equal(((await missingMethod.json()) as { error: { code: number } }).error.code, -32020);
+
+  const unsupported = modernRpc("tools/list", {}, undefined, {
+    "mcp-protocol-version": "2099-01-01",
+  });
+  const unsupportedBody = JSON.parse(await unsupported.clone().text()) as {
+    params: { _meta: Record<string, unknown> };
+  };
+  unsupportedBody.params._meta["io.modelcontextprotocol/protocolVersion"] = "2099-01-01";
+  const unsupportedRequest = new Request(unsupported.url, {
+    method: "POST",
+    headers: unsupported.headers,
+    body: JSON.stringify(unsupportedBody),
+  });
+  const rejected = await handleMcp(
+    unsupportedRequest,
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(rejected.status, 400);
+  const rejectedBody = (await rejected.json()) as {
+    error: { code: number; data: { supported: string[]; requested: string } };
+  };
+  assert.equal(rejectedBody.error.code, -32022);
+  assert.deepEqual(rejectedBody.error.data.supported, [...MCP_SUPPORTED_PROTOCOL_VERSIONS]);
+  assert.equal(rejectedBody.error.data.requested, "2099-01-01");
+
+  const metaOnlyUnknown = new Request("https://cp.test/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", "mcp-method": "tools/list" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+      params: {
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+  const metaOnlyRejected = await handleMcp(metaOnlyUnknown, store, new URL("https://cp.test/mcp"));
+  assert.equal(metaOnlyRejected.status, 400);
+  assert.equal(((await metaOnlyRejected.json()) as { error: { code: number } }).error.code, -32022);
+
+  const missingVersion = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", "mcp-method": "tools/list" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/list",
+        params: {
+          _meta: { "io.modelcontextprotocol/clientCapabilities": {} },
+        },
+      }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(missingVersion.status, 400);
+  assert.equal(((await missingVersion.json()) as { error: { code: number } }).error.code, -32020);
+
+  const legacyMalformed = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not-json",
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(legacyMalformed.status, 200);
+  assert.equal(((await legacyMalformed.json()) as { error: { code: number } }).error.code, -32700);
+
+  const modernGet = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      headers: { "mcp-protocol-version": MCP_MODERN_PROTOCOL_VERSION },
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(modernGet.status, 405);
+});
+
+test("catalog surfaces are smaller, disjoint, and enforced at invocation", async () => {
+  const allNames = new Set(PUBLISHED_MCP_TOOLS.map((tool) => tool.name));
+  const core = mcpToolsForSurface("core");
+  const admin = mcpToolsForSurface("admin");
+  const agents = mcpToolsForSurface("agents");
+  assert.ok(core.length > admin.length);
+  assert.ok(core.length < PUBLISHED_MCP_TOOLS.length);
+  assert.equal(core.length + admin.length + agents.length, PUBLISHED_MCP_TOOLS.length);
+  assert.equal(new Set([...core, ...admin, ...agents].map((tool) => tool.name)).size, allNames.size);
+
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const listed = await handleMcp(
+    modernRpc("tools/list"),
+    store,
+    new URL("https://cp.test/mcp?surface=admin"),
+  );
+  const listedBody = (await listed.json()) as {
+    result: { tools: { name: string }[]; _meta: Record<string, unknown> };
+  };
+  assert.deepEqual(listedBody.result.tools.map((tool) => tool.name), admin.map((tool) => tool.name));
+  assert.equal(listedBody.result._meta["ownmesh/catalog_surface"], "admin");
+  assert.equal(listedBody.result._meta["ownmesh/catalog_version"], MCP_CATALOG_VERSION);
+  assert.deepEqual(
+    listedBody.result._meta["ownmesh/catalog_compatibility"],
+    MCP_CATALOG_COMPATIBILITY,
+  );
+
+  const authorized = await authed();
+  const blocked = await handleMcp(
+    modernRpc("tools/call", { name: "ownmesh_list_devices", arguments: {} }, authorized.token),
+    authorized.store,
+    new URL("https://cp.test/mcp?surface=admin"),
+  );
+  assert.equal(blocked.status, 404);
+  const blockedBody = (await blocked.json()) as { error: { code: number; data: { code: string } } };
+  assert.equal(blockedBody.error.code, -32601);
+  assert.equal(blockedBody.error.data.code, "OWNMESH_E_TOOL_SURFACE");
+});
+
+test("modern tools/call returns resultType and no protocol session", async () => {
+  const { store, token } = await authed();
+  const response = await handleMcp(
+    modernRpc("tools/call", { name: "ownmesh_list_devices", arguments: {} }, token),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.has("mcp-session-id"), false);
+  const body = (await response.json()) as {
+    result: { resultType: string; structuredContent: { status: string }; _meta: Record<string, unknown> };
+  };
+  assert.equal(body.result.resultType, "complete");
+  assert.equal(body.result.structuredContent.status, "completed");
+  assert.ok(body.result._meta["io.modelcontextprotocol/serverInfo"]);
+});
 
 test("MCP tools/call without bearer is HTTP 401 with WWW-Authenticate", async () => {
   const store = new MemoryStore();
@@ -788,6 +1019,22 @@ test("official profile catalog is 9 entries matching spec ids", () => {
   );
 });
 
+test("legacy initialize preserves version negotiation for older clients", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const response = await handleMcp(
+    rpc("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "older-client", version: "1" },
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(response.status, 200);
+  assert.equal(((await response.json()) as { result: { protocolVersion: string } }).result.protocolVersion, MCP_PROTOCOL_VERSION);
+});
+
 test("initialize advertises Streamable HTTP protocol version", async () => {
   const store = new MemoryStore();
   const res = await handleMcp(
@@ -1286,6 +1533,29 @@ test("system diagnosis folds device-local journal and discovery health into over
   );
   assert.equal(pressured.overall, "op_journal_pressure");
   assert.equal(pressured.recommendation, "run_local_doctor");
+
+  const orphaned = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.25", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: {
+        transition: { status: "ok" },
+        op_journal: { status: "warn", entries: 1, in_progress: 1, recoverable_orphaned: 1 },
+      },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(orphaned.overall, "op_journal_recoverable_orphaned");
+  assert.equal(orphaned.recommendation, "run_local_doctor");
+  assert.equal(
+    ((orphaned.journals as Record<string, unknown>).op_journal as Record<string, unknown>)
+      .recoverable_orphaned,
+    1,
+  );
 
   const degraded = normalizeSystemDiagnosis(
     {

@@ -5,6 +5,7 @@ import {
   handleAuthorize,
   handleRegister,
   handleToken,
+  isAllowedCimdClientId,
   oauthMetadata,
 } from "./oauth.ts";
 import { MemoryStore } from "./store.ts";
@@ -581,11 +582,171 @@ test("token endpoint rejects token_endpoint_auth_method=client_secret_post", asy
   assert.equal(body.error, "invalid_client");
 });
 
+test("CIMD registration is bounded, exact, and rejects metadata substitution", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const clientId = "https://client.example/oauth/ownmesh.json";
+  const redirect = "https://client.example/oauth/callback";
+  let fetches = 0;
+  const fetchClientMetadata = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    fetches += 1;
+    assert.equal(String(input), clientId);
+    assert.equal(init?.redirect, "error");
+    const headers = new Headers(init?.headers);
+    assert.equal(headers.has("authorization"), false);
+    return new Response(JSON.stringify({
+      client_id: clientId,
+      client_name: "CIMD test client",
+      redirect_uris: [redirect],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    }), { headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  const request = new Request(
+    `https://cp.test/oauth/authorize?${new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: redirect,
+      scope: "ownmesh.read",
+      code_challenge: "A".repeat(43),
+      code_challenge_method: "S256",
+    })}`,
+  );
+  const response = await handleAuthorize(request, store, "https://cp.test", {
+    principal: { id: "prin_owner", tenant_id: "ten_default" },
+    fetchClientMetadata,
+  });
+  assert.equal(response.status, 200);
+  assert.equal(fetches, 1);
+  const consent = await response.text();
+  const transactionId = /name="transaction_id" value="([^"]+)"/.exec(consent)?.[1];
+  const csrfToken = /name="csrf_token" value="([^"]+)"/.exec(consent)?.[1];
+  assert.ok(transactionId && csrfToken);
+  const changedDuringConsent = await handleAuthorize(
+    new Request(`https://cp.test/oauth/authorize?${new URLSearchParams({
+      decision: "approve",
+      transaction_id: transactionId,
+      csrf_token: csrfToken,
+    })}`, { method: "POST" }),
+    store,
+    "https://cp.test",
+    {
+      principal: { id: "prin_owner", tenant_id: "ten_default" },
+      fetchClientMetadata: (async () => new Response(JSON.stringify({
+        client_id: clientId,
+        client_name: "changed during consent",
+        redirect_uris: ["https://client.example/oauth/different-callback"],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code"],
+        response_types: ["code"],
+      }), { headers: { "content-type": "application/json" } })) as typeof fetch,
+    },
+  );
+  assert.equal(changedDuringConsent.status, 400);
+  assert.match(
+    ((await changedDuringConsent.json()) as { error_description?: string }).error_description || "",
+    /no longer matches/,
+  );
+
+  const stored = await store.getClient(clientId);
+  assert.equal(stored?.client_name, "CIMD test client");
+  assert.deepEqual(stored?.redirect_uris, [redirect]);
+
+  const substituted = await handleAuthorize(request, store, "https://cp.test", {
+    principal: { id: "prin_owner", tenant_id: "ten_default" },
+    fetchClientMetadata: (async () => new Response(JSON.stringify({
+      client_id: "https://attacker.example/client.json",
+      client_name: "substitute",
+      redirect_uris: [redirect],
+    }), { headers: { "content-type": "application/json" } })) as typeof fetch,
+  });
+  assert.equal(substituted.status, 401);
+  assert.equal(((await substituted.json()) as { error: string }).error, "unauthorized_client");
+});
+
+test("CIMD URL policy rejects local/private identifiers and OAuth responses include RFC 9207 iss", async () => {
+  for (const value of [
+    "http://client.example/client.json",
+    "https://localhost/client.json",
+    "https://127.0.0.1/client.json",
+    "https://10.0.0.1/client.json",
+    "https://169.254.169.254/client.json",
+    "https://100.64.0.1/client.json",
+    "https://192.0.2.1/client.json",
+    "https://198.51.100.1/client.json",
+    "https://203.0.113.1/client.json",
+    "https://[::1]/client.json",
+    "https://client.example/",
+  ]) assert.equal(isAllowedCimdClientId(value), false, value);
+  assert.equal(isAllowedCimdClientId("https://client.example/oauth/client.json"), true);
+
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: "client_iss",
+    tenant_id: "ten_default",
+    client_name: "issuer test",
+    redirect_uris: ["https://client.example/callback"],
+    created_at: new Date().toISOString(),
+  });
+  const response = await handleAuthorize(
+    new Request(`https://cp.test/oauth/authorize?${new URLSearchParams({
+      response_type: "code",
+      client_id: "client_iss",
+      redirect_uri: "https://client.example/callback",
+      scope: "ownmesh.read",
+      code_challenge: "A".repeat(43),
+      code_challenge_method: "S256",
+      auto: "1",
+    })}`),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" }, allowDevBypass: true },
+  );
+  assert.equal(response.status, 302);
+  const location = new URL(response.headers.get("location")!);
+  assert.equal(location.searchParams.get("iss"), "https://cp.test");
+});
+
+test("DCR application_type is validated without breaking legacy registrations", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const token = await store.issueTokens("client_admin", "prin_dev", "ownmesh.device");
+  const register = (body: Record<string, unknown>) => handleRegister(
+    new Request("https://cp.test/oauth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token.access_token}` },
+      body: JSON.stringify(body),
+    }),
+    store,
+    { allowDynamicRegistration: true },
+  );
+  assert.equal((await register({
+    client_name: "native mismatch",
+    redirect_uris: ["https://client.example/callback"],
+    application_type: "native",
+  })).status, 400);
+  assert.equal((await register({
+    client_name: "web mismatch",
+    redirect_uris: ["http://127.0.0.1/callback"],
+    application_type: "web",
+  })).status, 400);
+  assert.equal((await register({
+    client_name: "legacy public",
+    redirect_uris: ["https://client.example/callback"],
+  })).status, 201);
+});
+
 test("AS metadata advertises only token_endpoint_auth_method none", () => {
   const meta = oauthMetadata("https://cp.test") as {
     token_endpoint_auth_methods_supported: string[];
+    client_id_metadata_document_supported: boolean;
+    authorization_response_iss_parameter_supported: boolean;
   };
   assert.deepEqual(meta.token_endpoint_auth_methods_supported, ["none"]);
+  assert.equal(meta.client_id_metadata_document_supported, true);
+  assert.equal(meta.authorization_response_iss_parameter_supported, true);
   assert.equal(meta.token_endpoint_auth_methods_supported.length, 1);
   for (const method of [
     "client_secret_post",

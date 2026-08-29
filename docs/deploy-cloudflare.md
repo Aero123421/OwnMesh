@@ -233,11 +233,19 @@ python scripts/probe_machine_endpoints.py https://<worker>.workers.dev
 
 The probe sends the same anonymous `tools/list` from two HTTP stacks (Python
 `urllib` and curl) under several User-Agents, plus one deliberately invalid
-bearer, and reports **which layer answered**. It sends no credentials.
+bearer, and reports **which layer answered**. It sends no credentials. `--json`
+returns a versioned monitoring object with stable categories for DNS, TLS,
+connect timeout/retry exhaustion, edge 1010/denial/origin failure, Worker auth
+contract, Worker protocol 4xx/5xx, malformed JSON-RPC, and catalog mismatch.
+Pass `--expected-catalog-revision <digest>` to compare a release receipt with
+the deployment; `--attempts 1..3` bounds transport retries.
 
-- `worker` — the request reached OwnMesh. `HTTP 401` with a Bearer challenge on
-  the invalid-bearer probe is the correct, recoverable answer.
-- `edge` — Cloudflare answered instead. This is the misconfiguration below.
+- `worker` — the request reached OwnMesh. `worker_auth_contract` on the
+  invalid-bearer probe is the correct, recoverable answer.
+- `edge` — Cloudflare answered instead (`edge_1010`, `edge_denial`, or
+  `edge_origin_failure`). This is the misconfiguration below.
+- `transport` — no HTTP response; the category distinguishes DNS/TLS/connect
+  timeout and records whether bounded retries were exhausted.
 
 A ready-made manual check for the same thing:
 
