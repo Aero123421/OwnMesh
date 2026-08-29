@@ -470,6 +470,13 @@ def main() -> int:
                                 service=f"dev.ownmesh.loopback-test.e9.source.{marker}", password=password)
         destination_env = daemon_env(root=destination_root, issuer=issuer, device_id=device_destination, credential=credential_destination,
                                      service=f"dev.ownmesh.loopback-test.e9.destination.{marker}", password=password)
+        artifact_dir_raw = os.environ.get("OWNMESH_E2E_ARTIFACT_DIR")
+        artifact_dir = Path(artifact_dir_raw).resolve() if artifact_dir_raw else None
+        if artifact_dir and not (artifact_dir / "ownmeshd").is_file():
+            raise RuntimeError(f"release artifact directory lacks ownmeshd: {artifact_dir}")
+        if artifact_dir:
+            source_env["PATH"] = str(artifact_dir) + os.pathsep + source_env.get("PATH", "")
+            destination_env["PATH"] = str(artifact_dir) + os.pathsep + destination_env.get("PATH", "")
         try:
             run_checked([cargo, "build", "-p", "ownmeshd", "--bin", "ownmeshd", "--example", "e1_loopback_provision"], cwd=ROOT, env=source_env)
             source_key = run_checked([cargo, "run", "-q", "-p", "ownmeshd", "--example", "e1_loopback_provision", "--", "provision"], cwd=ROOT, env=source_env, capture=True)
@@ -502,7 +509,7 @@ def main() -> int:
             log = (temp / "wrangler.log").open("wb")
             wrangler_process = subprocess.Popen(wrangler(corepack, "dev", "--local", "--ip", "127.0.0.1", "--port", str(port), "--persist-to", str(persist), "--var", f"OAUTH_ISSUER:{issuer}", "--var", "OWNMESH_DEV_AUTH_BYPASS:true", "--var", f"SESSION_SECRET:{session_secret}", "--var", f"OWNER_TOKEN_HASH:{owner_token_hash}", "--var", f"OWNMESH_ALLOWED_ORIGINS:{issuer}", "--log-level", "info", "--show-interactive-dev-session", "false"), cwd=CONTROL_PLANE, env=source_env, stdout=log, stderr=subprocess.STDOUT)
             log.close(); wait_for_health(issuer, wrangler_process)
-            binary = ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
+            binary = artifact_dir / "ownmeshd" if artifact_dir else ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
             source_log, destination_log = temp / "source.log", temp / "destination.log"
             source_process = start_daemon(binary, source_env, source_log); destination_process = start_daemon(binary, destination_env, destination_log)
             wait_agent(source_process, source_log, source_root / "state"); wait_agent(destination_process, destination_log, destination_root / "state")

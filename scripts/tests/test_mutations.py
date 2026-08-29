@@ -244,8 +244,8 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_publish_always_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "needs: [ci-gate, security-gate, build, distribution-metadata]",
-                "needs: [ci-gate, security-gate, build, distribution-metadata]\n    if: always()",
+                "needs: [ci-gate, security-gate, build, release-candidate-e2e, distribution-metadata]",
+                "needs: [ci-gate, security-gate, build, release-candidate-e2e, distribution-metadata]\n    if: always()",
                 1,
             )
 

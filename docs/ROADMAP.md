@@ -14,7 +14,10 @@ Two documents bound this one and win where they disagree:
   the `W-*` evidence waivers.
 
 Nothing here is a dated commitment. Items are ordered by what would most improve
-the product, not by effort.
+the product, not by effort. Post-baseline stability/MCP work and its explicit
+partial boundaries are recorded in
+[`STABILITY_MCP_HARDENING.md`](./STABILITY_MCP_HARDENING.md); that document is
+not a shipped claim until its branch passes release gates and is tagged.
 
 ## Now — the gap between what the presets promise and what they do
 
@@ -46,6 +49,11 @@ These are the `W-*` waivers. The code exists; the receipt does not.
 
 ## Then — depth the specification asks for and the product does not yet have
 
+- **Finish per-session runtime lock decomposition.** Non-elevated command waits
+  are already split, and the active hardening change applies the same model to
+  elevated broker waits. Session supervisor RPCs are bounded but still run
+  through the runtime mutex; move transition ownership to session-scoped state
+  without weakening controller-epoch fencing or crash recovery.
 - **Bounded module decomposition.** The control-plane store/router and daemon
   runtime have grown into large authority-bearing modules. Refactor them only
   as behavior-preserving slices (OAuth/device state, MCP routing, transfer,

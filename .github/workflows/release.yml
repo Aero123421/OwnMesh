@@ -162,9 +162,62 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  release-candidate-e2e:
+    name: Exact packaged Linux artifact against local workerd
+    needs: [ci-gate, security-gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.92 toolchain for isolated enrollment fixture
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-candidate-e2e
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: Enable pinned pnpm and install Worker dependencies
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+          pnpm install --frozen-lockfile
+      - name: Download the packaged Linux x64 release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-linux-x64
+          path: release-candidate
+      - name: Verify and extract the exact archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-candidate
+          sha256sum --check --strict ownmesh-linux-x64.tar.gz.sha256
+          mkdir extracted
+          tar -xzf ownmesh-linux-x64.tar.gz -C extracted
+          for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do
+            test -x "extracted/${binary}"
+          done
+          ./extracted/ownmesh --version
+          ./extracted/ownmeshd --version
+      - name: Public MCP, device, filesystem, command, session, restart and recovery gate
+        env:
+          OWNMESH_E2E_ARTIFACT_DIR: ${{ github.workspace }}/release-candidate/extracted
+        run: python scripts/tests/run_e2e_loopback_tests.py
+      - name: Two-Agent resumable transfer gate
+        env:
+          OWNMESH_E2E_ARTIFACT_DIR: ${{ github.workspace }}/release-candidate/extracted
+        run: python scripts/tests/test_e9_workerd_transfer.py
+
   distribution-metadata:
     name: Installers and Homebrew formula
-    needs: [ci-gate, security-gate, build]
+    needs: [ci-gate, security-gate, build, release-candidate-e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -206,7 +259,7 @@ jobs:
 
   publish:
     name: Publish gated release
-    needs: [ci-gate, security-gate, build, distribution-metadata]
+    needs: [ci-gate, security-gate, build, release-candidate-e2e, distribution-metadata]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -308,11 +361,31 @@ jobs:
             ownmesh-installer.sh \
             ownmesh-installer.ps1 \
             ownmesh.rb \
+            minisign.pub \
+            ownmesh-*.sha256 \
             ownmesh-release-meta.json \
             sbom-rust.cdx.json \
             sbom-control-plane.cdx.json \
             > SHA256SUMS
           test -s SHA256SUMS
+      - name: Generate machine-readable release evidence
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/generate_release_evidence.py \
+            --version "${VERSION#v}" \
+            --commit "${COMMIT}" \
+            --checksums dist/SHA256SUMS \
+            --catalog-current release/mcp-catalog-current.json \
+            --catalog-baseline release/mcp-catalog-baseline-v1.json \
+            --workflow-url "${WORKFLOW_URL}" \
+            --output dist/ownmesh-release-evidence.json
+          test -s dist/ownmesh-release-evidence.json
+          grep -q '"completeness_claim": false' dist/ownmesh-release-evidence.json
+          (cd dist && sha256sum ownmesh-release-evidence.json >> SHA256SUMS)
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
@@ -322,6 +395,7 @@ jobs:
             dist/ownmesh-installer.*
             dist/ownmesh.rb
             dist/ownmesh-release-meta.json
+            dist/ownmesh-release-evidence.json
             dist/sbom-*.cdx.json
             dist/SHA256SUMS
       - name: Require minisign key material (no degraded fallback)
@@ -402,6 +476,7 @@ jobs:
             dist/ownmesh.rb
             dist/minisign.pub
             dist/ownmesh-release-meta.json
+            dist/ownmesh-release-evidence.json
             dist/sbom-*.cdx.json
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig

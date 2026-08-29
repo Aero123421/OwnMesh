@@ -1,8 +1,8 @@
 # OwnMesh 1.x Definition of Done — release-quality audit
 
-**Release train:** v1.2.16
+**Release train:** v1.2.24 baseline
 
-**Audit date:** 2026-08-19
+**Audit date:** 2026-08-28
 
 **Authority:** `OWNMESH_SPECIFICATION.ja.md` §33 and the shipped-surface registry
 
@@ -11,11 +11,19 @@
 
 ## Conclusion
 
-OwnMesh v1.2.16 is a stable release for the product surface admitted by the
+OwnMesh v1.2.24 is a stable release for the product surface admitted by the
 machine-checked registry. The Rust unsupported registries and the manifest both
 contain zero intentionally unimplemented CLI surfaces. Parser acceptance alone
 does not count: the admitted commands have fail-closed handlers and the relevant
-local or authenticated control-plane route.
+local or authenticated control-plane route. `completeness_claim` is currently
+**false**, because the nine-profile live receipt waiver is intentionally still
+open; fixture coverage is not live-provider evidence.
+
+Post-v1.2.24 hardening under review is tracked separately in
+[`STABILITY_MCP_HARDENING.md`](./STABILITY_MCP_HARDENING.md) and is not a
+released claim. Future release workflows generate
+`ownmesh-release-evidence.json` from exact artifact hashes and gate results,
+with completeness false while any `W-*` blocker remains.
 
 This scoped completeness claim is deliberately narrower than §33 of the full
 target specification. Native code signing/notarization, some cross-platform
@@ -65,9 +73,10 @@ v1.2.16 stable product surface.
 - Formal publication requires the enrolled minisign key; unsigned degraded
   release is forbidden. Provenance is attested by GitHub.
 - `scripts/check_release_quality.py` checks the publish graph, fail-closed
-  workflow patterns, toolchain/version alignment, release-note selection, and
-  the registry-backed surface manifest. For v1.2.16 the unsupported counts are
-  zero and `completeness_claim` is true.
+  workflow patterns, exact-artifact E2E dependency, toolchain/version alignment,
+  release-note selection, and the registry-backed surface manifest. For the
+  v1.2.24 baseline the unsupported CLI count is zero, but the evidence-backed
+  `completeness_claim` is false while `W-E6-RECEIPTS` remains open.
 - Release tags are annotated. Per
   [ADR 0001](./adr/0001-release-signing-sbom-provenance.md) they are also
   **signed** (GPG or SSH) when the release operator has signing configured:

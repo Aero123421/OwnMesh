@@ -223,6 +223,7 @@ def main() -> int:
     ci_gate = job_block(release, "ci-gate")
     security_gate = job_block(release, "security-gate")
     build_job = job_block(release, "build")
+    candidate_e2e_job = job_block(release, "release-candidate-e2e")
     dist_job = job_block(release, "distribution-metadata")
     publish_job = job_block(release, "publish")
     require_text(ci_gate, "uses: ./.github/workflows/ci.yml", "Release ci-gate")
@@ -231,8 +232,14 @@ def main() -> int:
     require("steps:" not in security_gate and "runs-on:" not in security_gate,
             "security-gate must remain a reusable workflow call")
     require_text(build_job, "needs: [ci-gate, security-gate]", "Release build")
-    require_text(dist_job, "needs: [ci-gate, security-gate, build]", "Release distribution-metadata")
-    require_text(publish_job, "needs: [ci-gate, security-gate, build, distribution-metadata]",
+    require_text(candidate_e2e_job, "needs: [ci-gate, security-gate, build]", "Release candidate E2E")
+    require_text(candidate_e2e_job, "name: release-linux-x64", "Release candidate artifact download")
+    require_text(candidate_e2e_job, "sha256sum --check --strict", "Release candidate checksum")
+    require_text(candidate_e2e_job, "OWNMESH_E2E_ARTIFACT_DIR", "Release candidate binary override")
+    require_text(candidate_e2e_job, "scripts/tests/run_e2e_loopback_tests.py", "Release candidate E2E")
+    require_text(candidate_e2e_job, "scripts/tests/test_e9_workerd_transfer.py", "Release candidate transfer E2E")
+    require_text(dist_job, "needs: [ci-gate, security-gate, build, release-candidate-e2e]", "Release distribution-metadata")
+    require_text(publish_job, "needs: [ci-gate, security-gate, build, release-candidate-e2e, distribution-metadata]",
                  "Release publish")
     require("if: always()" not in publish_job, "publish must not run after failed prerequisites")
     for asset in (
@@ -262,8 +269,13 @@ def main() -> int:
     require_text(dist_job, "scripts/render_distribution.py", "Release homebrew render")
     require_text(dist_job, "ownmesh.rb", "Release homebrew formula asset")
     require_text(publish_job, "ownmesh-release-meta.json", "Release meta asset")
-    # Checkout must drop credentials; every build/publish/dist checkout needs the flag.
-    release_jobs = build_job + "\n" + dist_job + "\n" + publish_job
+    require_text(publish_job, "scripts/generate_release_evidence.py", "Release evidence generator")
+    require_text(publish_job, "release/mcp-catalog-current.json", "Release current catalog receipt")
+    require_text(publish_job, "release/mcp-catalog-baseline-v1.json", "Release catalog baseline")
+    require_text(publish_job, "ownmesh-release-evidence.json", "Release evidence asset")
+    require_text(publish_job, '"completeness_claim": false', "Release evidence honesty gate")
+    # Checkout must drop credentials in every artifact-bearing release job.
+    release_jobs = build_job + "\n" + candidate_e2e_job + "\n" + dist_job + "\n" + publish_job
     checkout_count = len(re.findall(r"(?m)^\s*- uses:\s*actions/checkout@[0-9a-f]{40}", release_jobs))
     secure_checkout_count = len(
         re.findall(
@@ -272,10 +284,10 @@ def main() -> int:
             release_jobs,
         )
     )
-    require(checkout_count >= 3, "Release build/dist/publish must checkout the repository")
+    require(checkout_count >= 4, "Release build/E2E/dist/publish must checkout the repository")
     require(
         secure_checkout_count == checkout_count,
-        "Every release build/dist/publish checkout must set persist-credentials: false",
+        "Every release build/E2E/dist/publish checkout must set persist-credentials: false",
     )
     # Publish permissions stay narrowly scoped (no expansion beyond the three writes).
     require_text(publish_job, "contents: write", "Release publish permissions")
