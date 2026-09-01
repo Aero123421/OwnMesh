@@ -189,7 +189,7 @@ pnpm -r lint
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [ロードマップ](./docs/ROADMAP.md) — 次に何をやり、何をやらないか
-- [v1.2.25 release notes](./docs/RELEASE_NOTES_v1.2.25.md)
+- [v1.2.26 release notes](./docs/RELEASE_NOTES_v1.2.26.md)
 - [目標仕様](./OWNMESH_SPECIFICATION.ja.md) — 将来ロードマップの正本
 
 ## ライセンス

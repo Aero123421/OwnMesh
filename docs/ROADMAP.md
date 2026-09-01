@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.25 · **Last updated:** 2026-09-01
+**Baseline:** v1.2.26 · **Last updated:** 2026-09-01
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -14,8 +14,9 @@ Two documents bound this one and win where they disagree:
   the `W-*` evidence waivers.
 
 Nothing here is a dated commitment. Items are ordered by what would most improve
-the product, not by effort. The stability/MCP hardening shipped in v1.2.25 and
-its explicit partial boundaries are recorded in
+the product, not by effort. Generic external CLI sessions replace the removed
+coding-agent Profile layer in v1.2.26 (ADR 0018). The stability/MCP hardening
+shipped in v1.2.25 and its explicit partial boundaries are recorded in
 [`STABILITY_MCP_HARDENING.md`](./STABILITY_MCP_HARDENING.md).
 
 ## Now — the gap between what the presets promise and what they do

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.2.26 — Generic external CLI sessions
+
 ### Generic external CLI sessions (breaking)
 
 - Removed the coding-agent Profile crate, CLI/TUI/doctor flows, IPC methods,
