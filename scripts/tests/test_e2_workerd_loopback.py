@@ -31,6 +31,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE = ROOT / "packages" / "control-plane"
+OPERATION_NAMES: dict[str, str] = {}
 
 
 def session_id_from_operation(value: dict[str, object]) -> str:
