@@ -1,7 +1,7 @@
 {
   "name": "@ownmesh/schema",
   "private": true,
-  "version": "1.2.24",
+  "version": "1.2.25",
   "description": "OwnMesh TypeScript domain types, protocol envelope helpers, and fixture validation",
   "license": "Apache-2.0",
   "type": "module",
