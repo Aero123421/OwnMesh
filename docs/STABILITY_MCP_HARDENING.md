@@ -1,15 +1,15 @@
 # Stability and MCP hardening status
 
-**Implementation branch baseline:** v1.2.24 · **review date:** 2026-08-28
+**Released in:** v1.2.25 · **release review date:** 2026-09-01
 
-This file is an evidence boundary, not a release announcement. The shipped
-contract remains `release/SUPPORTED_SURFACES.json`; a change below becomes a
-release claim only after merge, cross-platform CI, the exact-artifact release
-candidate gate, and a tagged release.
+This file records the evidence boundary for the hardening shipped in v1.2.25.
+The authoritative shipped contract remains `release/SUPPORTED_SURFACES.json`;
+the table below distinguishes implemented behavior from the work and external
+receipts that remain open.
 
-| Area | Status in this change | Evidence / remaining boundary |
+| Area | Status in v1.2.25 | Evidence / remaining boundary |
 | --- | --- | --- |
-| Non-elevated command lock scope | done on baseline | ADR 0015 and existing concurrency/cancel/finalization regressions |
+| Non-elevated command lock scope | shipped | ADR 0015 and existing concurrency/cancel/finalization regressions |
 | Elevated broker lock scope | implemented | Broker connect/wait/cancel/output/re-attestation now use captured request authority outside the runtime mutex. Native broker release receipts remain separate. |
 | Session/PTY global lock scope | **partial** | Supervisor IPC is bounded (5 s) and session host/output custody is separate, but session open/transition methods still hold the runtime mutex across supervisor RPC. Per-session state ownership and 100-way session stress remain open. |
 | Operation restart convergence | strengthened, **partial** | A loaded prior-process `in_progress` marker is durably classified `recoverable_orphaned`, surfaced as `OWNMESH_E_OPERATION_ORPHANED`, and never auto-retried. Generic command PID/birth identity is not journaled, so automatic process reattachment is not claimed. Session sidecars already use PID + birth identity and controller epochs. |

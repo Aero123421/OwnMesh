@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+## v1.2.25 — Runtime custody, dual-era MCP, and release evidence
+
+v1.2.25 releases the hardening merged in #182. Elevated broker waits now use
+captured request authority outside the daemon runtime mutex, prior-process
+in-progress operations converge to a durable orphaned state without replay,
+and Linux shebang execution binds the script and interpreter through sealed
+custody. The Control Plane serves both MCP `2025-03-26` and `2026-07-28` from
+one authorization/tool registry, adds CIMD and RFC 9207 issuer responses, and
+freezes catalog-v1 call compatibility. Release publication now depends on an
+exact packaged-binary workerd E2E and emits signed, attested machine-readable
+evidence. No authorization, privacy, telemetry, or relay default is loosened.
+
+### Runtime execution and restart state
+
+- Elevated command broker connect, wait, cancel, output, and custody
+  re-attestation no longer hold the global runtime mutex. Admission and
+  finalization retain the exact operation, principal, credential generation,
+  expiry, payload hash, executable pins, and journal marker.
+- A prior-process `in_progress` marker is classified as
+  `recoverable_orphaned`, surfaced as `OWNMESH_E_OPERATION_ORPHANED`, and is
+  never silently retried. Generic command process reattachment is not claimed.
+- Linux interpreter scripts pin both the script and interpreter and execute
+  sealed snapshots through proc-fd handoff. A bounded Node loader preserves
+  the approved module URL and relative imports; unsupported `env` option
+  syntax fails closed.
+
+### MCP and OAuth compatibility
+
+- Legacy MCP `2025-03-26` and stateless modern MCP `2026-07-28` share one tool
+  registry, scope map, action binding, and device-policy route. Modern requests
+  receive strict metadata/header validation, typed negotiation errors,
+  `server/discover`, result types, and cache hints.
+- Catalog v1 has a frozen compatibility baseline. Existing names, including
+  hidden deprecated aliases, remain callable through the 1.x window; CI rejects
+  required-field, property, effect-hint, or callable-surface breakage.
+- OAuth advertises and validates bounded Client ID Metadata Documents, includes
+  RFC 9207 `iss`, and retains DCR as the compatibility fallback. Private-key
+  JWT is neither advertised nor accepted.
+
+### Release assurance and diagnostics
+
+- Publication waits for the downloaded, checksum-verified Linux x64 archive to
+  pass workerd device, filesystem, command, session, restart/recovery, profile,
+  and two-Agent resumable-transfer tests.
+- Releases emit `ownmesh-release-evidence.json` from exact artifact hashes,
+  catalog receipts, and gate facts. The receipt is covered by the mandatory
+  minisign checksum chain and GitHub provenance.
+- Machine endpoint probes classify DNS, TLS, connect timeout, Cloudflare edge
+  denial, Worker auth/4xx/5xx, malformed JSON, and catalog mismatch separately,
+  with bounded retries and CF-Ray reporting.
+
 ## v1.2.24 — Runtime availability and profile adapter correctness
 
 v1.2.24 is the first formal release after v1.2.23. It combines the post-release availability work in #169 and #167 with the official nine-profile adapter correctness work in #171. No authorization, privacy, telemetry, or relay default is loosened.

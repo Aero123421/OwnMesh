@@ -1212,7 +1212,7 @@ acp = false
 - 通常 Chat から利用する。
 - ChatGPT 固有のモード切替を OwnMesh の必須条件にしない。
 
-> **実装状況（post-v1.2.24 / [ADR 0017](./docs/adr/0017-dual-era-mcp-and-frozen-catalog-compatibility.md)）**
+> **実装状況（v1.2.25 / [ADR 0017](./docs/adr/0017-dual-era-mcp-and-frozen-catalog-compatibility.md)）**
 > 共通の tool registry・scope・action binding・device policy route の前に、
 > `2025-03-26` legacy adapter（`initialize` / 任意 session id）と
 > `2026-07-28` modern adapter（stateless request metadata、mirrored HTTP
