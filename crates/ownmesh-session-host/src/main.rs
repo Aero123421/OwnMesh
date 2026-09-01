@@ -248,7 +248,7 @@ fn run_serve(
     let sid = session_id.unwrap_or_else(|| format!("ses_local_{}", std::process::id()));
     let program = program.unwrap_or_else(default_shell);
     // P1-C: resolve through the shared executable resolver so the standalone
-    // helper agrees with daemon session launch, profile detection and command
+    // helper agrees with daemon session launch, command discovery, and command
     // execution. Windows batch shims are rewritten to the documented
     // `cmd.exe /e:ON /v:OFF /d /s /c call ...` form (CreateProcess cannot
     // exec .cmd/.bat directly); unresolved programs fail closed with the
@@ -388,8 +388,6 @@ fn register_spawned_session(
                     format!("host:{requested_id}"),
                     "session-host",
                     now_unix(),
-                    None,
-                    None,
                     Some(
                         std::iter::once(cmd.program.clone())
                             .chain(cmd.args.iter().cloned())
@@ -563,13 +561,7 @@ mod tests {
 
         let mut mgr = SessionManager::new();
         let ses = mgr
-            .open(
-                ownmesh_session::SessionKind::Pty,
-                "t",
-                "host",
-                now_unix(),
-                None,
-            )
+            .open(ownmesh_session::SessionKind::Pty, "t", "host", now_unix())
             .unwrap();
         let data = if out.is_empty() {
             "pty-host-ok\n".into()
@@ -676,7 +668,6 @@ mod tests {
                 "target",
                 "host",
                 now_unix(),
-                None,
             )
             .unwrap();
         mgr.attach_observer(&target.id, "reader", now_unix())
@@ -710,7 +701,6 @@ mod tests {
                 "target",
                 "host",
                 now_unix(),
-                None,
             )
             .unwrap();
         mgr.set_host_pid(&target.id, Some(42)).unwrap();
@@ -720,7 +710,6 @@ mod tests {
                 "unrelated",
                 "other",
                 now_unix(),
-                None,
             )
             .unwrap();
         mgr.push_output(
@@ -750,7 +739,6 @@ mod tests {
                 "target",
                 "host",
                 now_unix(),
-                None,
             )
             .unwrap();
         let before = serde_json::to_value(&mgr).unwrap();

@@ -2036,7 +2036,6 @@ dependencies = [
  "ownmesh-ipc",
  "ownmesh-persist",
  "ownmesh-policy",
- "ownmesh-profiles",
  "ownmesh-protocol",
  "ownmesh-transition-journal",
  "ownmesh-update",
@@ -2242,19 +2241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ownmesh-profiles"
-version = "1.2.25"
-dependencies = [
- "ownmesh-exec",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "toml",
-]
-
-[[package]]
 name = "ownmesh-protocol"
 version = "1.2.25"
 dependencies = [
@@ -2342,7 +2328,6 @@ dependencies = [
  "ownmesh-identity",
  "ownmesh-ipc",
  "ownmesh-policy",
- "ownmesh-profiles",
  "ownmesh-transfer",
  "portable-pty 0.8.1",
  "portable-pty 0.9.0",
@@ -2395,7 +2380,6 @@ dependencies = [
  "ownmesh-ipc",
  "ownmesh-logs",
  "ownmesh-policy",
- "ownmesh-profiles",
  "ownmesh-protocol",
  "ownmesh-session",
  "ownmesh-session-host",

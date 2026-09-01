@@ -21,7 +21,7 @@ class ReleaseEvidenceReceipt(unittest.TestCase):
             catalog = root / "catalog.json"
             catalog.write_text(json.dumps({
                 "schema_version": 1,
-                "catalog_version": 1,
+                "catalog_version": 2,
                 "catalog_revision": "b" * 16,
             }), encoding="utf-8")
             output = root / "receipt.json"
@@ -43,6 +43,8 @@ class ReleaseEvidenceReceipt(unittest.TestCase):
             self.assertEqual(receipt["mcp"]["compatibility_baseline_revision"], "b" * 16)
             self.assertTrue(receipt["deterministic_release_gate"]["exact_packaged_linux_x64_artifact"])
             self.assertGreater(len(receipt["external_blockers"]), 0)
+            self.assertNotIn("profile_evidence", receipt)
+            self.assertFalse(any("W-E6" in blocker for blocker in receipt["external_blockers"]))
 
     def test_path_like_or_duplicate_artifact_names_fail(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -52,7 +54,7 @@ class ReleaseEvidenceReceipt(unittest.TestCase):
             catalog = root / "catalog.json"
             catalog.write_text(json.dumps({
                 "schema_version": 1,
-                "catalog_version": 1,
+                "catalog_version": 2,
                 "catalog_revision": "b" * 16,
             }), encoding="utf-8")
             result = subprocess.run([

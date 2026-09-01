@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Generic external CLI sessions (breaking)
+
+- Removed the coding-agent Profile crate, CLI/TUI/doctor flows, IPC methods,
+  MCP tools and Profile-specific session fields, vendor protocol adapters,
+  fixtures, and the `W-E6-RECEIPTS` release waiver.
+- External CLIs now use the same exact `program`/`args` command, process, PTY,
+  and session model as every executable. OwnMesh authorizes the child
+  process/session boundary, not vendor-internal tool actions; workspace/cwd is
+  explicitly not an OS sandbox.
+- Legacy Profile methods are method-not-found, old Profile session inputs are
+  invalid-params with migration guidance, and persisted Profile sessions are
+  discarded rather than guessed into generic sessions.
+- MCP catalog v2 records the intentional public break. Catalog v1 remains
+  historical release evidence only. See ADR 0018.
+
 ## v1.2.25 — Runtime custody, dual-era MCP, and release evidence
 
 v1.2.25 releases the hardening merged in #182. Elevated broker waits now use

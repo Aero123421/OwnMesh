@@ -165,7 +165,7 @@ recovery details.
 | Machine health | `ownmesh status`, `ownmesh doctor --json` |
 | Device metadata | `device list/show/rename/labels/rotate-key/revoke` |
 | Remote work | `exec --device … --idempotency-key …`, `session open <device> --idempotency-key …` |
-| AI CLI profiles | `profile scan/list/show/login/test/start/resume` |
+| External CLIs | `exec --device … -- <program> <args…>`, `session open <device> --idempotency-key … -- <program> <args…>` |
 | Approvals | `approval list/show/watch/approve/deny`; browser `/approve` inbox, batch set, deny-all |
 | Policy/admin | `policy show/validate/explain/preset/rule`, `grants list/show/revoke/mint`, `lockdown`, `unlock`, `tokens revoke` |
 | Transfer | `transfer plan/send/list/status/cancel` |

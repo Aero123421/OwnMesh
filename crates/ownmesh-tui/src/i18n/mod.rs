@@ -45,7 +45,6 @@ pub enum Msg {
     NavDevices,
     NavWorkspaces,
     NavSessions,
-    NavProfiles,
     NavApprovals,
     NavTransfers,
     NavActivity,
@@ -90,10 +89,6 @@ pub enum Msg {
     SessionsTitle,
     SessionsEmpty,
     SessionsHint,
-    // Profiles
-    ProfilesTitle,
-    ProfilesOfficial,
-    ProfilesHint,
     // Approvals
     ApprovalsTitle,
     ApprovalsEmpty,
@@ -151,7 +146,6 @@ pub enum Msg {
     CmdGotoDevices,
     CmdGotoWorkspaces,
     CmdGotoSessions,
-    CmdGotoProfiles,
     CmdGotoApprovals,
     CmdGotoTransfers,
     CmdGotoActivity,
@@ -176,7 +170,6 @@ impl Msg {
         Self::NavDevices,
         Self::NavWorkspaces,
         Self::NavSessions,
-        Self::NavProfiles,
         Self::NavApprovals,
         Self::NavTransfers,
         Self::NavActivity,
@@ -216,9 +209,6 @@ impl Msg {
         Self::SessionsTitle,
         Self::SessionsEmpty,
         Self::SessionsHint,
-        Self::ProfilesTitle,
-        Self::ProfilesOfficial,
-        Self::ProfilesHint,
         Self::ApprovalsTitle,
         Self::ApprovalsEmpty,
         Self::ApprovalsPending,
@@ -269,7 +259,6 @@ impl Msg {
         Self::CmdGotoDevices,
         Self::CmdGotoWorkspaces,
         Self::CmdGotoSessions,
-        Self::CmdGotoProfiles,
         Self::CmdGotoApprovals,
         Self::CmdGotoTransfers,
         Self::CmdGotoActivity,
@@ -293,7 +282,6 @@ impl Msg {
             Self::NavDevices => "nav.devices",
             Self::NavWorkspaces => "nav.workspaces",
             Self::NavSessions => "nav.sessions",
-            Self::NavProfiles => "nav.profiles",
             Self::NavApprovals => "nav.approvals",
             Self::NavTransfers => "nav.transfers",
             Self::NavActivity => "nav.activity",
@@ -333,9 +321,6 @@ impl Msg {
             Self::SessionsTitle => "sessions.title",
             Self::SessionsEmpty => "sessions.empty",
             Self::SessionsHint => "sessions.hint",
-            Self::ProfilesTitle => "profiles.title",
-            Self::ProfilesOfficial => "profiles.official",
-            Self::ProfilesHint => "profiles.hint",
             Self::ApprovalsTitle => "approvals.title",
             Self::ApprovalsEmpty => "approvals.empty",
             Self::ApprovalsPending => "approvals.pending",
@@ -386,7 +371,6 @@ impl Msg {
             Self::CmdGotoDevices => "cmd.goto.devices",
             Self::CmdGotoWorkspaces => "cmd.goto.workspaces",
             Self::CmdGotoSessions => "cmd.goto.sessions",
-            Self::CmdGotoProfiles => "cmd.goto.profiles",
             Self::CmdGotoApprovals => "cmd.goto.approvals",
             Self::CmdGotoTransfers => "cmd.goto.transfers",
             Self::CmdGotoActivity => "cmd.goto.activity",
@@ -472,7 +456,6 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::NavDevices, "Devices");
     insert(&mut m, Msg::NavWorkspaces, "Workspaces");
     insert(&mut m, Msg::NavSessions, "Sessions");
-    insert(&mut m, Msg::NavProfiles, "Profiles");
     insert(&mut m, Msg::NavApprovals, "Approvals");
     insert(&mut m, Msg::NavTransfers, "Transfers");
     insert(&mut m, Msg::NavActivity, "Activity");
@@ -567,13 +550,6 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
         &mut m,
         Msg::SessionsHint,
         "Open sessions via CLI (`ownmesh session`) or session-host. Claim/release stays on-device.",
-    );
-    insert(&mut m, Msg::ProfilesTitle, "Profiles");
-    insert(&mut m, Msg::ProfilesOfficial, "Official CLI profiles");
-    insert(
-        &mut m,
-        Msg::ProfilesHint,
-        "Detection uses local binaries only; credentials never leave the device.",
     );
     insert(&mut m, Msg::ApprovalsTitle, "Approvals");
     insert(&mut m, Msg::ApprovalsEmpty, "No pending approvals.");
@@ -709,7 +685,6 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::CmdGotoDevices, "Go to Devices");
     insert(&mut m, Msg::CmdGotoWorkspaces, "Go to Workspaces");
     insert(&mut m, Msg::CmdGotoSessions, "Go to Sessions");
-    insert(&mut m, Msg::CmdGotoProfiles, "Go to Profiles");
     insert(&mut m, Msg::CmdGotoApprovals, "Go to Approvals");
     insert(&mut m, Msg::CmdGotoTransfers, "Go to Transfers");
     insert(&mut m, Msg::CmdGotoActivity, "Go to Activity");
@@ -738,7 +713,6 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::NavDevices, "デバイス");
     insert(&mut m, Msg::NavWorkspaces, "ワークスペース");
     insert(&mut m, Msg::NavSessions, "セッション");
-    insert(&mut m, Msg::NavProfiles, "プロファイル");
     insert(&mut m, Msg::NavApprovals, "承認");
     insert(&mut m, Msg::NavTransfers, "転送");
     insert(&mut m, Msg::NavActivity, "アクティビティ");
@@ -845,13 +819,6 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
         &mut m,
         Msg::SessionsHint,
         "CLI または session-host で開始。claim/release は端末内で完結します。",
-    );
-    insert(&mut m, Msg::ProfilesTitle, "プロファイル");
-    insert(&mut m, Msg::ProfilesOfficial, "公式 CLI プロファイル");
-    insert(
-        &mut m,
-        Msg::ProfilesHint,
-        "検出はローカルバイナリのみ。資格情報は端末外へ出ません。",
     );
     insert(&mut m, Msg::ApprovalsTitle, "承認キュー");
     insert(&mut m, Msg::ApprovalsEmpty, "保留中の承認はありません。");
@@ -987,7 +954,6 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::CmdGotoDevices, "デバイスへ");
     insert(&mut m, Msg::CmdGotoWorkspaces, "ワークスペースへ");
     insert(&mut m, Msg::CmdGotoSessions, "セッションへ");
-    insert(&mut m, Msg::CmdGotoProfiles, "プロファイルへ");
     insert(&mut m, Msg::CmdGotoApprovals, "承認へ");
     insert(&mut m, Msg::CmdGotoTransfers, "転送へ");
     insert(&mut m, Msg::CmdGotoActivity, "アクティビティへ");
@@ -1016,7 +982,6 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::NavDevices, "设备");
     insert(&mut m, Msg::NavWorkspaces, "工作区");
     insert(&mut m, Msg::NavSessions, "会话");
-    insert(&mut m, Msg::NavProfiles, "配置文件");
     insert(&mut m, Msg::NavApprovals, "审批");
     insert(&mut m, Msg::NavTransfers, "传输");
     insert(&mut m, Msg::NavActivity, "活动");
@@ -1091,13 +1056,6 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
         &mut m,
         Msg::SessionsHint,
         "通过 CLI 或 session-host 打开会话。claim/release 仅在本机。",
-    );
-    insert(&mut m, Msg::ProfilesTitle, "配置文件");
-    insert(&mut m, Msg::ProfilesOfficial, "官方 CLI 配置");
-    insert(
-        &mut m,
-        Msg::ProfilesHint,
-        "仅检测本地二进制；凭据不会离开本机。",
     );
     insert(&mut m, Msg::ApprovalsTitle, "审批队列");
     insert(&mut m, Msg::ApprovalsEmpty, "没有待处理审批。");
@@ -1229,7 +1187,6 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::CmdGotoDevices, "转到设备");
     insert(&mut m, Msg::CmdGotoWorkspaces, "转到工作区");
     insert(&mut m, Msg::CmdGotoSessions, "转到会话");
-    insert(&mut m, Msg::CmdGotoProfiles, "转到配置文件");
     insert(&mut m, Msg::CmdGotoApprovals, "转到审批");
     insert(&mut m, Msg::CmdGotoTransfers, "转到传输");
     insert(&mut m, Msg::CmdGotoActivity, "转到活动");
@@ -1254,7 +1211,6 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::NavDevices, "Устройства");
     insert(&mut m, Msg::NavWorkspaces, "Рабочие области");
     insert(&mut m, Msg::NavSessions, "Сессии");
-    insert(&mut m, Msg::NavProfiles, "Профили");
     insert(&mut m, Msg::NavApprovals, "Одобрения");
     insert(&mut m, Msg::NavTransfers, "Передачи");
     insert(&mut m, Msg::NavActivity, "Активность");
@@ -1349,13 +1305,6 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
         &mut m,
         Msg::SessionsHint,
         "Открывайте сессии через CLI или session-host. Claim/release остаётся на устройстве.",
-    );
-    insert(&mut m, Msg::ProfilesTitle, "Профили");
-    insert(&mut m, Msg::ProfilesOfficial, "Официальные CLI-профили");
-    insert(
-        &mut m,
-        Msg::ProfilesHint,
-        "Обнаружение только локальных бинарников; учётные данные не покидают устройство.",
     );
     insert(&mut m, Msg::ApprovalsTitle, "Очередь одобрений");
     insert(&mut m, Msg::ApprovalsEmpty, "Нет ожидающих одобрений.");
@@ -1511,7 +1460,6 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
     insert(&mut m, Msg::CmdGotoDevices, "Перейти к устройствам");
     insert(&mut m, Msg::CmdGotoWorkspaces, "Перейти к рабочим областям");
     insert(&mut m, Msg::CmdGotoSessions, "Перейти к сессиям");
-    insert(&mut m, Msg::CmdGotoProfiles, "Перейти к профилям");
     insert(&mut m, Msg::CmdGotoApprovals, "Перейти к одобрениям");
     insert(&mut m, Msg::CmdGotoTransfers, "Перейти к передачам");
     insert(&mut m, Msg::CmdGotoActivity, "Перейти к активности");

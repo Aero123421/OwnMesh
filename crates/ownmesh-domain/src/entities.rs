@@ -317,7 +317,6 @@ pub struct Operation {
 pub enum SessionType {
     Process,
     Terminal,
-    Profile,
     LocalShell,
 }
 
@@ -345,8 +344,6 @@ pub struct Session {
     pub device_id: DeviceId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<WorkspaceId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
     pub state: SessionState,
     pub created_by: PrincipalId,
     pub created_at: Timestamp,
@@ -358,8 +355,6 @@ pub struct Session {
     pub controller_lease_expires_at: Option<Expiry>,
     #[serde(default)]
     pub last_event_seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<u32>,
 }

@@ -18,7 +18,6 @@ mod mcp_client;
 mod policy_cmd;
 mod privileged;
 mod process_cmd;
-mod profile_cmd;
 mod service;
 mod session_cmd;
 mod setup;
@@ -76,7 +75,6 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Exec(args)) => exec::run_exec(cli, args),
         Some(Commands::Process(cmd)) => process_cmd::dispatch_process(cli, cmd),
         Some(Commands::Session(cmd)) => dispatch_session(cli, cmd),
-        Some(Commands::Profile(cmd)) => profile_cmd::dispatch_profile(cli, cmd),
         Some(Commands::Approval(cmd)) => approval::dispatch_approval(cli, cmd),
         Some(Commands::Policy(cmd)) => policy_cmd::dispatch_policy(cli, cmd),
         Some(Commands::Grants(cmd)) => grants_cmd::dispatch_grants(cli, cmd),
@@ -115,7 +113,7 @@ fn run_tui_launch(cli: &Cli) -> Result<(), ExitCode> {
             cli,
             format!("ownmesh: bundled TUI not found at {}", tui.display()),
             Some("reinstall OwnMesh, or run an explicit subcommand"),
-            ExitCode::ProfileUnavailable,
+            ExitCode::DependencyUnavailable,
         ));
     }
     // The TUI renders its own chrome, so `--lang` has to reach it as an

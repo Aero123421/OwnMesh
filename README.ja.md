@@ -105,6 +105,23 @@ ownmesh setup --control-plane-url https://your-worker.example --quickstart --dev
 ownmesh doctor --json
 ```
 
+## 外部 CLI の汎用セッション
+
+OwnMesh は coding agent 専用 Profile やベンダー固有 Adapter を同梱しません。
+任意の外部 CLI は、実行ファイルと引数を正確に指定して汎用 session として起動
+します。
+
+```bash
+ownmesh session open dev_example --idempotency-key session-001 -- my-tool --mode batch
+```
+
+MCP では `ownmesh_session_open` に `program: "my-tool"` と
+`args: ["--mode", "batch"]` を渡します。OwnMesh が認可・監査する境界は、その
+process/session の起動と制御までです。外部 CLI が内部で呼ぶ tool の意味や権限
+までは解釈・認可しません。`workspace_id` と `cwd` はパス解決の文脈であり、OS
+sandbox ではありません。子 process 自体の隔離が必要な場合は OS の隔離機構
+を併用してください。
+
 ## セキュリティ設計
 
 - コントロールプレーンの所有者はユーザー自身。中央 SaaS は不要です。

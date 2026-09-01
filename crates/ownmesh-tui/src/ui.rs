@@ -354,13 +354,6 @@ fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
             },
             t(app.lang, Msg::SessionsHint),
         ),
-        Screen::Profiles => draw_list_screen(
-            frame,
-            app,
-            body,
-            app.profile_lines(),
-            t(app.lang, Msg::ProfilesHint),
-        ),
         Screen::Approvals => draw_approvals(frame, app, body),
         Screen::Transfers => draw_list_screen(
             frame,

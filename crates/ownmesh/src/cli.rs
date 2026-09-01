@@ -71,9 +71,6 @@ pub enum Commands {
     /// Interactive / detached sessions.
     #[command(subcommand)]
     Session(SessionCmd),
-    /// Coding-agent profile operations.
-    #[command(subcommand)]
-    Profile(ProfileCmd),
     /// Approval queue.
     #[command(subcommand)]
     Approval(ApprovalCmd),
@@ -434,11 +431,6 @@ pub enum SessionCmd {
         #[arg(long = "to")]
         to: String,
     },
-    /// Cancel the active structured profile turn without closing its native session.
-    Cancel {
-        /// Session id.
-        id: String,
-    },
     /// Close a session gracefully.
     Close {
         /// Session id.
@@ -451,48 +443,6 @@ pub enum SessionCmd {
         /// Terminate all sessions.
         #[arg(long)]
         all: bool,
-    },
-}
-
-/// `ownmesh profile` subcommands.
-#[derive(Debug, Subcommand)]
-pub enum ProfileCmd {
-    /// Scan for installed coding CLIs.
-    Scan,
-    /// List known profiles.
-    List,
-    /// Show a profile.
-    Show {
-        /// Profile id.
-        id: String,
-    },
-    /// Trigger profile-specific login helper.
-    Login {
-        /// Profile id.
-        id: String,
-    },
-    /// Run profile conformance / smoke test.
-    Test {
-        /// Profile id.
-        id: String,
-    },
-    /// Start a profile session.
-    Start {
-        /// Profile id.
-        id: String,
-        /// Optional initial prompt. One-shot structured profiles require it.
-        #[arg(long)]
-        prompt: Option<String>,
-    },
-    /// Resume a native profile session.
-    Resume {
-        /// Profile id.
-        id: String,
-        /// Native session id.
-        native_id: String,
-        /// Optional prompt for the resumed native session.
-        #[arg(long)]
-        prompt: Option<String>,
     },
 }
 

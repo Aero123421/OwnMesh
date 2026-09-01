@@ -152,7 +152,7 @@ const READER_DRAIN_POLL: Duration = Duration::from_millis(10);
 impl StructuredProcessHost {
     pub fn spawn(cmd: &PtyCommand, size: PtySize) -> Result<Self, String> {
         // P1-C/P1-D review: same shared launchable resolver as PTY spawns and
-        // command execution, so structured session launch agrees with profile
+        // command execution, so structured session launch agrees with command
         // detection and never spawns a bare name the daemon PATH lacks.
         let resolved = ownmesh_exec::resolve_spawn_argv(
             &cmd.program,
@@ -720,7 +720,7 @@ impl Drop for LiveHost {
 /// Default interactive shell for the current platform.
 ///
 /// The program is resolved through the shared executable resolver so session
-/// launch agrees with command execution, profile detection and review pinning:
+/// launch agrees with command discovery, execution, and review pinning:
 /// on Windows a bare `cmd.exe` would let `CreateProcess` search the current
 /// directory for a shadowing `cmd.exe` (a workspace or cwd file could impersonate
 /// the pinned system shell), so the default is the absolute system path
@@ -1216,7 +1216,7 @@ fn terminate_child_tree(
 /// Spawn a PTY-backed process (pipe fallback on failure) for CLI one-shot use.
 pub fn spawn_pty(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String> {
     // P1-C/P1-D review: resolve through the shared launchable resolver before
-    // any spawner sees the program, exactly like profile detection, command
+    // any spawner sees the program, exactly like command discovery,
     // execution and review pinning. The daemon service PATH is system-only, so
     // a user-local CLI found by deterministic discovery must launch by its
     // absolute path, and on Windows an extensionless npm shim must never beat
@@ -1742,7 +1742,7 @@ mod tests {
     /// system shell); after resolution the program is the absolute system
     /// path. On Unix the resolved `$SHELL`/`/bin/sh` is an absolute
     /// launchable file, so default session launch agrees with command
-    /// execution, profile detection and review pinning — there is no
+    /// execution, command discovery, and review pinning — there is no
     /// detect-ready-then-spawn-bare-name disagreement.
     #[test]
     fn default_shell_command_resolves_to_an_absolute_launchable_program() {
@@ -1771,7 +1771,7 @@ mod tests {
     /// a bare `cmd.exe` would let `CreateProcess` search the working directory
     /// for a shadowing `cmd.exe`/`cmd.com` (Microsoft CreateProcess
     /// documentation); on Unix a bare `$SHELL` would be re-searched by the
-    /// spawner's PATH, which may disagree with the resolver that profile
+    /// spawner's PATH, which may disagree with the resolver that command
     /// detection and command execution use. The pure core is exercised with an
     /// unresolvable `$SHELL` (absolute and bare forms) and must return the
     /// platform's absolute launchable default instead.

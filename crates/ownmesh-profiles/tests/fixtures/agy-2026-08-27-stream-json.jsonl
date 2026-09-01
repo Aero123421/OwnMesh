@@ -1,5 +1,0 @@
-{"type":"init","session_id":"agy-fixture","model":"agy"}
-{"type":"message","role":"assistant","content":"Hello from Agy","delta":true}
-{"type":"tool_use","tool_name":"run_shell_command","tool_id":"agy-tool-1","parameters":{"command":"redacted"}}
-{"type":"tool_result","tool_id":"agy-tool-1","status":"success","output":"done"}
-{"type":"result","status":"success","stats":{"input_tokens":1,"output_tokens":2}}

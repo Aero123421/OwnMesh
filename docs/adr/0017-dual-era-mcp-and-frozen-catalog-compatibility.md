@@ -4,6 +4,11 @@
 - Date: 2026-08-28
 - Deciders: OwnMesh maintainers
 
+> Amendment (2026-09-01): [ADR 0018](./0018-generic-external-cli-sessions.md)
+> intentionally ends catalog-v1 callable compatibility and establishes the
+> removed-Profile catalog-v2 baseline. The dual MCP transport decision below
+> remains accepted; catalog v1 is historical release evidence only.
+
 ## Context
 
 OwnMesh shipped the initialization-based MCP revision `2025-03-26`. The current

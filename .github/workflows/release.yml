@@ -380,7 +380,7 @@ jobs:
             --commit "${COMMIT}" \
             --checksums dist/SHA256SUMS \
             --catalog-current release/mcp-catalog-current.json \
-            --catalog-baseline release/mcp-catalog-baseline-v1.json \
+            --catalog-baseline release/mcp-catalog-baseline-v2.json \
             --workflow-url "${WORKFLOW_URL}" \
             --output dist/ownmesh-release-evidence.json
           test -s dist/ownmesh-release-evidence.json

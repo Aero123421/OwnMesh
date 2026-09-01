@@ -10,7 +10,7 @@ Participation is governed by [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md).
 
 1. Read the relevant specification sections and the shipped-surface contract in [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json).
 2. For security-sensitive changes, review [`docs/SECURITY_REVIEW_CHECKLIST.md`](./docs/SECURITY_REVIEW_CHECKLIST.md).
-3. Breaking protocol, auth, policy-boundary, or official-profile changes require an **ADR** under `docs/adr/` (see `docs/adr/ADR_TEMPLATE.md`).
+3. Breaking protocol, auth, policy-boundary, or public-capability changes require an **ADR** under `docs/adr/` (see `docs/adr/ADR_TEMPLATE.md`).
 
 ## Development setup
 
@@ -94,17 +94,17 @@ fifth exception requires an ADR.
 
 | Path | Responsibility |
 | --- | --- |
-| `crates/*` | Local runtime, CLI, TUI, IPC, policy, profiles, … |
+| `crates/*` | Local runtime, CLI, TUI, IPC, policy, sessions, … |
 | `packages/control-plane` | Cloudflare Workers control plane |
 | `spec-bundle/schemas` | JSON Schema / catalogs shared by implementations |
-| `spec-bundle/examples` | Example config / policy / profile TOML |
+| `spec-bundle/examples` | Example config, policy, and protocol fixtures |
 | `docs/adr` | Architecture decisions |
 
 Prefer small, reviewable PRs that complete one clear behavior or boundary.
 
 ## Coding guidelines
 
-- Keep UI, domain, protocol, OS adapters, privileged code, and external adapters separated.
+- Keep UI, domain, protocol, OS integration, and privileged code separated.
 - Do not commit secrets, tokens, private keys, `.env` files, or local runtime state.
 - Avoid drive-by refactors unrelated to the change.
 - Identifiers, API names, config keys, and error codes use **English** as the source of truth.

@@ -1,6 +1,6 @@
 # ADR 0016: Dialect-aware adapter normalization and denial-only vendor requests
 
-- Status: Accepted
+- Status: Superseded by [ADR 0018](./0018-generic-external-cli-sessions.md)
 - Date: 2026-08-27
 - Deciders: OwnMesh runtime maintainers
 

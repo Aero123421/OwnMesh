@@ -31,7 +31,7 @@ SURFACES = ROOT / "release" / "SUPPORTED_SURFACES.json"
 E4_E9_ACCEPTANCE_ROWS: tuple[tuple[str, str], ...] = (
     ("E4", "workspace CRUD/enforcement + handle-rooted custody"),
     ("E5", "cloud PTY sessions + controller lease + replay/spool"),
-    ("E6", "nine official profile adapters + generic tool execution"),
+    ("E6", "generic exact-program command/session execution"),
     ("E7", "bounded unified-diff patch + Git review (no auto-merge)"),
     (
         "E8",
@@ -101,11 +101,9 @@ def main() -> int:
             "expiry reclaim, and stale token/nonce mutation denial"
         ),
         "E6": (
-            "nine official profile adapters plus a generic CLI through public "
-            "MCP/workerd/Agent/ownmeshd: strict Codex and ACP handshakes, "
-            "bounded raw cursor replay, delayed turn completion, safe auth "
-            "status, native argv/negotiated resume, explicit unsupported "
-            "resume rejection, and exact sidecar cleanup"
+            "generic external CLI execution through public MCP/workerd/Agent/"
+            "ownmeshd with exact program/args binding, bounded raw cursor replay, "
+            "and exact sidecar cleanup"
         ),
         "E7": (
             "nested temporary Git repository through public MCP/workerd/Agent/"

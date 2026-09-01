@@ -14,7 +14,6 @@ members = [
     "crates/ownmesh-session",
     "crates/ownmesh-transition-journal",
     "crates/ownmesh-broker-client",
-    "crates/ownmesh-profiles",
     "crates/ownmesh-transfer",
     "crates/ownmesh-update",
     "crates/ownmesh-diagnostics",

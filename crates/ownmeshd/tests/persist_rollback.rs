@@ -1261,30 +1261,6 @@ async fn session_write_pending_after_final_persist_failure_is_at_most_once() {
 }
 
 #[tokio::test]
-async fn profile_list_detects_official_ids_without_credential_exfil() {
-    let dir = tempdir().unwrap();
-    let paths = OwnMeshPaths::for_base(dir.path());
-    paths.ensure_layout().unwrap();
-    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
-    let listed = rt
-        .dispatch(methods::PROFILE_LIST, None, &client("local"))
-        .await
-        .expect("profile.list");
-    assert_eq!(listed["official_count"], 9);
-    assert_eq!(listed["total"], 9);
-    let profiles = listed["profiles"].as_array().expect("profiles array");
-    assert_eq!(profiles.len(), 9);
-    let ids: Vec<&str> = profiles.iter().filter_map(|p| p["id"].as_str()).collect();
-    assert!(ids.contains(&"codex"));
-    assert!(ids.contains(&"claude-code"));
-    assert!(ids.contains(&"pi"));
-    // Status is local PATH detection only — never embeds secrets.
-    let blob = listed.to_string().to_ascii_lowercase();
-    assert!(!blob.contains("api_key"));
-    assert!(!blob.contains("authorization"));
-}
-
-#[tokio::test]
 async fn fs_patch_applies_bounded_unified_diff() {
     let dir = tempdir().unwrap();
     let paths = OwnMeshPaths::for_base(dir.path());

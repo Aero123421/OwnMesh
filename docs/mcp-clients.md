@@ -44,7 +44,7 @@ are not configurable:
 
 | Scope | Grants |
 | --- | --- |
-| `ownmesh.read` | Read and discovery: `ownmesh_list_devices`, `ownmesh_get_device`, `ownmesh_fs_list` / `_read` / `_stat`, `ownmesh_git_status` / `_diff`, `ownmesh_workspace_list` / `_show`, `ownmesh_list_profiles`, `ownmesh_profile_show`, `ownmesh_review_show` / `_page`, `ownmesh_transfer_get` / `_list` / `_status`, `ownmesh_get_operation` |
+| `ownmesh.read` | Read and discovery: `ownmesh_list_devices`, `ownmesh_get_device`, `ownmesh_fs_list` / `_read` / `_stat`, `ownmesh_git_status` / `_diff`, `ownmesh_workspace_list` / `_show`, `ownmesh_review_show` / `_page`, `ownmesh_transfer_get` / `_list` / `_status`, `ownmesh_get_operation` |
 | `ownmesh.write` | Content and resource mutation: `ownmesh_fs_write` / `_patch` / `_delete`, `ownmesh_workspace_add` / `_update` / `_remove`, `ownmesh_review_start`, `ownmesh_transfer_plan` / `_send` / `_cancel` |
 | `ownmesh.exec` | Command execution: `ownmesh_command_run`, `ownmesh_command_shell`, `ownmesh_cancel_operation` |
 | `ownmesh.session` | Interactive sessions: `ownmesh_session_open` / `_attach` / `_write` / `_resize` / `_replay` / `_list` / `_show` / `_claim` / `_renew` / `_detach` / `_release` / `_give` / `_close` / `_terminate` |

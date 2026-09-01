@@ -63,7 +63,6 @@ where
                 "title": "cli",
                 "program": program,
                 "args": args,
-                "adapter_mode": "pty",
                 "idempotency_key": idempotency_key,
             });
             if program.is_none() {
@@ -230,13 +229,6 @@ where
             });
             Ok(())
         }
-        SessionCmd::Cancel { id } => {
-            let value = call_local_daemon("session.cancel", Some(json!({ "id": id })))?;
-            print_value(cli.json, &value, |_| {
-                println!("cancellation requested for {id}");
-            });
-            Ok(())
-        }
         SessionCmd::Close { id } => {
             let value = call_local_daemon("session.close", Some(json!({ "id": id })))?;
             print_value(cli.json, &value, |_| println!("closed {id}"));
@@ -330,28 +322,5 @@ mod tests {
         );
         assert_eq!(result, Err(ExitCode::UsageConfig));
         assert!(!remote_attempted.get());
-    }
-
-    #[test]
-    fn structured_cancel_routes_to_the_typed_local_method() {
-        let cli = Cli::try_parse_from(["ownmesh", "session", "cancel", "ses_1"])
-            .expect("session cancel parses");
-        let Commands::Session(cmd) = cli.command.as_ref().unwrap() else {
-            panic!("session command");
-        };
-        let called = Cell::new(false);
-        let result = dispatch_session_with(
-            &cli,
-            cmd,
-            |method, params| {
-                called.set(true);
-                assert_eq!(method, "session.cancel");
-                assert_eq!(params.unwrap()["id"], "ses_1");
-                Ok(json!({"cancel_requested": true, "session_id": "ses_1"}))
-            },
-            |_, _, _, _| panic!("local cancellation must not use remote routing"),
-        );
-        assert!(result.is_ok());
-        assert!(called.get());
     }
 }

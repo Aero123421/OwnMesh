@@ -31,7 +31,6 @@ ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
 ownmesh-policy = { path = "../ownmesh-policy" }
-ownmesh-profiles = { path = "../ownmesh-profiles" }
 ownmesh-transfer = { path = "../ownmesh-transfer" }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.12.12", default-features = false, features = [

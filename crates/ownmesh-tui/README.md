@@ -12,7 +12,7 @@ ownmesh-tui --check-i18n    # translation completeness (CI)
 
 ## Screens
 
-Dashboard · Devices · Workspaces · Sessions · Profiles · Approvals · Transfers · Activity · Diagnostics · Settings
+Dashboard · Devices · Workspaces · Sessions · Approvals · Transfers · Activity · Diagnostics · Settings
 
 ## Keys
 

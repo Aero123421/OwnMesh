@@ -271,7 +271,7 @@ def main() -> int:
     require_text(publish_job, "ownmesh-release-meta.json", "Release meta asset")
     require_text(publish_job, "scripts/generate_release_evidence.py", "Release evidence generator")
     require_text(publish_job, "release/mcp-catalog-current.json", "Release current catalog receipt")
-    require_text(publish_job, "release/mcp-catalog-baseline-v1.json", "Release catalog baseline")
+    require_text(publish_job, "release/mcp-catalog-baseline-v2.json", "Release catalog baseline")
     require_text(publish_job, "ownmesh-release-evidence.json", "Release evidence asset")
     require_text(publish_job, '"completeness_claim": false', "Release evidence honesty gate")
     # Checkout must drop credentials in every artifact-bearing release job.

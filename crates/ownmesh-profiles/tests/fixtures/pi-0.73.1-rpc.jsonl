@@ -1,7 +1,0 @@
-{"id":"ownmesh-prompt-1","type":"response","command":"prompt","success":true}
-{"type":"agent_start"}
-{"type":"message_update","message":{},"assistantMessageEvent":{"type":"thinking_delta","delta":"must-not-be-exposed"}}
-{"type":"message_update","message":{},"assistantMessageEvent":{"type":"text_delta","delta":"Hello from Pi"}}
-{"type":"tool_execution_start","toolCallId":"pi-tool-1","toolName":"bash","args":{"command":"redacted"}}
-{"type":"tool_execution_end","toolCallId":"pi-tool-1","toolName":"bash","result":{"content":[{"type":"text","text":"done"}]}}
-{"type":"agent_end","messages":[]}

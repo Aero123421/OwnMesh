@@ -15,7 +15,7 @@ pub enum ExitCode {
     DeviceOffline = 5,
     TimeoutCancelled = 6,
     Conflict = 7,
-    ProfileUnavailable = 8,
+    DependencyUnavailable = 8,
     Internal = 9,
 }
 
@@ -37,7 +37,7 @@ impl ExitCode {
             Self::DeviceOffline => "Device offline/unreachable",
             Self::TimeoutCancelled => "Timeout/cancelled",
             Self::Conflict => "Conflict/stale snapshot/controller conflict",
-            Self::ProfileUnavailable => "Profile/dependency unavailable",
+            Self::DependencyUnavailable => "Dependency unavailable",
             Self::Internal => "Internal error",
         }
     }
@@ -52,7 +52,7 @@ impl ExitCode {
             Self::DeviceOffline,
             Self::TimeoutCancelled,
             Self::Conflict,
-            Self::ProfileUnavailable,
+            Self::DependencyUnavailable,
             Self::Internal,
         ]
     }
@@ -125,8 +125,8 @@ pub enum ErrorCode {
     SelfReentrantExec,
 
     // exit 8
-    #[serde(rename = "OWNMESH_E_PROFILE_UNAVAILABLE")]
-    ProfileUnavailable,
+    #[serde(rename = "OWNMESH_E_DEPENDENCY_UNAVAILABLE")]
+    DependencyUnavailable,
     #[serde(rename = "OWNMESH_E_EXECUTABLE_FORMAT")]
     ExecutableFormat,
 
@@ -161,7 +161,7 @@ impl ErrorCode {
             Self::JournalCapacity => "OWNMESH_E_JOURNAL_CAPACITY",
             Self::TransitionRecoveryRequired => "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED",
             Self::SelfReentrantExec => "OWNMESH_E_SELF_REENTRANT_EXEC",
-            Self::ProfileUnavailable => "OWNMESH_E_PROFILE_UNAVAILABLE",
+            Self::DependencyUnavailable => "OWNMESH_E_DEPENDENCY_UNAVAILABLE",
             Self::ExecutableFormat => "OWNMESH_E_EXECUTABLE_FORMAT",
             Self::Internal => "OWNMESH_E_INTERNAL",
         }
@@ -195,7 +195,7 @@ impl ErrorCode {
             "OWNMESH_E_JOURNAL_CAPACITY" => Ok(Self::JournalCapacity),
             "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED" => Ok(Self::TransitionRecoveryRequired),
             "OWNMESH_E_SELF_REENTRANT_EXEC" => Ok(Self::SelfReentrantExec),
-            "OWNMESH_E_PROFILE_UNAVAILABLE" => Ok(Self::ProfileUnavailable),
+            "OWNMESH_E_DEPENDENCY_UNAVAILABLE" => Ok(Self::DependencyUnavailable),
             "OWNMESH_E_EXECUTABLE_FORMAT" => Ok(Self::ExecutableFormat),
             "OWNMESH_E_INTERNAL" => Ok(Self::Internal),
             _ => Err(DomainError::new(
@@ -228,7 +228,7 @@ impl ErrorCode {
             | Self::JournalCapacity
             | Self::TransitionRecoveryRequired
             | Self::SelfReentrantExec => ExitCode::Conflict,
-            Self::ProfileUnavailable | Self::ExecutableFormat => ExitCode::ProfileUnavailable,
+            Self::DependencyUnavailable | Self::ExecutableFormat => ExitCode::DependencyUnavailable,
             Self::Internal => ExitCode::Internal,
         }
     }
@@ -379,8 +379,8 @@ pub fn exit_code_table() -> [ExitCodeRow; 9] {
             meaning: ExitCode::Conflict.meaning(),
         },
         ExitCodeRow {
-            code: ExitCode::ProfileUnavailable.code(),
-            meaning: ExitCode::ProfileUnavailable.meaning(),
+            code: ExitCode::DependencyUnavailable.code(),
+            meaning: ExitCode::DependencyUnavailable.meaning(),
         },
         ExitCodeRow {
             code: ExitCode::Internal.code(),

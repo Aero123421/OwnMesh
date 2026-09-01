@@ -1029,8 +1029,8 @@ pub fn is_launchable_file(path: &Path) -> bool {
 /// `cfg!(windows)`), and `pathext` supplies the extension list (callers pass
 /// `std::env::var("PATHEXT")`); both are parameters so the Windows ordering
 /// can be unit-tested on any platform without mutating process env.  This is
-/// the pure core shared by the daemon, profile detection, review pinning and
-/// session launch so all four consumers agree about resolution.
+/// the pure core shared by the daemon, command execution, review pinning, and
+/// session launch so all consumers agree about resolution.
 #[must_use]
 pub fn resolve_executable_in_dirs(
     program: &str,
@@ -1060,7 +1060,7 @@ pub fn resolve_executable_in_dirs(
 }
 
 /// Like [`resolve_executable_in_dirs`] but skips candidates that are not
-/// actually launchable ([`is_launchable_file`]).  Profile detection uses this
+/// actually launchable ([`is_launchable_file`]). Command discovery uses this
 /// so a non-executable Unix file can never be reported "installed" while the
 /// launch path it yields would fail at spawn.
 #[must_use]
@@ -1175,8 +1175,8 @@ pub fn resolve_spawn_argv(
     // `dirs` is only extended on Unix (user-local CLI discovery); Windows
     // keeps the inherited user PATH, so the `mut` is unused there. An unset
     // `PATH` is treated as empty (never a hard failure) so the deterministic
-    // user-local dirs are still searched — matching profile discovery, which
-    // must not disagree with spawn resolution (P1-D).
+    // user-local dirs are still searched so discovery and spawn resolution
+    // cannot disagree (P1-D).
     #[cfg_attr(windows, allow(unused_mut))]
     let mut dirs: Vec<PathBuf> =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -1379,10 +1379,10 @@ ownmesh-ownmeshd.service`) — `ownmesh doctor` discloses the effective unit"
 /// those semantics must retain this path separately from the canonical backing
 /// executable used for identity pinning.
 ///
-/// Resolution uses the same launchable-file semantics as profile detection
+/// Resolution uses the same launchable-file semantics as command discovery
 /// (Unix: at least one execute bit; Windows: PATHEXT invocable-sibling
-/// ordering), so command execution, review pinning, session launch and profile
-/// discovery never disagree about which file is invocable: a non-executable
+/// ordering), so command execution, review pinning, and session launch never
+/// disagree about which file is invocable: a non-executable
 /// first PATH match is skipped exactly as discovery skips it, and an unset
 /// `PATH` still searches the deterministic user-local dirs (P1-D).
 #[must_use]
@@ -1408,8 +1408,8 @@ pub fn resolve_executable_invocation_path(program: &str, cwd: Option<&Path>) -> 
         // Windows/PATHEXT semantics for explicit paths without an extension:
         // an invocable `.exe/.com/.cmd/.bat` sibling wins over an extensionless
         // file (npm-style POSIX shims fail with Win32 error 193). This keeps
-        // profile detection, command execution, review pinning and session
-        // launch agreeing about resolution (P1-C).
+        // command discovery, review pinning, and session launch agreeing about
+        // resolution (P1-C).
         if cfg!(windows) && Path::new(raw).extension().is_none() {
             let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
             let name = candidate
@@ -1435,8 +1435,8 @@ pub fn resolve_executable_invocation_path(program: &str, cwd: Option<&Path>) -> 
     // `dirs` is only extended on Unix (user-local CLI discovery); Windows
     // keeps the inherited user PATH, so the `mut` is unused there. An unset
     // `PATH` is treated as empty (never a hard failure) so the deterministic
-    // user-local dirs are still searched — matching profile discovery, which
-    // must not disagree with invocation resolution (P1-D).
+    // user-local dirs are still searched so discovery cannot disagree with
+    // invocation resolution (P1-D).
     #[cfg_attr(windows, allow(unused_mut))]
     let mut dirs: Vec<PathBuf> =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -1905,8 +1905,8 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
             {
                 // Shared launchable resolver: PATH plus the deterministic
                 // user-local dirs (~/.local/bin, Cargo, Nix, NVM node bins),
-                // so command execution never disagrees with profile
-                // detection/review pinning/session launch about which file is
+                // so command execution never disagrees with discovery/review
+                // pinning/session launch about which file is
                 // invocable, and a bare name is never handed to the spawner
                 // (P1-D/P1-C). An unresolvable program fails closed before
                 // any process is spawned.
@@ -3260,8 +3260,12 @@ mod tests {
         );
         // PATHEXT entries that are not directly invocable (.ps1/.sh) and
         // duplicates are filtered out; case is preserved from PATHEXT.
-        let candidates = windows_pathext_candidates("opencode", Some(";.PS1;.exe;.CMD;.SH;.cmd"));
-        assert_eq!(candidates, vec!["opencode.exe", "opencode.CMD", "opencode"]);
+        let candidates =
+            windows_pathext_candidates("sample-tool", Some(";.PS1;.exe;.CMD;.SH;.cmd"));
+        assert_eq!(
+            candidates,
+            vec!["sample-tool.exe", "sample-tool.CMD", "sample-tool"]
+        );
         // Explicit extensions never go through PATHEXT ordering.
         let candidates = windows_pathext_candidates("pi.cmd", None);
         assert_eq!(candidates, vec!["pi.cmd"]);
@@ -3307,13 +3311,13 @@ mod tests {
     #[test]
     fn unix_resolution_is_bare_name_only() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("codex"), b"#!/bin/sh\n").unwrap();
-        std::fs::write(dir.path().join("codex.cmd"), b"@echo off\r\n").unwrap();
+        std::fs::write(dir.path().join("sample-tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("sample-tool.cmd"), b"@echo off\r\n").unwrap();
         // Unix semantics: the bare file is the only candidate, even when a
         // .cmd sibling exists (Windows PATHEXT semantics must not leak over).
         let dirs = vec![dir.path().to_path_buf()];
-        let resolved = resolve_executable_in_dirs("codex", &dirs, None, false, None).unwrap();
-        assert_eq!(resolved, dir.path().join("codex"));
+        let resolved = resolve_executable_in_dirs("sample-tool", &dirs, None, false, None).unwrap();
+        assert_eq!(resolved, dir.path().join("sample-tool"));
     }
 
     /// P1-C: an explicit relative path without an extension (`./pi`) must
@@ -3568,26 +3572,39 @@ mod tests {
     #[test]
     fn spawn_argv_unix_resolves_absolute_and_requires_exec() {
         let dir = tempdir().unwrap();
-        let shim = dir.path().join("codex");
+        let shim = dir.path().join("sample-tool");
         std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
         let dirs = vec![dir.path().to_path_buf()];
         #[cfg(unix)]
         {
             // Non-executable: unresolved (never hand a bare name to a spawner).
             assert_eq!(
-                resolve_spawn_argv_in_dirs("codex", &["exec".into()], &dirs, None, false, None),
+                resolve_spawn_argv_in_dirs(
+                    "sample-tool",
+                    &["exec".into()],
+                    &dirs,
+                    None,
+                    false,
+                    None
+                ),
                 Err(SpawnResolveError::NotFound)
             );
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&shim).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&shim, perms).unwrap();
-            let argv =
-                resolve_spawn_argv_in_dirs("codex", &["exec".into()], &dirs, None, false, None)
-                    .expect("resolved");
+            let argv = resolve_spawn_argv_in_dirs(
+                "sample-tool",
+                &["exec".into()],
+                &dirs,
+                None,
+                false,
+                None,
+            )
+            .expect("resolved");
             assert_eq!(argv[0], shim.display().to_string());
             assert_eq!(argv[1], "exec");
-            // Absolute-path programs are verified directly (profile launch plans).
+            // Absolute-path programs are verified directly.
             let argv = resolve_spawn_argv_in_dirs(
                 shim.to_str().unwrap(),
                 &["exec".into()],
@@ -3601,9 +3618,15 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            let argv =
-                resolve_spawn_argv_in_dirs("codex", &["exec".into()], &dirs, None, false, None)
-                    .expect("resolved");
+            let argv = resolve_spawn_argv_in_dirs(
+                "sample-tool",
+                &["exec".into()],
+                &dirs,
+                None,
+                false,
+                None,
+            )
+            .expect("resolved");
             assert_eq!(argv[0], shim.display().to_string());
         }
     }
@@ -3611,7 +3634,7 @@ mod tests {
     /// P1-D review: the actual spawn path (`build_command` behind
     /// `run_command`) must fail closed when a structured program resolves to
     /// nothing, instead of silently handing a bare name to the spawner and
-    /// letting the OS PATH lookup disagree with profile detection and review
+    /// letting the OS PATH lookup disagree with command discovery and review
     /// pinning. An absolute path to a missing file is deterministic on every
     /// platform and exercises the shared `resolve_spawn_argv` core on Unix
     /// (Windows already routes through it).
@@ -3834,15 +3857,15 @@ mod tests {
         let home = tempdir().unwrap();
         let local_bin = home.path().join(".local/bin");
         std::fs::create_dir_all(&local_bin).unwrap();
-        std::fs::write(local_bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(local_bin.join("sample-tool"), b"#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(local_bin.join("codex"))
+            let mut perms = std::fs::metadata(local_bin.join("sample-tool"))
                 .unwrap()
                 .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(local_bin.join("codex"), perms).unwrap();
+            std::fs::set_permissions(local_bin.join("sample-tool"), perms).unwrap();
         }
         let nvm_bin = home.path().join(".nvm/versions/node/v24.19.0/bin");
         std::fs::create_dir_all(&nvm_bin).unwrap();
@@ -3856,8 +3879,8 @@ mod tests {
         }
         let dirs = user_cli_search_dirs(Some(home.path()));
         assert_eq!(
-            resolve_executable_in_dirs("codex", &dirs, None, false, None),
-            Some(local_bin.join("codex"))
+            resolve_executable_in_dirs("sample-tool", &dirs, None, false, None),
+            Some(local_bin.join("sample-tool"))
         );
         assert_eq!(
             resolve_executable_in_dirs("pi", &dirs, None, false, None),
@@ -3893,7 +3916,7 @@ mod tests {
     }
 
     /// P1-D/P1-F: invocation-path resolution must use the same launchable-file
-    /// semantics as profile detection. A non-executable first PATH match must
+    /// semantics as command discovery. A non-executable first PATH match must
     /// be skipped (a later executable wins), so command/review pinning can
     /// never pin a file that discovery would not report installed and that
     /// spawning would reject with EACCES.
@@ -3906,33 +3929,34 @@ mod tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         // Non-executable first match (leftover shim without its exec bit).
-        std::fs::write(first.join("codex"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(first.join("sample-tool"), b"#!/bin/sh\n").unwrap();
         // Executable later match.
-        std::fs::write(second.join("codex"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(second.join("sample-tool"), b"#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(second.join("codex"))
+            let mut perms = std::fs::metadata(second.join("sample-tool"))
                 .unwrap()
                 .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(second.join("codex"), perms).unwrap();
+            std::fs::set_permissions(second.join("sample-tool"), perms).unwrap();
         }
         let dirs = vec![first.clone(), second.clone()];
-        // Profile detection (launchable) skips the first match.
+        // Command discovery (launchable) skips the first match.
         assert_eq!(
-            resolve_launchable_executable_in_dirs("codex", &dirs, None, false, None),
-            Some(second.join("codex"))
+            resolve_launchable_executable_in_dirs("sample-tool", &dirs, None, false, None),
+            Some(second.join("sample-tool"))
         );
         // Invocation resolution uses the same launchable core, so it must
         // agree (P1-F: no detect-ready-then-pin-unlaunchable divergence).
         assert_eq!(
-            resolve_launchable_executable_in_dirs("codex", &dirs, None, false, None),
-            Some(second.join("codex"))
+            resolve_launchable_executable_in_dirs("sample-tool", &dirs, None, false, None),
+            Some(second.join("sample-tool"))
         );
         // And spawn resolution agrees too.
-        let argv = resolve_spawn_argv_in_dirs("codex", &[], &dirs, None, false, None).unwrap();
-        assert_eq!(argv[0], second.join("codex").to_string_lossy());
+        let argv =
+            resolve_spawn_argv_in_dirs("sample-tool", &[], &dirs, None, false, None).unwrap();
+        assert_eq!(argv[0], second.join("sample-tool").to_string_lossy());
     }
 
     /// P1-D: an unset `PATH` must not make invocation/spawn resolution fail
@@ -3944,24 +3968,27 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(bin.join("sample-tool"), b"#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(bin.join("codex")).unwrap().permissions();
+            let mut perms = std::fs::metadata(bin.join("sample-tool"))
+                .unwrap()
+                .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(bin.join("codex"), perms).unwrap();
+            std::fs::set_permissions(bin.join("sample-tool"), perms).unwrap();
         }
         // The pure dirs core: user-local dirs are searched even with an empty
         // PATH-derived list (the production wrapper treats unset PATH as
         // empty and appends these dirs).
         let dirs = user_cli_search_dirs(Some(home.path()));
         assert_eq!(
-            resolve_launchable_executable_in_dirs("codex", &dirs, None, false, None),
-            Some(bin.join("codex")),
+            resolve_launchable_executable_in_dirs("sample-tool", &dirs, None, false, None),
+            Some(bin.join("sample-tool")),
             "user-local dirs must be searched with no PATH"
         );
-        let argv = resolve_spawn_argv_in_dirs("codex", &[], &dirs, None, false, None).unwrap();
-        assert_eq!(argv[0], bin.join("codex").to_string_lossy());
+        let argv =
+            resolve_spawn_argv_in_dirs("sample-tool", &[], &dirs, None, false, None).unwrap();
+        assert_eq!(argv[0], bin.join("sample-tool").to_string_lossy());
     }
 }

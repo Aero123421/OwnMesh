@@ -88,7 +88,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
 
    | Scope | Tools (examples) |
    |---|---|
-   | `ownmesh.read` / `ownmesh.device` | `ownmesh_list_devices`, `ownmesh_fs_list` / `ownmesh_list_files`, `ownmesh_fs_read` / `ownmesh_read_file`, `ownmesh_get_operation`, `ownmesh_list_profiles` |
+   | `ownmesh.read` / `ownmesh.device` | `ownmesh_list_devices`, `ownmesh_fs_list` / `ownmesh_list_files`, `ownmesh_fs_read` / `ownmesh_read_file`, `ownmesh_get_operation` |
    | `ownmesh.write` | `ownmesh_fs_write` / `ownmesh_write_file` |
    | `ownmesh.exec` | `ownmesh_command_run` / `ownmesh_run_command`, `ownmesh_command_shell` / `ownmesh_run_shell`, `ownmesh_cancel_operation` |
    | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` under `full_user_access`/`full_access` only (denied in `workspace_only`/`recommended` until OS confinement); controller `input_seq`/`resize_seq` exact-once (RetryPending is at-most-once / uncertain, never re-delivers); E5 partial: reconnect matrix still open; always pass `workspace_id` |
@@ -284,10 +284,11 @@ First determine which OpenAI lifecycle owns the metadata:
    list TTL and request-local metadata. Neither mechanism substitutes for the
    published-plugin workflow above.
 
-Snapshot clients remain safe during the catalog 1.x window: old names and
-required argument semantics stay callable even when deprecated aliases are
-hidden from the newest list. CI compares every release to
-`release/mcp-catalog-baseline-v1.json` and blocks unversioned breaking changes.
+Catalog v2 intentionally removes coding-agent Profile tools and Profile-specific
+session arguments. Clients must rediscover tools and launch external CLIs with
+exact generic `program`/`args`. CI compares releases to
+`release/mcp-catalog-baseline-v2.json` and blocks further unversioned breaking
+changes; catalog v1 is historical evidence only.
 
 ---
 
@@ -297,8 +298,8 @@ hidden from the newest list. CI compares every release to
 pnpm -r test
 # includes packages/control-plane MCP → DeviceRoom → approval / scope / prompt-injection tests
 
-cargo test -p ownmesh-profiles
-# 9 official profile fixture conformance + generic launch
+cargo test -p ownmesh-session -p ownmesh-session-host
+# generic exact-argv process/PTY lifecycle, replay, and persisted-state handling
 
 cargo test -p ownmeshd prompt_injection
 # device policy remains final under injection payloads

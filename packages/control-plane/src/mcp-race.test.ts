@@ -314,7 +314,7 @@ test("SQL store: late unconditional-style update cannot clobber via put; CAS fro
   assert.equal((await store.getMcpOperation(op.operation_id))?.status, "completed");
 });
 
-test("get_device success+not-found and list_profiles ops are pollable after simulated restart", async () => {
+test("get_device success and not-found ops are pollable after simulated restart", async () => {
   const store = new MemoryStore();
   const token = await authed(store);
   const deviceId = "dev_race_local_poll_01";
@@ -345,17 +345,11 @@ test("get_device success+not-found and list_profiles ops are pollable after simu
   assert.equal(getMissSc.status, "failed");
   const getMissId = String(getMissSc.operation_id);
 
-  const profiles = await callTool(store, token, "ownmesh_list_profiles", {});
-  const profilesSc = profiles.body.result!.structuredContent!;
-  assert.equal(profilesSc.status, "completed");
-  const profilesId = String(profilesSc.operation_id);
-
   // Simulated Worker isolate restart: empty tracker, same store.
   const fresh = new OperationTracker();
   for (const [opId, expectStatus] of [
     [getOkId, "completed"],
     [getMissId, "failed"],
-    [profilesId, "completed"],
   ] as const) {
     assert.ok(await store.getMcpOperation(opId), `store must hold ${opId}`);
     const poll = await callTool(

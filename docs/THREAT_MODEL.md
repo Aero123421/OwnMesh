@@ -53,7 +53,7 @@
 
 | Surface | Release | Primary new exposure | Where controls live |
 | --- | --- | --- | --- |
-| Agent transport (E1) | v1.2 | Structured adapter framing between daemon and coding-agent CLIs | `ownmeshd/src/structured_adapter.rs`, `agent_transport.rs` |
+| Agent transport (E1) | v1.2 | Authenticated bounded routing between the control plane and daemon | `ownmeshd/src/agent_transport.rs`, `control-plane/src/device-room.ts` |
 | Remote routing (E2) | v1.2 | Control-plane-routed device operations; no local fallback | `ownmeshd/src/runtime.rs`, `control-plane/src/device-room.ts` |
 | Action binding (E3) | v1.2 | Approval decisions bound to an exact operation + payload hash | `control-plane/src/mcp.ts`, `ownmeshd/src/review_manifest.rs` |
 | Workspace custody (E4) | v1.2 | Workspace-relative path authority and ACL | `control-plane/migrations/0011_workspace_acl.sql` |
@@ -82,6 +82,7 @@ the release notes for the evidence split.
 | A8 Command injection | Turn structured argv into shell metachar execution | Structured exec never invokes a shell |
 | A9 Supply chain | Troianed dependency or release asset | `cargo audit` / pnpm audit, SBOM, checksums + signing (ADR-0001) |
 | A10 Honest-but-curious operator | Learn secrets from telemetry/support | Telemetry default OFF; bundle redaction; audit local-first |
+| A11 Untrusted external CLI | Use ambient OS-user authority or make internal tool calls OwnMesh cannot see | Exact program/args authorization at launch; process/session controls; operator-supplied OS sandbox when child confinement is required |
 
 ## 4. STRIDE summary
 
@@ -91,7 +92,7 @@ the release notes for the evidence split.
 | Tampering | Mutated WS envelope, patched binary, journal rewrite | Parser limits + signature/MAC; release signing partially waived (**W-SIGN**) |
 | Repudiation | Deny an elevated run occurred | Local audit log append; CP audit metadata for cloud path |
 | Information disclosure | Token in logs/MCP/support bundle | Secret newtypes, redaction helpers, checklist-linked tests |
-| Denial of service | Giant frames, output bombs, hung adapters | Frame caps, output limits, adapter process isolation (no in-process plugin load) |
+| Denial of service | Giant frames, output bombs, hung child processes | Frame caps, output limits, bounded process/session supervision |
 | Elevation of privilege | Unprivileged daemon → root without broker proof | Broker boundary + networkless bind; Full Access still requires valid broker crypto |
 
 ## 5. Control → test evidence map (harden-07)
@@ -106,7 +107,7 @@ the release notes for the evidence split.
 | Broker boundary / networkless | `crates/ownmesh-broker/tests/security_boundary.rs`, `ownmesh-broker-client` |
 | IPC spoofing | `crates/ownmesh-ipc/tests/security_spoofing.rs` |
 | WS / envelope parser fuzz | `crates/ownmesh-protocol/tests/fuzz_harness_build.rs`, `ws_parser_fuzz.rs` |
-| Adapter isolation | `crates/ownmesh-profiles/tests/adapter_isolation.rs` |
+| External process/session boundary | `crates/ownmesh-session-host/**`, `crates/ownmeshd` session tests |
 | Prompt injection | `packages/control-plane/src/mcp.test.ts`, `security-harden.test.ts`; `ownmeshd` policy tests |
 | §12 relay fail-closed | `crates/ownmesh-transfer/**`, `packages/control-plane/src/wrangler-config.test.ts` |
 | §14 telemetry OFF / redaction / audit keep | `crates/ownmesh-config/**`, `ownmesh-update/**`, `ownmesh-diagnostics/**`, `ownmesh-policy` Full Access tests |
@@ -151,5 +152,8 @@ OwnMesh intentionally concentrates power on a user-owned PC. A malicious process
 3. Model/tool text cannot become an authorization oracle.
 4. Restricted presets enforce workspace path policy; Full Access does so only by explicit user choice — **with no hidden hard denies**.
 5. Cloud relay and central telemetry stay **opt-in**.
+6. Generic external CLI authorization ends at the launched process/session
+   boundary. Vendor-internal actions are outside OwnMesh visibility, and
+   `workspace_id`/`cwd` are not OS confinement.
 
 Operators who need multi-user hardening must rely on OS account separation, disk encryption, and not sharing the OwnMesh runtime directory across users.

@@ -39,7 +39,6 @@ pub fn collect_doctor_report(
         privacy_policy: observe_privacy_policy(paths),
         service,
         journals: observe_journals(paths),
-        profile_discovery: observe_profile_discovery(),
         layout_custody: observe_layout_custody(paths),
     };
 
@@ -778,73 +777,6 @@ fn observe_journals(paths: &OwnMeshPaths) -> ownmesh_diagnostics::JournalsObserv
     obs
 }
 
-/// Read-only official-profile discovery health (P1-D/P1-F): runs the official
-/// registry against the deterministic search (system PATH + user-local dirs)
-/// and compares it with the bare system PATH. Never spawns version probes —
-/// observation must not run binaries as a side effect.
-fn observe_profile_discovery() -> ownmesh_diagnostics::ProfileDiscoveryObservation {
-    #[cfg(windows)]
-    {
-        // Windows user bins are already reachable through the inherited user
-        // PATH; no separate user-local discovery step exists there.
-        ownmesh_diagnostics::ProfileDiscoveryObservation::default()
-    }
-
-    #[cfg(not(windows))]
-    {
-        let mut obs = ownmesh_diagnostics::ProfileDiscoveryObservation::default();
-        let Some(home) = env::var_os("HOME") else {
-            // A missing HOME means the deterministic user-local search could not
-            // be evaluated at all — that is a discovery-health issue, not a
-            // healthy result (P1-F).
-            obs.home_unavailable = true;
-            return obs;
-        };
-        let system_dirs: Vec<PathBuf> = env::var_os("PATH")
-            .map(|path| env::split_paths(&path).collect())
-            .unwrap_or_default();
-        let user_dirs = ownmesh_exec::user_cli_search_dirs(Some(home.as_ref()));
-        let mut full_dirs = system_dirs.clone();
-        for dir in &user_dirs {
-            if !full_dirs.contains(dir) {
-                full_dirs.push(dir.clone());
-            }
-        }
-        // Existing user-local bin dirs that are absent from PATH. Home is
-        // collapsed to `~` so the disclosure matches the resolver's own
-        // labels (#145).
-        let home_path = std::path::PathBuf::from(&home);
-        for dir in &user_dirs {
-            if dir.is_dir() && !system_dirs.contains(dir) {
-                let label = match dir.strip_prefix(&home_path) {
-                    Ok(stripped) if !stripped.as_os_str().is_empty() => {
-                        format!("~/{}", stripped.display())
-                    }
-                    _ => dir.display().to_string(),
-                };
-                obs.existing_dirs_not_searched.push(label);
-            }
-        }
-        // Official profiles that resolve only through the full search.
-        let registry = ownmesh_profiles::ProfileRegistry::with_official();
-        for profile in registry.list() {
-            let id = &profile.id;
-            let via_system = registry
-                .resolve_binary_in_dirs(id, &system_dirs)
-                .ok()
-                .flatten();
-            let via_full = registry
-                .resolve_binary_in_dirs(id, &full_dirs)
-                .ok()
-                .flatten();
-            if via_full.is_some() && via_system.is_none() {
-                obs.user_local_only.push(id.clone());
-            }
-        }
-        obs
-    }
-}
-
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1364,98 +1296,6 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(appears_redacted(&json));
         assert!(!json.contains("host_nonce"));
-    }
-
-    /// P1-D/P1-F: doctor runs official profile discovery and compares the
-    /// bare system PATH with the deterministic user-local search — an
-    /// installed CLI that only a login shell finds is surfaced, and dirs that
-    /// exist but are not searched are named. The check is pure over the
-    /// environment inputs so it does not depend on the CI host's PATH.
-    #[cfg(not(windows))]
-    #[test]
-    fn doctor_profile_discovery_compares_service_and_login_paths() {
-        let dir = tempdir().unwrap();
-        let bin = dir.path().join(".local/bin");
-        fs::create_dir_all(&bin).unwrap();
-        let codex = bin.join("codex");
-        fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&codex).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&codex, perms).unwrap();
-        }
-
-        // Isolated computation with a system-only PATH.
-        let system_dirs: Vec<PathBuf> =
-            env::split_paths(&std::ffi::OsString::from("/usr/bin:/bin")).collect();
-        let full_dirs = {
-            let mut dirs = system_dirs.clone();
-            for d in ownmesh_exec::user_cli_search_dirs(Some(dir.path())) {
-                if !dirs.contains(&d) {
-                    dirs.push(d);
-                }
-            }
-            dirs
-        };
-        let registry = ownmesh_profiles::ProfileRegistry::with_official();
-        let user_local_only: Vec<String> = registry
-            .list()
-            .iter()
-            .filter(|p| {
-                registry
-                    .resolve_binary_in_dirs(&p.id, &system_dirs)
-                    .ok()
-                    .flatten()
-                    .is_none()
-                    && registry
-                        .resolve_binary_in_dirs(&p.id, &full_dirs)
-                        .ok()
-                        .flatten()
-                        .is_some()
-            })
-            .map(|p| p.id.clone())
-            .collect();
-        assert!(
-            user_local_only.contains(&"codex".to_string()),
-            "codex installed in ~/.local/bin must resolve through the full search only: \
-{user_local_only:?}"
-        );
-
-        // Feed the observation into run_doctor and expect a warn row.
-        let mut input = ownmesh_diagnostics::DoctorInput::default();
-        input.binary.cli_version = "1.2.13".into();
-        input.profile_discovery = ownmesh_diagnostics::ProfileDiscoveryObservation {
-            user_local_only,
-            existing_dirs_not_searched: vec![bin.display().to_string()],
-            home_unavailable: false,
-        };
-        let report = ownmesh_diagnostics::run_doctor(&input);
-        let check = report
-            .checks
-            .iter()
-            .find(|c| c.id == "profiles.discovery")
-            .expect("profile discovery check row");
-        assert_eq!(check.status, ownmesh_diagnostics::CheckStatus::Warn);
-        assert!(check.message.contains("codex"), "{check:?}");
-        assert!(
-            check.message.contains("not-installed"),
-            "must explain the daemon-vs-login consequence: {check:?}"
-        );
-
-        // All-clear → pass.
-        let mut input = ownmesh_diagnostics::DoctorInput::default();
-        input.binary.cli_version = "1.2.13".into();
-        let report = ownmesh_diagnostics::run_doctor(&input);
-        let check = report
-            .checks
-            .iter()
-            .find(|c| c.id == "profiles.discovery")
-            .unwrap();
-        assert_eq!(check.status, ownmesh_diagnostics::CheckStatus::Pass);
-        let json = serde_json::to_string(&report).unwrap();
-        assert!(appears_redacted(&json));
     }
 
     #[test]
@@ -2166,25 +2006,6 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
                 .contains("full validation"),
             "{obs:?}"
         );
-    }
-
-    /// P1-F: a missing `HOME` must surface as a profile-discovery health
-    /// issue, not silently produce a healthy observation.
-    #[cfg(not(windows))]
-    #[test]
-    fn missing_home_surfaces_profile_discovery_issue() {
-        let dir = tempdir().unwrap();
-        let paths = OwnMeshPaths::for_base(dir.path());
-        paths.ensure_layout().unwrap();
-        let obs = observe_profile_discovery();
-        if std::env::var_os("HOME").is_none() {
-            assert!(
-                obs.home_unavailable,
-                "missing HOME must be surfaced: {obs:?}"
-            );
-        } else {
-            assert!(!obs.home_unavailable, "HOME present: {obs:?}");
-        }
     }
 
     /// #168: doctor must fail on a group-writable ancestor, not hide it

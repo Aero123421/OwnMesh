@@ -494,43 +494,6 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "write",
   },
   {
-    name: "ownmesh_list_profiles",
-    description:
-      "List official CLI profiles. Without device_id returns catalog metadata; with device_id runs live PATH detection on that PC (credentials never leave the device).",
-    inputSchema: {
-      type: "object",
-      properties: { ...deviceProp, ...cursorProps },
-      additionalProperties: false,
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      openWorldHint: false,
-      idempotentHint: true,
-    },
-    scope: "ownmesh.read",
-    risk: "read",
-  },
-  {
-    name: "ownmesh_profile_show",
-    description:
-      "Show one official CLI profile's device-local detection and safe authentication status. Credentials are never read or returned.",
-    inputSchema: {
-      type: "object",
-      properties: { ...deviceProp, id: str },
-      required: ["device_id", "id"],
-      additionalProperties: false,
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      openWorldHint: false,
-      idempotentHint: true,
-    },
-    scope: "ownmesh.read",
-    risk: "read",
-  },
-  {
     name: "ownmesh_fs_list",
     description: "List files in a workspace path on a device",
     inputSchema: {
@@ -910,23 +873,6 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         title: str,
         program: str,
         args: { type: "array", items: { type: "string" } },
-        profile_id: {
-          type: "string",
-          description: "Official adapter id; binds the source-backed local profile contract",
-        },
-        prompt: {
-          type: "string",
-          description: "Single prompt passed as one argv/protocol value for a profile adapter",
-        },
-        native_session_id: {
-          type: "string",
-          description: "Vendor-native session id for explicit continuation; never inferred from output",
-        },
-        adapter_mode: {
-          type: "string",
-          enum: ["auto", "structured", "pty"],
-          description: "Structured refuses a PTY downgrade; PTY is explicit",
-        },
         workspace_id: str,
         idempotency_key: {
           type: "string",
@@ -954,23 +900,6 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         title: str,
         program: str,
         args: { type: "array", items: { type: "string" } },
-        profile_id: {
-          type: "string",
-          description: "Official adapter id; binds the source-backed local profile contract",
-        },
-        prompt: {
-          type: "string",
-          description: "Single prompt passed as one argv/protocol value for a profile adapter",
-        },
-        native_session_id: {
-          type: "string",
-          description: "Vendor-native session id for explicit continuation; never inferred from output",
-        },
-        adapter_mode: {
-          type: "string",
-          enum: ["auto", "structured", "pty"],
-          description: "Structured refuses a PTY downgrade; PTY is explicit",
-        },
         workspace_id: str,
         idempotency_key: {
           type: "string",
@@ -1116,9 +1045,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         // is intentionally independent from UTF-8 session sequence replay so
         // each observer can resume bounded binary-safe output independently.
         sidecar_cursor: { type: "integer", minimum: 0 },
-        // Default replay returns normalized events only. This opt-in returns a
-        // separately cursor-paged, base64-encoded diagnostic page capped by
-        // the device runtime.
+        // Opt in to a separately cursor-paged, base64-encoded raw page capped
+        // by the device runtime.
         raw_sidecar: { type: "boolean", default: false },
         limit: { type: "integer", minimum: 1, maximum: 1000 },
         workspace_id: str,
@@ -1132,33 +1060,6 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
-      openWorldHint: false,
-      idempotentHint: true,
-    },
-    scope: "ownmesh.session",
-    risk: "session",
-  },
-  {
-    name: "ownmesh_session_cancel",
-    description: "Cancel the active structured profile turn while preserving its reusable native session",
-    inputSchema: {
-      type: "object",
-      properties: {
-        ...deviceProp,
-        session_id: str,
-        lease_id: str,
-        controller_epoch: { type: "integer", minimum: 1 },
-        workspace_id: str,
-        idempotency_key: {
-          type: "string",
-          description: "Required caller idempotency key",
-        },
-      },
-      required: ["device_id", "session_id", "lease_id", "controller_epoch", "workspace_id", "idempotency_key"],
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
       openWorldHint: false,
       idempotentHint: true,
     },
@@ -1760,11 +1661,11 @@ export const PUBLISHED_MCP_TOOLS: readonly McpToolDef[] = MCP_TOOLS.filter(
 );
 
 /** Catalog compatibility contract for frozen ChatGPT/plugin snapshots. */
-export const MCP_CATALOG_VERSION = 1;
+export const MCP_CATALOG_VERSION = 2;
 export const MCP_CATALOG_COMPATIBILITY = {
-  min_version: 1,
-  max_version: 1,
-  deprecated_aliases_callable_through: "1.x",
+  min_version: 2,
+  max_version: 2,
+  deprecated_aliases_callable_through: "2.x",
 } as const;
 
 export type McpCatalogSurface = "all" | "core" | "admin" | "agents";
@@ -1782,7 +1683,7 @@ function toolSurface(tool: McpToolDef): Exclude<McpCatalogSurface, "all"> {
     || name === "ownmesh_daemon_unlock"
     || name === "ownmesh_token_revoke"
   ) return "admin";
-  if (name.startsWith("ownmesh_profile_") || name.startsWith("ownmesh_review_")) {
+  if (name.startsWith("ownmesh_review_")) {
     return "agents";
   }
   return "core";
@@ -2233,96 +2134,6 @@ function diagnosisText(value: unknown, max = 64): string | null {
   return /[\u0000-\u001f\u007f]/.test(value) ? null : value;
 }
 
-/**
- * Credential-ish marker used to redact free-form diagnosis notes before they
- * are exposed or persisted. The device payload is only semi-trusted: a
- * compromised or buggy Agent could stuff secrets, credential assignments, or
- * user-home paths into its notes, which the Control Plane would otherwise
- * persist and relay. Lines that are credential assignments or private-key PEM
- * blocks are dropped; embedded `name=value` credential assignments and
- * user-home paths are replaced with `[REDACTED]`.
- */
-const CREDENTIAL_NOTE_MARKER =
-  /(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key|session[_-]?secret|private[_-]?key|authorization|bearer|password|passwd|secret|credential|token|key)/i;
-
-/**
- * A whitespace-delimited value that looks like a credential token: contains a
- * token separator (`-`, `_`, `.`, `/`, `+`, `=`) or is a long opaque
- * alphanumeric run (e.g. a JWT payload). Short plain words ("was",
- * "refreshed", "installed") are never treated as secrets, so benign prose
- * like "the token was refreshed" survives redaction.
- */
-const TOKEN_LIKE_VALUE =
-  /(?:[A-Za-z0-9_\-./+=]*[_.\-\/+=][A-Za-z0-9_\-./+=]*|[A-Za-z0-9]{16,})/;
-
-/**
- * Short plain words that may sit between a credential marker and its value in
- * prose ("token is <value>", "api key was <value>", "password happens to be:
- * <value>"). Filler is bounded so marker-plus-filler forms cannot smuggle an
- * opaque value past the space-delimited redaction, while benign prose whose
- * trailing word is not token-like ("the token was refreshed", "the key to
- * success is persistence") still survives because the trailing word is not a
- * credential-shaped value.
- */
-const CREDENTIAL_NOTE_FILLER = /(?:\s+[A-Za-z]{1,12}){0,5}/;
-
-/**
- * Redact a free-form diagnosis note (secret/path/env-safe, bounded). Returns
- * `null` when the value is not a usable note after redaction.
- */
-function redactDiagnosisNote(value: unknown): string | null {
-  // Accept a slightly larger pre-redaction window so a note that is mostly
-  // redaction boilerplate still fits the exposed 160-char cap.
-  const text = diagnosisText(value, 512);
-  if (text === null) return null;
-  const REDACTED = "[REDACTED]";
-  // Drop credential-assignment lines and private-key PEM blocks entirely.
-  const kept = text.split(/\r?\n/).filter((line) => {
-    const trimmed = line.trim();
-    if (/^-----begin[^-]*private key/i.test(trimmed)) return false;
-    return !CREDENTIAL_NOTE_MARKER.test(trimmed) || !/^[^\s=]+\s*[:=]\s*\S/.test(trimmed);
-  });
-  let redacted = kept.join("\n");
-  // Replace embedded credential assignments anywhere (`token=abc`, `KEY: xyz`,
-  // `token: is sk-…`). Up to two short filler words may separate the marker
-  // from the value after the `:`/`=` so a value cannot hide behind prose
-  // (`token: was set to abc` redacts through the first non-space token, the
-  // same conservative posture as the plain assignment form).
-  redacted = redacted.replace(
-    new RegExp(
-      `\\b${CREDENTIAL_NOTE_MARKER.source}(?:'s)?\\s*[:=]\\s*(?:[A-Za-z]{1,12}\\s+){0,2}[^\\s,;]+`,
-      "gi",
-    ),
-    REDACTED,
-  );
-  // Replace space-delimited credential values (`Bearer sk-secret123`,
-  // `authorization eyJ...`) when the value looks like a token, so a
-  // semi-trusted device cannot exfiltrate a bearer credential through a
-  // diagnosis note that is not assignment-shaped. Marker-plus-filler forms
-  // (`token is <long-opaque-value>`, `api key was <value>`, `password happens
-  // to be: <value>`) are covered too: up to five short filler words and an
-  // optional `:`/`=` may sit between the marker and the value, and filler
-  // never lets a token-like value past the redaction. Benign prose whose
-  // trailing word is not token-like ("the token was refreshed") still
-  // survives.
-  redacted = redacted.replace(
-    new RegExp(
-      `\\b${CREDENTIAL_NOTE_MARKER.source}(?:'s)?${CREDENTIAL_NOTE_FILLER.source}\\s*(?:[:=]\\s*)?(${TOKEN_LIKE_VALUE.source})`,
-      "gi",
-    ),
-    REDACTED,
-  );
-  // Replace user-home path prefixes that would name a host account. POSIX
-  // (`/home/alice`, `/Users/alice`) and Windows (`C:\Users\Alice`, `\Users\Alice`)
-  // forms are both covered; the drive letter is optional so a relative
-  // `\Users\Alice` path is redacted too. The match stops at the first path
-  // separator, so the account name is always removed even when the note
-  // continues with deeper path components.
-  redacted = redacted.replace(/\/(?:home|Users)\/[^/\s]+/gi, REDACTED);
-  redacted = redacted.replace(/(?:[A-Za-z]:)?\\Users\\[^\\\s]+/gi, REDACTED);
-  return diagnosisText(redacted, 160);
-}
-
 function diagnosisAgentVersion(value: unknown): string | null {
   const text = diagnosisText(value, 32);
   return text && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(text)
@@ -2545,17 +2356,12 @@ export function normalizeSystemDiagnosis(
   const stateFor = (id: string) => String(checks.find((check) => check.id === id)?.state || "");
   const sessionsCheck = checks.find((check) => check.id === "sessions");
   const staleCount = Number(sessionsCheck?.stale_count || 0);
-  // Additive device-local journal / discovery fields (P0-A/P0-B/P1-F): old
+  // Additive device-local journal fields (P0-A/P0-B/P1-F): old
   // Agents omit them; new Agents expose typed status. They never replace the
   // check-id contract — they only lift `overall` away from an unconditional
   // `healthy` when the device reports a real failure.
   const transitionStatus = diagnosisNestedStatus(source, ["journals", "transition", "status"], ["ok", "warn", "fail"]);
   const opJournalStatus = diagnosisNestedStatus(source, ["journals", "op_journal", "status"], ["ok", "warn", "critical", "degraded"]);
-  const profileDiscoveryStatus = diagnosisNestedStatus(
-    source,
-    ["profile_discovery", "status"],
-    ["ok", "warn"],
-  );
   const journals = source?.journals && typeof source.journals === "object" && !Array.isArray(source.journals)
     ? source.journals as Record<string, unknown>
     : undefined;
@@ -2576,17 +2382,8 @@ export function normalizeSystemDiagnosis(
   const opJournalRecoverableOrphaned = opJournal && Number.isSafeInteger(opJournal.recoverable_orphaned)
     ? Number(opJournal.recoverable_orphaned) > 0
     : false;
-  const profileDiscovery = source?.profile_discovery && typeof source.profile_discovery === "object" && !Array.isArray(source.profile_discovery)
-    ? source.profile_discovery as Record<string, unknown>
-    : undefined;
   const countField = (value: unknown, max = 1_000_000): number | undefined =>
     Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= max ? Number(value) : undefined;
-  const profileNotes = Array.isArray(profileDiscovery?.notes)
-    ? (profileDiscovery.notes as unknown[])
-        .slice(0, 8)
-        .map(redactDiagnosisNote)
-        .filter((n): n is string => n !== null)
-    : [];
   const overall = stateFor("daemon") === "lockdown"
     ? "lockdown"
     : stateFor("session_supervisor") === "unavailable"
@@ -2601,9 +2398,7 @@ export function normalizeSystemDiagnosis(
             ? "op_journal_pressure"
             : opJournalRecoverableOrphaned
               ? "op_journal_recoverable_orphaned"
-            : profileDiscoveryStatus === "warn" || profileDiscoveryStatus === "malformed"
-              ? "profile_discovery_issues"
-              : sessionsCheck?.state === "stale" || staleCount > 0
+            : sessionsCheck?.state === "stale" || staleCount > 0
                 ? "stale_sessions"
                 : stateFor("workspace") === "unbound_enforced"
                   ? "workspace_selection_required"
@@ -2622,7 +2417,7 @@ export function normalizeSystemDiagnosis(
         ? "repair_op_journal_locally"
         : overall === "agent_contract_drift"
         ? "upgrade_control_plane"
-        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "op_journal_recoverable_orphaned" || overall === "profile_discovery_issues" || overall === "agent_route_offline"
+        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "op_journal_recoverable_orphaned" || overall === "agent_route_offline"
         ? "run_local_doctor"
         : overall === "stale_sessions"
           ? "reconcile_stale_sessions"
@@ -2641,7 +2436,7 @@ export function normalizeSystemDiagnosis(
     },
     checks: [enrollment, routeCheck, ...checks],
     recommendation,
-    // Additive allowlisted device-local journal/discovery health (present only
+    // Additive allowlisted device-local journal health (present only
     // when the Agent reports it; never a log/path/env exfiltration surface).
     journals: {
       transition: {
@@ -2662,10 +2457,6 @@ export function normalizeSystemDiagnosis(
         ...(opJournal?.uncertain !== undefined ? { uncertain: countField(opJournal.uncertain, 1_000_000) } : {}),
         ...(opJournal?.degraded === true || opJournalStatus === "degraded" ? { degraded: true } : {}),
       },
-    },
-    profile_discovery: {
-      status: profileDiscoveryStatus,
-      notes: profileNotes,
     },
     grants: {
       bounded_tool: countField(
@@ -3981,13 +3772,6 @@ function toolCapability(toolName: string): string {
     case "ownmesh_fs_stat":
     case "ownmesh_fs_read":
       return "filesystem.read";
-    case "ownmesh_list_profiles":
-    case "ownmesh_profile_list":
-      return "profile.list";
-    case "ownmesh_profile_show":
-      return "profile.show";
-    case "ownmesh_profile_scan":
-      return "profile.scan";
     case "ownmesh_system_diagnose":
       return "system.diagnose";
     case "ownmesh_policy_show":
@@ -4023,8 +3807,6 @@ function toolCapability(toolName: string): string {
       return "session.release";
     case "ownmesh_session_give":
       return "session.give";
-    case "ownmesh_session_cancel":
-      return "session.cancel";
     case "ownmesh_session_close":
       return "session.close";
     case "ownmesh_session_terminate":
@@ -4121,8 +3903,6 @@ function toolAction(toolName: string): string {
       return "session.release";
     case "ownmesh_session_give":
       return "session.give";
-    case "ownmesh_session_cancel":
-      return "session.cancel";
     case "ownmesh_session_close":
       return "session.close";
     case "ownmesh_session_terminate":
@@ -4165,13 +3945,6 @@ function toolAction(toolName: string): string {
       return "grants.list";
     case "ownmesh_grants_revoke":
       return "grants.revoke";
-    case "ownmesh_list_profiles":
-    case "ownmesh_profile_list":
-      return "profile.list";
-    case "ownmesh_profile_show":
-      return "profile.show";
-    case "ownmesh_profile_scan":
-      return "profile.scan";
     case "ownmesh_system_diagnose":
       return "system.diagnose";
     case "ownmesh_policy_show":
@@ -4677,22 +4450,6 @@ export function approvalRequiredEnvelope(opts: {
     warnings: opts.warnings,
   });
 }
-
-// ---------------------------------------------------------------------------
-// Official profile catalog metadata (control-plane discovery; device detects)
-// ---------------------------------------------------------------------------
-
-export const OFFICIAL_PROFILE_CATALOG = [
-  { id: "codex", display_name: "OpenAI Codex CLI", binaries: ["codex"] },
-  { id: "claude-code", display_name: "Claude Code", binaries: ["claude"] },
-  { id: "kimi-code", display_name: "Kimi Code", binaries: ["kimi"] },
-  { id: "opencode", display_name: "OpenCode", binaries: ["opencode"] },
-  { id: "pi", display_name: "Pi Coding Agent", binaries: ["pi"] },
-  { id: "agy", display_name: "Antigravity CLI", binaries: ["agy"] },
-  { id: "qwen-code", display_name: "Qwen Code", binaries: ["qwen"] },
-  { id: "hermes-agent", display_name: "Hermes Agent", binaries: ["hermes"] },
-  { id: "qoder", display_name: "Qoder CLI", binaries: ["qodercli"] },
-] as const;
 
 // ---------------------------------------------------------------------------
 // E9 public transfer coordinator (metadata only)
@@ -6363,39 +6120,6 @@ async function handleMcpCore(
       const page = paginateList(transfers, { cursor: typeof args.cursor === "string" ? args.cursor : undefined, limit: typeof args.limit === "number" ? args.limit : undefined });
       const env = makeEnvelope({ operation_id: operationId, status: "completed", summary: `listed ${page.page.length} transfer(s)`, data: { transfers: page.page }, truncated: page.truncated, next_cursor: page.next_cursor, warnings: injectWarnings });
       await persistOp(store, tracker, { ...env, tool: name, principal: rec.principal, tenant_id: rec.tenant_id, created_at: nowIso(), updated_at: nowIso() });
-      return mcpResult(id, toolContent(env));
-    }
-
-    if (name === "ownmesh_list_profiles" && !deviceId) {
-      // Catalog-only fallback when no device is selected. With device_id, route
-      // to ownmeshd for real PATH detection (E6).
-      const { page, next_cursor, truncated } = paginateList(
-        [...OFFICIAL_PROFILE_CATALOG],
-        {
-          cursor: args.cursor ? String(args.cursor) : undefined,
-          limit: typeof args.limit === "number" ? args.limit : undefined,
-        },
-      );
-      const env = makeEnvelope({
-        operation_id: operationId,
-        status: "completed",
-        summary: "official profile catalog (no device_id; detection not run)",
-        data: {
-          profiles: page,
-          note: "Pass device_id for live PATH detection on the selected PC.",
-        },
-        truncated,
-        next_cursor,
-        warnings: injectWarnings,
-      });
-      await persistOp(store, tracker, {
-        ...env,
-        tool: name,
-        principal: rec.principal,
-        tenant_id: rec.tenant_id,
-        created_at: nowIso(),
-        updated_at: nowIso(),
-      });
       return mcpResult(id, toolContent(env));
     }
 

@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_transition_preserves_shared_adapter_manifest() {
+    async fn structured_transition_preserves_shared_io_mode() {
         let root = tempdir().unwrap();
         let state = SupervisorState::new(root.path());
         let mut manifest = HostManifest::new(
@@ -1114,8 +1114,6 @@ mod tests {
         )
         .unwrap();
         manifest.io_mode = HostIoMode::StructuredPipes;
-        manifest.profile_id = Some("fixture".into());
-        manifest.adapter_dialect = Some("jsonl".into());
         let binding = state
             .spawn_with_io(
                 manifest,
@@ -1132,8 +1130,7 @@ mod tests {
         let primary = OwnerSpool::open(root.path(), "ses_structured_transition").unwrap();
         let stderr = OwnerSpool::create_stderr(root.path(), "ses_structured_transition").unwrap();
         assert_eq!(primary.manifest(), stderr.manifest());
-        assert_eq!(primary.manifest().profile_id.as_deref(), Some("fixture"));
-        assert_eq!(primary.manifest().adapter_dialect.as_deref(), Some("jsonl"));
+        assert_eq!(primary.manifest().io_mode, HostIoMode::StructuredPipes);
         // `cmd.exe` may already have exited on Windows; state cleanup remains
         // best effort for a naturally exited structured child.
         let _ = state.terminate(&successor).await;
@@ -1259,8 +1256,6 @@ mod tests {
         )
         .unwrap();
         manifest.io_mode = HostIoMode::StructuredPipes;
-        manifest.profile_id = Some("fixture".into());
-        manifest.adapter_dialect = Some("jsonl".into());
         let command = if cfg!(windows) {
             PtyCommand {
                 program: "cmd.exe".into(),
@@ -1410,8 +1405,8 @@ mod tests {
     /// running, its attested child in state `Z`, and the session pinned as
     /// `running` with close refusing to reconcile it.
     ///
-    /// Structured pipes are the official-profile transport (a Codex
-    /// `app-server` over stdio JSON-RPC), which is where this was first seen.
+    /// Structured pipes are a generic stdio transport, which is where this was
+    /// first seen.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_child_that_exits_behind_held_pipes_attests_as_exited() {

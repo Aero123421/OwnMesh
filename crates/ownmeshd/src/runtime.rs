@@ -33,8 +33,6 @@ mod runtime_session;
 mod runtime_transfer;
 #[path = "runtime_workspace.rs"]
 mod runtime_workspace;
-#[path = "structured_adapter.rs"]
-mod structured_adapter;
 #[cfg(target_os = "linux")]
 use broker_runtime::load_linux_broker_client;
 #[cfg(target_os = "macos")]
@@ -82,10 +80,6 @@ use ownmesh_policy::{
     OperationFacts, PolicyDocument, PolicyRule, StoredGrant, MAX_BOUNDED_TOOL_GRANT_TTL_SECS,
     MAX_BOUNDED_TOOL_GRANT_USES, TAG_READS_SENSITIVE_LOCATION, TAG_WRITES_SENSITIVE_LOCATION,
 };
-use ownmesh_profiles::{
-    official_adapter_spec, parse_adapter_event_page_for_dialect, AdapterDialect, NativeResume,
-    ProfileRegistry, ProfileStatus,
-};
 use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{
     SessionKind, SessionManager, SessionState, SidecarHostBinding, StreamKind as SessionStreamKind,
@@ -116,7 +110,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use structured_adapter::{cancel_protocol_frame, latest_codex_turn_id, StructuredAdapterDriver};
 use tokio::sync::{watch, Mutex, Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
@@ -131,7 +124,6 @@ pub mod session_methods {
     pub const DETACH: &str = "session.detach";
     pub const RELEASE: &str = "session.release";
     pub const GIVE: &str = "session.give";
-    pub const CANCEL: &str = "session.cancel";
     pub const CLOSE: &str = "session.close";
     pub const TERMINATE: &str = "session.terminate";
     pub const REPLAY: &str = "session.replay";
@@ -694,8 +686,8 @@ pub struct DaemonRuntime {
     /// Process-local live PTY hosts keyed by session id (not persisted).
     /// Metadata/leases survive restart; live hosts are re-created only on open.
     live_hosts: HashMap<String, LiveHost>,
-    /// Dedicated local-only proxy for persistent remote PTYs and all official
-    /// structured profile sessions. Interactive local PTYs remain embedded.
+    /// Dedicated local-only proxy for persistent remote PTYs. Interactive
+    /// local PTYs remain embedded.
     supervisor: Option<SupervisorClient>,
     transition_journal: SessionTransitionJournal,
     /// Bounded health state for transition-journal recovery (P0-A). Records
@@ -1652,149 +1644,6 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             .unwrap_or(0)
     }
 
-    /// Run the documented, bounded structured child bootstrap through the
-    /// persistent supervisor.  The child owns no network listener; stdout is
-    /// drained solely through the owner-only sidecar spool.
-    async fn bootstrap_structured_adapter(
-        supervisor: &SupervisorClient,
-        binding: &SupervisorBinding,
-        dialect: AdapterDialect,
-        prompt: Option<&str>,
-        native_session_id: Option<&str>,
-        cwd: &str,
-    ) -> IpcResult<(Option<String>, u64)> {
-        let mut driver = StructuredAdapterDriver::new(dialect, prompt, native_session_id, cwd)
-            .map_err(|message| IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message,
-            })?;
-        for request in driver.start().map_err(|message| IpcError::Remote {
-            code: app_error::INVALID_PARAMS,
-            message,
-        })? {
-            supervisor
-                .write(binding, request)
-                .await
-                .map_err(|err| IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!("structured adapter bootstrap write failed: {err}"),
-                })?;
-        }
-        if driver.is_open_ready() {
-            return Ok((driver.native_session_id().map(str::to_owned), 0));
-        }
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut cursor = 0_u64;
-        let mut partial = Vec::new();
-        while tokio::time::Instant::now() < deadline {
-            let page = supervisor
-                .drain_stream(binding, cursor, 64 * 1024, "stdout")
-                .await
-                .map_err(|err| IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!("structured adapter bootstrap drain failed: {err}"),
-                })?;
-            cursor = page.next_offset.unwrap_or(page.total_bytes);
-            if page.bytes.is_empty() {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                continue;
-            }
-            partial.extend_from_slice(&page.bytes);
-            if partial.len() > structured_adapter::MAX_STRUCTURED_FRAME_BYTES {
-                return Err(IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: "structured adapter emitted an overlong bootstrap record".into(),
-                });
-            }
-            while let Some(end) = partial.iter().position(|byte| *byte == b'\n') {
-                let record: Vec<_> = partial.drain(..=end).collect();
-                for request in driver
-                    .on_record(&record)
-                    .map_err(|message| IpcError::Remote {
-                        code: app_error::CONFLICT,
-                        message,
-                    })?
-                {
-                    supervisor
-                        .write(binding, request)
-                        .await
-                        .map_err(|err| IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!("structured adapter follow-up write failed: {err}"),
-                        })?;
-                }
-                if driver.is_open_ready() {
-                    return Ok((driver.native_session_id().map(str::to_owned), cursor));
-                }
-            }
-        }
-        Err(IpcError::Remote {
-            code: app_error::CONFLICT,
-            message: "structured adapter bootstrap timed out".into(),
-        })
-    }
-
-    /// Continue servicing only denial-side protocol requests after bootstrap.
-    /// The cursor is monotonic, so each vendor request ID is answered at most
-    /// once by this pump. Binding rotation/controller loss invalidates writes
-    /// and stops the pump fail-closed.
-    fn spawn_fail_closed_adapter_pump(
-        supervisor: SupervisorClient,
-        binding: SupervisorBinding,
-        dialect: AdapterDialect,
-        mut cursor: u64,
-    ) {
-        if matches!(
-            dialect,
-            AdapterDialect::ClaudeStreamJson
-                | AdapterDialect::PiRpc
-                | AdapterDialect::AgyStreamJson
-        ) {
-            return;
-        }
-        drop(tokio::spawn(async move {
-            let mut partial = Vec::new();
-            loop {
-                let page = match supervisor
-                    .drain_stream(&binding, cursor, 64 * 1024, "stdout")
-                    .await
-                {
-                    Ok(page) => page,
-                    Err(_) => return,
-                };
-                cursor = page.next_offset.unwrap_or(page.total_bytes);
-                if page.bytes.is_empty() {
-                    match supervisor.status(&binding).await {
-                        Ok(status) if status.exited => return,
-                        Ok(_) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                            continue;
-                        }
-                        Err(_) => return,
-                    }
-                }
-                partial.extend_from_slice(&page.bytes);
-                if partial.len() > structured_adapter::MAX_STRUCTURED_FRAME_BYTES {
-                    return;
-                }
-                while let Some(end) = partial.iter().position(|byte| *byte == b'\n') {
-                    let record: Vec<_> = partial.drain(..=end).collect();
-                    let response =
-                        match structured_adapter::fail_closed_protocol_frame(dialect, &record) {
-                            Ok(response) => response,
-                            Err(_) => continue,
-                        };
-                    if let Some(response) = response {
-                        if supervisor.write(&binding, response).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }));
-    }
-
     fn new_id(prefix: &str) -> String {
         format!("{prefix}{}", Uuid::new_v4().simple())
     }
@@ -2117,9 +1966,6 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::OPS_FS_STAT,
             methods::OPS_FS_READ,
             methods::OPS_LOGS_QUERY,
-            methods::PROFILE_LIST,
-            methods::PROFILE_SCAN,
-            methods::PROFILE_SHOW,
             methods::TRANSFER_STATUS,
             methods::TRANSFER_LIST,
             methods::GRANTS_LIST,
@@ -3658,7 +3504,7 @@ full_user_access/full_access for arbitrary commands",
             // launchable path. The old code silently fell back to the bare
             // name when resolution failed, and the Unix spawn path then ran
             // `Command::new(program)` — an OS PATH lookup that can disagree
-            // with profile detection/review pinning/session launch and spawn
+            // with review pinning/session launch and spawn
             // a different binary than the one authorized (detect-ready then
             // spawn-bare-name inconsistency, TOCTOU).
             //
@@ -6380,8 +6226,6 @@ path or install the tool so detection and execution agree",
             ops_methods::WORKSPACE_UPDATE => self.handle_workspace_update(params, client),
             ops_methods::WORKSPACE_REMOVE => self.handle_workspace_remove(params, client),
             ops_methods::SYSTEM_DIAGNOSE => self.handle_system_diagnose(params, client).await,
-            methods::PROFILE_LIST | methods::PROFILE_SCAN => self.handle_profile_list(params),
-            methods::PROFILE_SHOW => self.handle_profile_show(params),
             methods::APPROVAL_LIST => self.handle_approval_list(),
             methods::APPROVAL_SHOW => self.handle_approval_show(params),
             methods::APPROVAL_APPROVE => self.handle_approval_approve(params, client).await,
@@ -6426,7 +6270,6 @@ path or install the tool so detection and execution agree",
             session_methods::DETACH => self.handle_session_detach(params, client).await,
             session_methods::RELEASE => self.handle_session_release(params, client),
             session_methods::GIVE => self.handle_session_give(params, client).await,
-            session_methods::CANCEL => self.handle_session_cancel(params, client).await,
             session_methods::CLOSE => self.handle_session_close(params, client).await,
             session_methods::TERMINATE => self.handle_session_terminate(params, client).await,
             session_methods::REPLAY => self.handle_session_replay(params, client).await,
@@ -7310,66 +7153,6 @@ run `ownmesh doctor` or inspect {} ",
     /// Directory hosting the durable transition journal (for diagnostics).
     fn transition_journal_dir(&self) -> PathBuf {
         self.paths.state_dir.join("session-transitions")
-    }
-
-    fn handle_profile_list(&self, params: Option<Value>) -> IpcResult<Value> {
-        #[derive(Deserialize)]
-        struct P {
-            #[serde(default)]
-            cursor: Option<String>,
-            #[serde(default)]
-            limit: Option<usize>,
-        }
-        let p: P = parse_params(params)?;
-        let reg = ProfileRegistry::with_official();
-        let mut statuses: Vec<ProfileStatus> = reg.detect_all();
-        statuses.sort_by(|a, b| a.id.cmp(&b.id));
-        let limit = p.limit.unwrap_or(32).clamp(1, 64);
-        let start = p
-            .cursor
-            .as_deref()
-            .and_then(|c| statuses.iter().position(|s| s.id == c).map(|i| i + 1))
-            .unwrap_or(0);
-        let end = (start + limit).min(statuses.len());
-        let page = &statuses[start..end];
-        let truncated = end < statuses.len();
-        let next_cursor = if truncated {
-            page.last().map(|s| s.id.clone())
-        } else {
-            None
-        };
-        Ok(json!({
-            "profiles": page,
-            "count": page.len(),
-            "total": statuses.len(),
-            "truncated": truncated,
-            "next_cursor": next_cursor,
-            "official_count": 9,
-            "note": "local PATH detection only; credentials never leave the device",
-        }))
-    }
-
-    fn handle_profile_show(&self, params: Option<Value>) -> IpcResult<Value> {
-        #[derive(Deserialize)]
-        struct P {
-            id: String,
-        }
-        let p: P = parse_params(params)?;
-        let reg = ProfileRegistry::with_official();
-        let profile = reg.get(&p.id).map_err(|e| IpcError::Remote {
-            code: app_error::INVALID_PARAMS,
-            message: e.to_string(),
-        })?;
-        let status = reg.detect(&p.id).map_err(|e| IpcError::Remote {
-            code: app_error::INTERNAL,
-            message: e.to_string(),
-        })?;
-        Ok(json!({
-            "profile": profile,
-            "status": status,
-            "adapter": official_adapter_spec(&p.id),
-            "auth_status": "unknown_no_credential_probe",
-        }))
     }
 
     fn require_reader(&self, session_id: &str, principal: &str, now_unix: i64) -> IpcResult<()> {
@@ -8730,6 +8513,56 @@ mod device_binding_tests {
         Ok(dir)
     }
 
+    #[tokio::test]
+    async fn removed_profile_and_turn_methods_are_explicitly_method_not_found() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let client = ClientIdentity::new("legacy-client", "test");
+
+        for method in [
+            "profile.list",
+            "profile.show",
+            "profile.scan",
+            "session.cancel",
+        ] {
+            let err = runtime.dispatch(method, None, &client).await.unwrap_err();
+            assert!(matches!(
+                err,
+                IpcError::Remote {
+                    code: app_error::METHOD_NOT_FOUND,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_profile_session_inputs_are_rejected_without_launching() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let client = ClientIdentity::new("legacy-client", "test");
+
+        for params in [
+            json!({ "profile_id": "legacy-vendor", "prompt": "do work" }),
+            json!({ "kind": "profile_agent", "program": "sample-tool" }),
+        ] {
+            let err = runtime
+                .dispatch(session_methods::OPEN, Some(params), &client)
+                .await
+                .unwrap_err();
+            match err {
+                IpcError::Remote { code, message } => {
+                    assert_eq!(code, app_error::INVALID_PARAMS);
+                    assert!(message.contains("program/args"));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            assert!(runtime.sessions.list().is_empty());
+        }
+    }
+
     #[test]
     fn authenticated_workspace_registry_contains_ids_and_policy_but_no_roots() {
         let dir = tempdir().unwrap();
@@ -8910,7 +8743,6 @@ mod device_binding_tests {
                 "device-bound",
                 "client:remote:tenant:owner",
                 DaemonRuntime::now(),
-                None,
             )
             .unwrap();
         runtime
@@ -8959,7 +8791,6 @@ mod device_binding_tests {
                 "dead-child",
                 "client:remote:tenant:owner",
                 DaemonRuntime::now(),
-                None,
             )
             .unwrap();
         runtime
@@ -9006,7 +8837,6 @@ mod device_binding_tests {
                     "dead-after-restart",
                     "client:remote:tenant:owner",
                     DaemonRuntime::now(),
-                    None,
                 )
                 .unwrap();
             runtime
@@ -9076,7 +8906,6 @@ mod device_binding_tests {
                     title,
                     "client:remote:tenant:owner",
                     DaemonRuntime::now(),
-                    None,
                 )
                 .unwrap();
             let lease = session.controller.clone().unwrap();
@@ -9099,8 +8928,6 @@ mod device_binding_tests {
                     cols: 80,
                     rows: 24,
                     io_mode: HostIoMode::StructuredPipes,
-                    profile_id: Some("test-profile".into()),
-                    adapter_dialect: Some("test-jsonl".into()),
                 },
                 lease.expires_unix,
             )
@@ -9227,7 +9054,6 @@ mod device_binding_tests {
                 "interrupted-open",
                 "client:remote:tenant:owner",
                 DaemonRuntime::now(),
-                None,
             )
             .unwrap();
         let lease = session.controller.clone().unwrap();
@@ -9257,8 +9083,6 @@ mod device_binding_tests {
                 cols: 80,
                 rows: 24,
                 io_mode: HostIoMode::StructuredPipes,
-                profile_id: Some("test-profile".into()),
-                adapter_dialect: Some("test-jsonl".into()),
             })
             .await
             .unwrap();
@@ -9335,7 +9159,6 @@ mod device_binding_tests {
                 "live-child",
                 "client:remote:tenant:owner",
                 DaemonRuntime::now(),
-                None,
             )
             .unwrap();
         let child_pid = std::process::id();
@@ -9398,7 +9221,6 @@ mod device_binding_tests {
                 "zombie-child",
                 "client:remote:tenant:owner",
                 DaemonRuntime::now(),
-                None,
             )
             .unwrap();
 
@@ -9501,7 +9323,7 @@ mod device_binding_tests {
 
         let dead = runtime
             .sessions
-            .open(SessionKind::Pty, "dead", "owner", now, None)
+            .open(SessionKind::Pty, "dead", "owner", now)
             .unwrap();
         runtime
             .sessions
@@ -9514,7 +9336,7 @@ mod device_binding_tests {
             .expect("this test process is live");
         let live = runtime
             .sessions
-            .open(SessionKind::Pty, "live", "owner", now, None)
+            .open(SessionKind::Pty, "live", "owner", now)
             .unwrap();
         runtime
             .sessions
@@ -12075,7 +11897,7 @@ mod broker_intent_tests {
     /// P1-D review: `handle_exec` must reject a structured program that
     /// cannot be resolved to a launchable file, fail-closed, instead of
     /// silently falling back to a bare-name spawn whose OS PATH lookup can
-    /// disagree with profile detection/review pinning (detect-ready then
+    /// disagree with review pinning (resolve-ready then
     /// spawn-bare-name inconsistency). The error names the program and the
     /// remedy.
     #[tokio::test]
@@ -12874,7 +12696,7 @@ mod journal_lifecycle_tests {
         let now = DaemonRuntime::now();
         let info = runtime
             .sessions
-            .open(SessionKind::Pty, "journal-test", "owner", now, None)
+            .open(SessionKind::Pty, "journal-test", "owner", now)
             .unwrap();
         if closed {
             runtime.sessions.close(&info.id).unwrap();
@@ -12994,7 +12816,7 @@ mod journal_lifecycle_tests {
         // controller lease, a controller attach succeeds.
         let other = runtime
             .sessions
-            .open(SessionKind::Pty, "fence-unrelated", "owner", now, None)
+            .open(SessionKind::Pty, "fence-unrelated", "owner", now)
             .expect("open unrelated session")
             .id;
         runtime
@@ -13070,8 +12892,6 @@ mod journal_lifecycle_tests {
                 "crash-window",
                 "owner_a",
                 now,
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -13192,8 +13012,6 @@ mod journal_lifecycle_tests {
                 "crash-window-ahead",
                 "owner_a",
                 now,
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -13318,7 +13136,7 @@ mod journal_lifecycle_tests {
         // A brand-new unrelated session still opens without any journal error.
         runtime
             .sessions
-            .open(SessionKind::Pty, "after-recovery", "owner", now, None)
+            .open(SessionKind::Pty, "after-recovery", "owner", now)
             .expect("unrelated session open must succeed");
     }
 
@@ -13422,7 +13240,7 @@ mod journal_lifecycle_tests {
         // An unrelated session still opens — no global poison pill.
         runtime
             .sessions
-            .open(SessionKind::Pty, "after-retained", "owner", now, None)
+            .open(SessionKind::Pty, "after-retained", "owner", now)
             .expect("unrelated session open must succeed");
     }
 
@@ -13621,7 +13439,6 @@ mod journal_lifecycle_tests {
                     "probe-clear",
                     "owner",
                     DaemonRuntime::now(),
-                    None,
                 )
                 .unwrap();
             runtime.sessions.close(&info.id).unwrap();
@@ -13679,7 +13496,7 @@ mod journal_lifecycle_tests {
         // Unrelated sessions still open — no global poison pill.
         runtime
             .sessions
-            .open(SessionKind::Pty, "after-bad-bound", "owner", now, None)
+            .open(SessionKind::Pty, "after-bad-bound", "owner", now)
             .expect("unrelated session open must succeed");
     }
 
@@ -16164,13 +15981,7 @@ cleanup cannot leave the legacy large-body copy behind"
         let remote_principal = "client:remote:tenant_test:principal_test";
         let info = runtime
             .sessions
-            .open(
-                SessionKind::Pty,
-                "renew-exact-once",
-                remote_principal,
-                now,
-                None,
-            )
+            .open(SessionKind::Pty, "renew-exact-once", remote_principal, now)
             .unwrap();
         let lease = runtime
             .sessions
@@ -16283,13 +16094,7 @@ cleanup cannot leave the legacy large-body copy behind"
         let remote_principal = "client:remote:tenant_test:principal_close";
         let info = runtime
             .sessions
-            .open(
-                SessionKind::Pty,
-                "close-exact-once",
-                remote_principal,
-                now,
-                None,
-            )
+            .open(SessionKind::Pty, "close-exact-once", remote_principal, now)
             .unwrap();
         let lease = runtime
             .sessions

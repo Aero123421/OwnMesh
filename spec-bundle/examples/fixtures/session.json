@@ -3,7 +3,6 @@
   "session_type": "terminal",
   "device_id": "dev_windows-01",
   "workspace_id": "ws_app",
-  "profile_id": "codex",
   "state": "running",
   "created_by": "prin_owner1",
   "created_at": "2026-08-06T00:00:00Z",
@@ -11,6 +10,5 @@
   "controller_lease_version": 3,
   "controller_lease_expires_at": "2026-08-06T00:05:00Z",
   "last_event_seq": 42,
-  "native_session_id": "native-abc",
   "process_id": 4242
 }

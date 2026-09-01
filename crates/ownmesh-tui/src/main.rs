@@ -490,12 +490,11 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         KeyCode::Char('2') => app.goto_screen(Screen::Devices),
         KeyCode::Char('3') => app.goto_screen(Screen::Workspaces),
         KeyCode::Char('4') => app.goto_screen(Screen::Sessions),
-        KeyCode::Char('5') => app.goto_screen(Screen::Profiles),
-        KeyCode::Char('6') => app.goto_screen(Screen::Approvals),
-        KeyCode::Char('7') => app.goto_screen(Screen::Transfers),
-        KeyCode::Char('8') => app.goto_screen(Screen::Activity),
-        KeyCode::Char('9') => app.goto_screen(Screen::Diagnostics),
-        KeyCode::Char('0') => app.goto_screen(Screen::Settings),
+        KeyCode::Char('5') => app.goto_screen(Screen::Approvals),
+        KeyCode::Char('6') => app.goto_screen(Screen::Transfers),
+        KeyCode::Char('7') => app.goto_screen(Screen::Activity),
+        KeyCode::Char('8') => app.goto_screen(Screen::Diagnostics),
+        KeyCode::Char('9' | '0') => app.goto_screen(Screen::Settings),
         KeyCode::Char('w') => {
             app.open_setup_wizard();
         }
@@ -1099,9 +1098,9 @@ mod tests {
     fn keyboard_list_navigation_clamps_to_existing_rows() {
         let rt = nav_runtime();
         let mut app = test_app();
-        app.goto_screen(Screen::Profiles);
-        let len = app.profile_lines().len();
-        assert!(len > 1, "profiles fixture should have several rows");
+        app.goto_screen(Screen::Transfers);
+        let len = app.transfer_lines().len();
+        assert!(len > 1, "transfer view should have several rows");
         for _ in 0..len + 5 {
             handle_key(&mut app, press(KeyCode::Char('j')), &rt);
         }
@@ -1130,7 +1129,7 @@ mod tests {
 
         // Numeric shortcut.
         handle_key(&mut app, press(KeyCode::Char('5')), &rt);
-        assert_eq!(app.screen, Screen::Profiles);
+        assert_eq!(app.screen, Screen::Approvals);
         assert_eq!(app.list_cursor, 0);
 
         // Esc back to the dashboard.
