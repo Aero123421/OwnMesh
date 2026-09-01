@@ -12,7 +12,8 @@ import {
 type BaselineTool = {
   name: string;
   required: string[];
-  properties: Record<string, string>;
+  property_schema_sha256: string[];
+  property_names: string[];
   additional_properties: boolean;
   annotations: Record<string, unknown> | null;
 };
@@ -30,7 +31,7 @@ function digest(value: unknown): string {
 }
 
 async function baseline(): Promise<CatalogBaseline> {
-  const path = new URL("../../../release/mcp-catalog-baseline-v1.json", import.meta.url);
+  const path = new URL("../../../release/mcp-catalog-baseline-v2.json", import.meta.url);
   return JSON.parse(await readFile(path, "utf8")) as CatalogBaseline;
 }
 
@@ -83,7 +84,13 @@ test("published catalog remains callable and schema-compatible with the release 
       && !Array.isArray(current.inputSchema.properties)
       ? current.inputSchema.properties as Record<string, unknown>
       : {};
-    for (const [field, oldDigest] of Object.entries(old.properties)) {
+    assert.equal(
+      old.property_names.length,
+      old.property_schema_sha256.length,
+      `${old.name} baseline property arrays differ in length`,
+    );
+    for (const [index, field] of old.property_names.entries()) {
+      const oldDigest = old.property_schema_sha256[index];
       assert.ok(field in currentProperties, `${old.name} removed snapshot field ${field}`);
       assert.equal(
         digest(currentProperties[field]),

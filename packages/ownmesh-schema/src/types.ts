@@ -39,7 +39,7 @@ export type OperationStatus =
   | "failed"
   | "cancelled"
   | "timed_out";
-export type SessionType = "process" | "terminal" | "profile" | "local_shell";
+export type SessionType = "process" | "terminal" | "local_shell";
 export type SessionState =
   | "starting"
   | "running"
@@ -181,7 +181,6 @@ export interface Session {
   session_type: SessionType;
   device_id: string;
   workspace_id?: string;
-  profile_id?: string;
   state: SessionState;
   created_by: string;
   created_at: string;
@@ -189,7 +188,6 @@ export interface Session {
   controller_lease_version?: number;
   controller_lease_expires_at?: string;
   last_event_seq?: number;
-  native_session_id?: string;
   process_id?: number;
 }
 

@@ -30,7 +30,6 @@ ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
 ownmesh-logs = { path = "../ownmesh-logs" }
 ownmesh-policy = { path = "../ownmesh-policy" }
-ownmesh-profiles = { path = "../ownmesh-profiles" }
 ownmesh-protocol = { path = "../ownmesh-protocol" }
 ownmesh-session = { path = "../ownmesh-session" }
 ownmesh-transition-journal = { path = "../ownmesh-transition-journal" }

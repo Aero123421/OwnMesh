@@ -440,25 +440,6 @@ pub struct JournalsObservation {
     pub op_journal_read_error: Option<String>,
 }
 
-/// Read-only observation of official-profile discovery (P1-D/P1-F): runs the
-/// deterministic search (system PATH + user-local dirs) and compares it with
-/// the bare system PATH. Never spawns version probes — observation must not
-/// run binaries.
-#[derive(Debug, Clone, Default)]
-pub struct ProfileDiscoveryObservation {
-    /// Official profiles that resolve only through user-local search dirs,
-    /// i.e. a login shell would find them but a systemd user service with a
-    /// system-only PATH would report them not-installed.
-    pub user_local_only: Vec<String>,
-    /// User-local bin dirs that exist on disk but are absent from PATH
-    /// (would report installed CLIs as not-installed).
-    pub existing_dirs_not_searched: Vec<String>,
-    /// `HOME` is unset, so the deterministic user-local search could not be
-    /// evaluated at all. This is a discovery-health issue, not a healthy
-    /// result: installed user CLIs may be reported not-installed.
-    pub home_unavailable: bool,
-}
-
 /// Full set of doctor inputs gathered by the CLI (read-only observations).
 #[derive(Debug, Clone, Default)]
 pub struct DoctorInput {
@@ -471,7 +452,6 @@ pub struct DoctorInput {
     pub privacy_policy: PrivacyPolicyObservation,
     pub service: ServiceObservation,
     pub journals: JournalsObservation,
-    pub profile_discovery: ProfileDiscoveryObservation,
     /// Ancestor custody of config/state/runtime. Empty means the same walk
     /// the Agent uses at start found no blocking ancestor.
     pub layout_custody: LayoutCustodyObservation,
@@ -1224,62 +1204,6 @@ after the operation finishes or reconcile the marker manually",
                 input.journals.op_journal_durable_bytes,
                 input.journals.op_journal_in_progress
             ),
-        ));
-    }
-
-    // Official-profile discovery (P1-D/P1-F): installed CLIs that only
-    // resolve through user-local dirs (or dirs that exist but are not
-    // searched) must be surfaced instead of an unconditional healthy result.
-    // A missing `HOME` means the user-local search could not be evaluated at
-    // all — that is a discovery-health issue, not a healthy result.
-    let discovery_warned = !input.profile_discovery.user_local_only.is_empty()
-        || !input
-            .profile_discovery
-            .existing_dirs_not_searched
-            .is_empty()
-        || input.profile_discovery.home_unavailable;
-    if discovery_warned {
-        let mut detail = String::new();
-        if input.profile_discovery.home_unavailable {
-            detail.push_str(
-                "HOME is unset, so the deterministic user-local CLI search could not be evaluated; \
-installed user CLIs may be reported not-installed",
-            );
-        }
-        if !input.profile_discovery.user_local_only.is_empty() {
-            if !detail.is_empty() {
-                detail.push_str("; ");
-            }
-            detail.push_str("official profile(s) resolve only through user-local search dirs, not the service PATH: ");
-            detail.push_str(&input.profile_discovery.user_local_only.join(", "));
-        }
-        if !input
-            .profile_discovery
-            .existing_dirs_not_searched
-            .is_empty()
-        {
-            if !detail.is_empty() {
-                detail.push_str("; ");
-            }
-            detail.push_str("user-local bin dir(s) exist but are not searched: ");
-            detail.push_str(
-                &input
-                    .profile_discovery
-                    .existing_dirs_not_searched
-                    .join(", "),
-            );
-        }
-        checks.push(DoctorCheck::warn(
-            "profiles.discovery",
-            format!(
-                "official profile discovery mismatch — {detail}; a login shell finds these, a \
-daemon service with the bare system PATH reports them not-installed"
-            ),
-        ));
-    } else {
-        checks.push(DoctorCheck::pass(
-            "profiles.discovery",
-            "official profile discovery consistent with service PATH",
         ));
     }
 
@@ -2130,65 +2054,6 @@ mod tests {
         assert!(op.message.contains("read-only"), "{}", op.message);
         assert!(op.message.contains("--repair-journal"), "{}", op.message);
         assert_eq!(report.outcome, DoctorOutcome::Error, "{report:?}");
-    }
-
-    /// P1-D/P1-F: run_doctor must surface user-local-only official profiles
-    /// and existing-but-unsearched user bin dirs instead of an unconditional
-    /// healthy result.
-    #[test]
-    fn doctor_surfaces_profile_discovery_mismatch() {
-        let mut input = DoctorInput::default();
-        input.binary.cli_version = "1.2.13".into();
-        let report = run_doctor(&input);
-        let check = report
-            .checks
-            .iter()
-            .find(|c| c.id == "profiles.discovery")
-            .unwrap();
-        assert_eq!(check.status, CheckStatus::Pass, "{report:?}");
-
-        input.profile_discovery = ProfileDiscoveryObservation {
-            user_local_only: vec!["codex".into(), "pi".into()],
-            existing_dirs_not_searched: vec!["~/.local/bin".into()],
-            home_unavailable: false,
-        };
-        let report = run_doctor(&input);
-        let check = report
-            .checks
-            .iter()
-            .find(|c| c.id == "profiles.discovery")
-            .unwrap();
-        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
-        assert!(check.message.contains("codex"));
-        assert!(check.message.contains("pi"));
-        assert!(check.message.contains("~/.local/bin"));
-        assert!(check.message.contains("not-installed"));
-
-        // The serialized report must stay redacted (profile ids are fixed
-        // official ids — no user data or tokens).
-        let json = serde_json::to_string(&report).unwrap();
-        assert!(appears_redacted(&json));
-    }
-
-    /// P1-F: a missing `HOME` must surface as a profile-discovery health
-    /// issue instead of silently producing a healthy observation.
-    #[test]
-    fn doctor_surfaces_missing_home_in_profile_discovery() {
-        let mut input = DoctorInput::default();
-        input.binary.cli_version = "1.2.13".into();
-        input.profile_discovery.home_unavailable = true;
-        let report = run_doctor(&input);
-        let check = report
-            .checks
-            .iter()
-            .find(|c| c.id == "profiles.discovery")
-            .unwrap();
-        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
-        assert!(
-            check.message.contains("HOME is unset"),
-            "actionable message expected: {check:?}"
-        );
-        assert_eq!(report.outcome, DoctorOutcome::Warn, "{report:?}");
     }
 
     #[test]

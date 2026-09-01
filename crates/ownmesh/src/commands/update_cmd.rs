@@ -1398,7 +1398,7 @@ fn fail(cli: &Cli, err: UpdateError) -> Result<(), ExitCode> {
         | UpdateError::ProtocolIncompatible(_)
         | UpdateError::UnsafeArchive(_) => ExitCode::Authorization,
         UpdateError::UnsupportedPlatform(_) | UpdateError::MissingMetadata(_) => {
-            ExitCode::ProfileUnavailable
+            ExitCode::DependencyUnavailable
         }
         UpdateError::LimitExceeded(_) | UpdateError::Transport(_) | UpdateError::Install(_) => {
             ExitCode::Internal

@@ -12,7 +12,7 @@
 //!   fall back to a deterministic short owner-scoped pathname and explicitly
 //!   configured paths are rejected with the required reduction.
 //! - Windows named pipes are scoped by a cryptographic digest of the
-//!   normalized runtime directory so distinct profiles never share a pipe.
+//!   normalized runtime directory so distinct installations never share a pipe.
 
 use crate::{IpcError, IpcResult};
 use sha2::{Digest, Sha256};
@@ -221,7 +221,7 @@ impl Endpoint {
     /// Build the default endpoint for `bus` under `runtime_dir`.
     ///
     /// On Windows this returns a named pipe scoped by a cryptographic digest of
-    /// the normalized runtime directory, so distinct profiles and concurrent
+    /// the normalized runtime directory, so distinct installations and concurrent
     /// test instances never share a pipe. On Unix it uses
     /// `{runtime_dir}/ownmesh-{bus}.sock`, falling back to a deterministic short
     /// owner-scoped pathname when that would exceed `sun_path`.
@@ -269,7 +269,7 @@ impl Endpoint {
 }
 
 /// Deterministic short pathname for a runtime directory that cannot host a
-/// bindable socket. Profile isolation is preserved by digesting the requested
+/// bindable socket. Installation isolation is preserved by digesting the requested
 /// runtime directory; the bus tag keeps buses distinct without a digest input.
 #[cfg(unix)]
 fn short_unix_socket_path(runtime_dir: &Path, bus: IpcBus) -> PathBuf {
@@ -295,7 +295,7 @@ fn unix_path_too_long(path: &Path) -> IpcError {
 }
 
 /// Lowercase hex of the first 8 digest bytes (64 bits): collision-negligible for
-/// the number of profiles one machine can host, and short enough for `sun_path`.
+/// the number of installations one machine can host, and short enough for `sun_path`.
 #[cfg(any(unix, windows))]
 fn hex16(digest: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -558,14 +558,14 @@ mod tests {
         #[test]
         fn punctuation_differences_do_not_collide() {
             assert_ne!(
-                Endpoint::default_for(Path::new(r"C:\OwnMesh\profiles\a-b\run"), IpcBus::Daemon),
-                Endpoint::default_for(Path::new(r"C:\OwnMesh\profiles\ab\run"), IpcBus::Daemon)
+                Endpoint::default_for(Path::new(r"C:\OwnMesh\instances\a-b\run"), IpcBus::Daemon),
+                Endpoint::default_for(Path::new(r"C:\OwnMesh\instances\ab\run"), IpcBus::Daemon)
             );
         }
 
         #[test]
         fn paths_differing_after_forty_characters_do_not_collide() {
-            let prefix = r"C:\OwnMesh\profiles\averylongcommonprefixsegment\run";
+            let prefix = r"C:\OwnMesh\instances\averylongcommonprefixsegment\run";
             assert_ne!(
                 Endpoint::default_for(&PathBuf::from(format!(r"{prefix}\alpha")), IpcBus::Daemon),
                 Endpoint::default_for(&PathBuf::from(format!(r"{prefix}\bravo")), IpcBus::Daemon)

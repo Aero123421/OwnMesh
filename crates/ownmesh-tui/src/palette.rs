@@ -28,7 +28,7 @@ pub fn all_commands() -> &'static [PaletteCommand] {
     &COMMANDS
 }
 
-const COMMANDS: [PaletteCommand; 15] = [
+const COMMANDS: [PaletteCommand; 14] = [
     PaletteCommand {
         id: "goto.dashboard",
         label_msg: Msg::CmdGotoDashboard,
@@ -52,12 +52,6 @@ const COMMANDS: [PaletteCommand; 15] = [
         label_msg: Msg::CmdGotoSessions,
         keywords: "session pty shell",
         action: PaletteAction::Goto(Screen::Sessions),
-    },
-    PaletteCommand {
-        id: "goto.profiles",
-        label_msg: Msg::CmdGotoProfiles,
-        keywords: "profile cli codex claude",
-        action: PaletteAction::Goto(Screen::Profiles),
     },
     PaletteCommand {
         id: "goto.approvals",

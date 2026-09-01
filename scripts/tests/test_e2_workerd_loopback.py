@@ -31,41 +31,6 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE = ROOT / "packages" / "control-plane"
-E6_FIXTURE = ROOT / "scripts" / "tests" / "fixtures" / "e6_adapter_fixture.py"
-OPERATION_NAMES: dict[str, str] = {}
-
-
-def install_e6_profile_fixtures(directory: Path) -> None:
-    """Create exact-name executable wrappers placed ahead of PATH for E6.
-
-    The production profile resolver still performs normal PATH discovery; only
-    the executable implementation is deterministic. Each wrapper selects a
-    strict wire validator in the checked-in fixture, so no runtime handler is
-    bypassed.
-    """
-    directory.mkdir(parents=True, exist_ok=True)
-    names = {
-        "codex": "codex", "claude": "claude-code", "kimi": "kimi-code",
-        "opencode": "opencode", "pi": "pi", "agy": "agy",
-        "qwen": "qwen-code", "hermes": "hermes-agent", "qodercli": "qoder",
-    }
-    if os.name == "nt":
-        for executable_name, profile in names.items():
-            (directory / f"{executable_name}.cmd").write_text(
-                "@echo off\r\n"
-                f"set E6_PROFILE={profile}\r\n"
-                f'"{sys.executable}" "{E6_FIXTURE}" %*\r\n',
-                encoding="utf-8",
-            )
-    else:
-        for executable_name, profile in names.items():
-            path = directory / executable_name
-            path.write_text(
-                "#!/bin/sh\n"
-                f"E6_PROFILE='{profile}' exec '{sys.executable}' '{E6_FIXTURE}' \"$@\"\n",
-                encoding="utf-8",
-            )
-            path.chmod(0o700)
 
 
 def session_id_from_operation(value: dict[str, object]) -> str:
@@ -483,7 +448,6 @@ def main() -> int:
         state_dir = temp / "state"
         runtime_dir = temp / "runtime"
         cache_dir = temp / "cache"
-        fixture_bin_dir = temp / "e6-profile-bin"
         keystore_dir = state_dir / "keystore"
         workspace_dir = state_dir / "workspace"
         workspace_alt = state_dir / "workspace-alt"
@@ -496,10 +460,8 @@ def main() -> int:
             keystore_dir,
             workspace_dir,
             workspace_alt,
-            fixture_bin_dir,
         ]:
             directory.mkdir(parents=True, exist_ok=True)
-        install_e6_profile_fixtures(fixture_bin_dir)
         # Device-local workspace registry (E4): default + alt roots for selection proof.
         (state_dir / "workspaces.json").write_text(
             json.dumps(
@@ -572,7 +534,7 @@ def main() -> int:
         artifact_dir = Path(artifact_dir_raw).resolve() if artifact_dir_raw else None
         if artifact_dir and not (artifact_dir / "ownmeshd").is_file():
             raise RuntimeError(f"release artifact directory lacks ownmeshd: {artifact_dir}")
-        path_parts = [str(fixture_bin_dir)]
+        path_parts: list[str] = []
         if artifact_dir:
             path_parts.append(str(artifact_dir))
         path_parts.append(base_env.get("PATH", ""))
@@ -795,248 +757,6 @@ def main() -> int:
                 check=True,
                 stdout=subprocess.DEVNULL,
             )
-
-            # E6 real path: every official profile is discovered from the
-            # daemon's actual PATH, then opened through public MCP → workerd →
-            # Agent WSS → production ownmeshd. The fixture binaries are strict
-            # protocol peers, not an alternate runtime implementation.
-            profile_catalog_pending = structured(
-                mcp_call(
-                    issuer,
-                    access_token,
-                    "ownmesh_list_profiles",
-                    {"device_id": device_id, "limit": 16},
-                    rpc_id=4000,
-                )
-            )
-            profile_catalog = wait_operation(
-                issuer,
-                access_token,
-                str(profile_catalog_pending.get("operation_id") or ""),
-                want={"completed"},
-            )
-            profile_dump = json.dumps(profile_catalog)
-            profile_ids = [
-                "codex", "claude-code", "kimi-code", "opencode", "pi", "agy",
-                "qwen-code", "hermes-agent", "qoder",
-            ]
-            for profile_id in profile_ids:
-                if profile_id not in profile_dump:
-                    raise RuntimeError(f"E6 live profile detection omitted {profile_id}: {profile_catalog}")
-
-            e6_sessions: dict[str, tuple[str, str, int]] = {}
-            for offset, profile_id in enumerate(profile_ids):
-                opened = structured(
-                    mcp_call(
-                        issuer,
-                        access_token,
-                        "ownmesh_session_open",
-                        {
-                            "device_id": device_id,
-                            "workspace_id": "ws_default",
-                            "title": f"e6-{profile_id}-{marker}",
-                            "profile_id": profile_id,
-                            "prompt": f"fixture prompt {profile_id}",
-                            "adapter_mode": "structured",
-                            "async": True,
-                            "idempotency_key": f"idem_e6_{profile_id}_{marker}",
-                        },
-                        rpc_id=4010 + offset,
-                    )
-                )
-                opened_done = wait_operation(
-                    issuer, access_token, str(opened.get("operation_id") or ""), want={"completed"}
-                )
-                session_id = session_id_from_operation(opened_done)
-                lease_id = find_value(opened_done, "lease_id")
-                controller_epoch = find_value(opened_done, "controller_epoch")
-                if not isinstance(lease_id, str) or not isinstance(controller_epoch, int):
-                    raise RuntimeError(f"E6 session open omitted exact controller facts: {opened_done}")
-                e6_sessions[profile_id] = (session_id, lease_id, controller_epoch)
-
-            # Profile show is also public-device routed. No adapter in this
-            # test has a source-backed read-only credential probe, so the
-            # production response must explicitly refuse credential discovery.
-            profile_show = structured(
-                mcp_call(
-                    issuer, access_token, "ownmesh_profile_show",
-                    {"device_id": device_id, "id": "codex", "async": True,
-                     "idempotency_key": f"idem_e6_show_{marker}"}, rpc_id=4040,
-                )
-            )
-            profile_show_done = wait_operation(
-                issuer, access_token, str(profile_show.get("operation_id") or ""), want={"completed"}
-            )
-            if "unknown_no_credential_probe" not in json.dumps(profile_show_done):
-                raise RuntimeError(f"E6 profile.show must not probe credentials: {profile_show_done}")
-
-            # Every opened profile must yield its fixture's unique marker on
-            # bounded public replay. This catches argv/frame failure even when
-            # a structured session became open-ready before a child exits.
-            output_markers = {
-                "codex": "codex-delayed-output", "claude-code": "claude-code-output",
-                "kimi-code": "kimi-code-output", "opencode": "opencode-output",
-                "pi": "pi-output", "agy": "agy-output", "qwen-code": "qwen-code-output",
-                "hermes-agent": "hermes-agent-output", "qoder": "qoder-output",
-            }
-            for index, profile_id in enumerate(profile_ids):
-                replay_seen = False
-                session_id, _, _ = e6_sessions[profile_id]
-                for attempt in range(20):
-                    replay = structured(
-                        mcp_call(
-                            issuer,
-                            access_token,
-                            "ownmesh_session_replay",
-                            {
-                                "device_id": device_id, "workspace_id": "ws_default",
-                                "session_id": session_id, "sidecar_cursor": 0, "async": True,
-                                "idempotency_key": f"idem_e6_{profile_id}_replay_{marker}_{attempt}",
-                            },
-                            rpc_id=4050 + index * 32 + attempt,
-                        )
-                    )
-                    replay_done = wait_operation(
-                        issuer, access_token, str(replay.get("operation_id") or ""), want={"completed"}
-                    )
-                    replay_dump = json.dumps(replay_done)
-                    if output_markers[profile_id] in replay_dump or output_markers[profile_id].encode() in sidecar_bytes(replay_done):
-                        if profile_id != "codex" or "delayed fixture error" in replay_dump:
-                            replay_seen = True
-                            break
-                    time.sleep(0.25)
-                if not replay_seen:
-                    raise RuntimeError(f"E6 {profile_id} output/error was not visible through public replay")
-
-            # Keep the real supervisor/session quotas bounded while proving the
-            # second (resume) matrix. These exact terminal operations also
-            # prove the initial profile sessions are not fixture leaks.
-            for index, (profile_id, (session_id, lease_id, controller_epoch)) in enumerate(e6_sessions.items()):
-                terminated = structured(
-                    mcp_call(
-                        issuer,
-                        access_token,
-                        "ownmesh_session_terminate",
-                        {
-                            "device_id": device_id, "workspace_id": "ws_default", "session_id": session_id,
-                            "lease_id": lease_id, "controller_epoch": controller_epoch, "async": True,
-                            "idempotency_key": f"idem_e6_{profile_id}_terminate_{marker}",
-                        },
-                        rpc_id=4350 + index,
-                    )
-                )
-                wait_operation(
-                    issuer, access_token, str(terminated.get("operation_id") or ""), want={"completed"}
-                )
-
-            # Resume paths are exercised through the same public route. The
-            # fixture rejects either a missing prompt/stream-json Claude argv,
-            # a double ACP load after Kimi/Hermes argv resume, or an invented
-            # negotiated RPC method. Replay is deliberately required: a ready
-            # operation alone cannot prove the child accepted its resume wire.
-            resume_native_ids = {
-                "codex": "native_codex",
-                "claude-code": "native_claude_code",
-                "kimi-code": "native_kimi_code",
-                "opencode": "native_opencode",
-                "qwen-code": "native_qwen_code",
-                "hermes-agent": "native_hermes_agent",
-                "qoder": "native_qoder",
-            }
-            e6_resumed: dict[str, tuple[str, str, int]] = {}
-            for offset, (profile_id, native_session_id) in enumerate(resume_native_ids.items()):
-                resumed = structured(
-                    mcp_call(
-                        issuer,
-                        access_token,
-                        "ownmesh_session_open",
-                        {
-                            "device_id": device_id,
-                            "workspace_id": "ws_default",
-                            "title": f"e6-resume-{profile_id}-{marker}",
-                            "profile_id": profile_id,
-                            "prompt": f"fixture resume {profile_id}",
-                            "native_session_id": native_session_id,
-                            "adapter_mode": "structured",
-                            "async": True,
-                            "idempotency_key": f"idem_e6_resume_{profile_id}_{marker}",
-                        },
-                        rpc_id=4200 + offset,
-                    )
-                )
-                resumed_done = wait_operation(
-                    issuer, access_token, str(resumed.get("operation_id") or ""), want={"completed"}
-                )
-                resumed_id = session_id_from_operation(resumed_done)
-                lease_id = find_value(resumed_done, "lease_id")
-                controller_epoch = find_value(resumed_done, "controller_epoch")
-                if not isinstance(lease_id, str) or not isinstance(controller_epoch, int):
-                    raise RuntimeError(f"E6 resumed {profile_id} omitted exact lease facts: {resumed_done}")
-                e6_resumed[profile_id] = (resumed_id, lease_id, controller_epoch)
-
-            for index, profile_id in enumerate(resume_native_ids):
-                resumed_id, _, _ = e6_resumed[profile_id]
-                marker_text = output_markers[profile_id]
-                for attempt in range(20):
-                    replay = structured(
-                        mcp_call(
-                            issuer, access_token, "ownmesh_session_replay",
-                            {
-                                "device_id": device_id, "workspace_id": "ws_default",
-                                "session_id": resumed_id, "sidecar_cursor": 0, "async": True,
-                                "idempotency_key": f"idem_e6_resume_replay_{profile_id}_{marker}_{attempt}",
-                            },
-                            rpc_id=4250 + index * 32 + attempt,
-                        )
-                    )
-                    replay_done = wait_operation(
-                        issuer, access_token, str(replay.get("operation_id") or ""), want={"completed"}
-                    )
-                    if marker_text in json.dumps(replay_done) or marker_text.encode() in sidecar_bytes(replay_done):
-                        break
-                    time.sleep(0.25)
-                else:
-                    raise RuntimeError(f"E6 native resume {profile_id} did not reach public replay")
-
-            # Profiles whose official contracts have no resume surface must
-            # reject an invented native id rather than silently starting a
-            # different native conversation.
-            for offset, profile_id in enumerate(("pi", "agy")):
-                rejected = structured(
-                    mcp_call(
-                        issuer, access_token, "ownmesh_session_open",
-                        {
-                            "device_id": device_id, "workspace_id": "ws_default",
-                            "profile_id": profile_id, "prompt": "must reject",
-                            "native_session_id": "invented_native", "adapter_mode": "structured",
-                            "async": True, "idempotency_key": f"idem_e6_reject_{profile_id}_{marker}",
-                        },
-                        rpc_id=4320 + offset,
-                    )
-                )
-                rejected_done = wait_operation(
-                    issuer, access_token, str(rejected.get("operation_id") or ""), want={"failed"}
-                )
-                if "no source-backed native resume" not in json.dumps(rejected_done):
-                    raise RuntimeError(f"E6 {profile_id} accepted invented native id: {rejected_done}")
-
-            for index, (profile_id, (session_id, lease_id, controller_epoch)) in enumerate(e6_resumed.items()):
-                terminated = structured(
-                    mcp_call(
-                        issuer,
-                        access_token,
-                        "ownmesh_session_terminate",
-                        {
-                            "device_id": device_id, "workspace_id": "ws_default", "session_id": session_id,
-                            "lease_id": lease_id, "controller_epoch": controller_epoch, "async": True,
-                            "idempotency_key": f"idem_e6_resume_{profile_id}_terminate_{marker}",
-                        },
-                        rpc_id=4380 + index,
-                    )
-                )
-                wait_operation(
-                    issuer, access_token, str(terminated.get("operation_id") or ""), want={"completed"}
-                )
 
             # Direct write via public MCP → DeviceRoom → real binary runtime.
             write_sc = structured(

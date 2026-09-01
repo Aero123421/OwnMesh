@@ -27,5 +27,5 @@ body:
       label: Impact
       options:
         - label: Changes a security, privilege, or policy boundary (needs an ADR)
-        - label: Changes the protocol, IPC surface, or an official profile (needs an ADR)
+        - label: Changes the protocol, IPC surface, or public capability (needs an ADR)
         - label: Adds or changes a shipped CLI or MCP surface (needs a SUPPORTED_SURFACES.json update)

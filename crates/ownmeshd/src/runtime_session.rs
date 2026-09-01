@@ -9,19 +9,14 @@
 //! of `runtime`, so it reaches `DaemonRuntime`'s private state directly, and
 //! handlers are `pub(super)` because the dispatch table lives in the parent.
 
-const CODEX_CANCEL_REPLAY_BYTES: usize = 1024 * 1024;
-
 use super::{
-    app_error, base64_standard, cancel_protocol_frame, default_shell_command, fs_err,
-    is_remote_runtime_principal, json, latest_codex_turn_id, normalize_handoff_target,
-    official_adapter_spec, parse_adapter_event_page_for_dialect, parse_params,
-    persistent_child_is_live, preset_name, principal_journal_key, reject_spoofed_principal,
-    session_err, sha256_hex, AdapterDialect, ClientIdentity, DaemonRuntime, Deserialize,
-    HostIoMode, IpcError, IpcResult, LiveHost, NativeResume, OperationFacts, Path, PathBuf,
-    ProfileRegistry, PtyCommand, PtySize, SessionKind, SessionState, SessionStreamKind,
-    SidecarHostBinding, SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest,
-    SystemDiagnoseParams, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
-    Value, OP_JOURNAL_STATE_FIELD,
+    app_error, base64_standard, default_shell_command, fs_err, is_remote_runtime_principal, json,
+    normalize_handoff_target, parse_params, persistent_child_is_live, preset_name,
+    principal_journal_key, reject_spoofed_principal, session_err, sha256_hex, ClientIdentity,
+    DaemonRuntime, Deserialize, HostIoMode, IpcError, IpcResult, LiveHost, OperationFacts, Path,
+    PtyCommand, PtySize, SessionKind, SessionState, SessionStreamKind, SidecarHostBinding,
+    SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest, SystemDiagnoseParams, TransitionKind,
+    TransitionPhase, TransitionRecord, TransitionTarget, Value, OP_JOURNAL_STATE_FIELD,
 };
 
 /// Structured sidecar pages are capped below the durable MCP result budget.
@@ -273,9 +268,6 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 super::op_journal_entry_state(value) == super::OpJournalEntryState::Uncertain
             })
             .count();
-        // P1-D/P1-F: profile discovery canary — user-local bin dirs that exist
-        // but are not searched mean installed CLIs appear not-installed.
-        let profile_discovery = profile_discovery_health();
         let credential_store = credential_store_health(&self.paths);
         let (in_flight_external, in_flight_journaled, self_reentrant_refusals) =
             super::runtime_queue_observation();
@@ -301,7 +293,6 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 op_journal_recoverable_orphaned,
                 op_journal_uncertain,
                 op_journal_degraded: self.op_journal_degraded.is_some(),
-                profile_discovery,
                 credential_store,
                 agent_route: self.agent_route_presence(),
                 in_flight_external,
@@ -336,22 +327,6 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
             #[serde(default)]
             kind: Option<String>,
             #[serde(default)]
-            profile_id: Option<String>,
-            /// A prompt for a profile's documented non-interactive structured
-            /// surface. It remains an individual argv element, never a shell
-            /// fragment.
-            #[serde(default)]
-            prompt: Option<String>,
-            /// Vendor-native continuation id, separate from the OwnMesh
-            /// session id. It is canonical action input and never inferred
-            /// from terminal output.
-            #[serde(default)]
-            native_session_id: Option<String>,
-            /// `auto` follows the source-backed adapter preference;
-            /// `structured` refuses a PTY downgrade; `pty` is explicit.
-            #[serde(default)]
-            adapter_mode: Option<String>,
-            #[serde(default)]
             command: Option<Vec<String>>,
             /// MCP schema uses program/args; agent_transport maps them to command.
             #[serde(default)]
@@ -370,13 +345,46 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
             #[serde(default)]
             idempotency_key: Option<String>,
         }
+        if params
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|object| {
+                ["profile_id", "prompt", "native_session_id", "adapter_mode"]
+                    .iter()
+                    .any(|field| object.contains_key(*field))
+            })
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "coding-agent Profile session parameters were removed; launch the external CLI with exact program/args and use generic session control".into(),
+            });
+        }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        // Validate the public session kind before policy/idempotency work so
+        // removed kinds always return migration guidance and can never reserve
+        // a journal key or be mistaken for a policy decision.
+        let kind = match p.kind.as_deref() {
+            Some("process") => SessionKind::Process,
+            None | Some("pty" | "terminal") => SessionKind::Pty,
+            Some("profile_agent" | "profile") => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "coding-agent Profile sessions were removed; use kind=pty with exact program/args".into(),
+                });
+            }
+            Some(other) => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: format!("session kind must be pty|terminal|process (got {other})"),
+                });
+            }
+        };
         // Exact-once device journal replay (P0-B / MCP `session.open`
-        // contract): consult the receipt *before* workspace/profile/executable
+        // contract): consult the receipt *before* workspace/executable
         // preflight so a retried open after response loss continues the
-        // original session even when the workspace was removed or the profile
-        // tool is no longer installed (the first operation already ran and
+        // original session even when the workspace or executable is no longer
+        // available (the first operation already ran and
         // its receipt is principal-namespaced proof of that). An
         // in-progress/uncertain marker stays fail-closed. The durable marker
         // itself is still reserved only after preflight, so a preflight
@@ -426,50 +434,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 raw.to_owned()
             }
         };
-        let mut kind = match p.kind.as_deref() {
-            Some("process") => SessionKind::Process,
-            Some("profile_agent") | Some("profile") => SessionKind::ProfileAgent,
-            _ => SessionKind::Pty,
-        };
-        if p.profile_id.is_some() && kind == SessionKind::Pty {
-            // Explicit profile_id without kind defaults to profile agent session.
-            kind = SessionKind::ProfileAgent;
-        }
-        let adapter_mode = match p.adapter_mode.as_deref().unwrap_or("auto") {
-            "auto" => "auto",
-            "structured" => "structured",
-            "pty" => "pty",
-            other => {
-                return Err(IpcError::Remote {
-                    code: app_error::INVALID_PARAMS,
-                    message: format!("adapter_mode must be auto|structured|pty (got {other})"),
-                });
-            }
-        };
-        if p.native_session_id
-            .as_deref()
-            .is_some_and(|id| id.is_empty() || id.len() > 512 || id.chars().any(char::is_control))
-        {
-            return Err(IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message: "native_session_id must be a non-control string <= 512 bytes".into(),
-            });
-        }
-        if p.adapter_mode.is_some() && p.profile_id.is_none() {
-            return Err(IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message: "adapter_mode requires profile_id; generic program/args are unchanged"
-                    .into(),
-            });
-        }
-        if p.native_session_id.is_some() && p.profile_id.is_none() {
-            return Err(IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message:
-                    "native_session_id requires profile_id; generic program/args are unchanged"
-                        .into(),
-            });
-        }
         let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
         // Resolve/pin cwd under the selected workspace (custody when enforce is on;
@@ -482,15 +446,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             Some(ws_root.root().to_string_lossy().into_owned())
         };
-        // Official profile launch plan (E6): detection + preferred interface, with
-        // PTY fallback. Never copies tool credentials to the cloud. Generic CLIs
-        // still use program/args/command without profile registration.
-        let mut profile_meta: Option<Value> = None;
-        let mut structured_adapter: Option<(String, AdapterDialect)> = None;
-        let mut profile_env: Vec<(String, String)> = Vec::new();
-        // Argv resumes consume the native id in their exact launch plan; a
-        // negotiated JSON-RPC resume keeps it for the structured driver.
-        let mut driver_native_session_id = p.native_session_id.clone();
         let command = if let Some(cmd) = p.command.clone().filter(|c| !c.is_empty()) {
             Some(cmd)
         } else if let Some(program) = p
@@ -503,97 +458,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             if let Some(args) = p.args.clone() {
                 argv.extend(args);
             }
-            Some(argv)
-        } else if let Some(profile_id) = p
-            .profile_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let reg = ProfileRegistry::with_official();
-            let spec = official_adapter_spec(profile_id).ok_or_else(|| IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message: format!("no source-backed adapter contract for profile {profile_id}"),
-            })?;
-            // Process-argv resumes (currently Claude) consume the native id
-            // before ACP bootstrap; passing it again would incorrectly issue a
-            // second `session/load`. Negotiated resumes (Codex/ACP) start the
-            // normal structured child and let the exact driver perform the
-            // source-backed resume after capability negotiation.
-            let native_resume = p.native_session_id.as_deref().map(|native_id| match &spec.resume {
-                NativeResume::Argv { .. } => {
-                    driver_native_session_id = None;
-                    reg.resume_plan_with_prompt(profile_id, native_id, p.prompt.as_deref()).map(Some).map_err(|e| {
-                        IpcError::Remote {
-                            code: app_error::INVALID_PARAMS,
-                            message: format!("profile native resume plan failed: {e}"),
-                        }
-                    })
-                }
-                NativeResume::Negotiated { .. } => Ok(None),
-                NativeResume::Degraded => Err(IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!(
-                        "profile {profile_id} has no source-backed native resume; use a new profile session or explicit PTY"
-                    ),
-                }),
-            }).transpose()?.flatten();
-            let plan = match native_resume {
-                Some(plan) => plan,
-                None => reg
-                    // Structured adapters must be allowed to select their declared
-                    // stdio/HTTP dialect. PTY is opt-in only; this keeps generic
-                    // CLI behavior unchanged while avoiding an accidental terminal
-                    // downgrade for an explicit structured profile request.
-                    .launch_plan(
-                        profile_id,
-                        p.prompt.as_deref(),
-                        /* force_pty */ adapter_mode == "pty",
-                    )
-                    .map_err(|e| IpcError::Remote {
-                        code: app_error::INVALID_PARAMS,
-                        message: format!("profile launch plan failed: {e}"),
-                    })?,
-            };
-            if adapter_mode == "structured" && plan.use_pty {
-                return Err(IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!(
-                        "profile {profile_id} cannot provide structured mode; use adapter_mode=pty explicitly"
-                    ),
-                });
-            }
-            if !plan.use_pty {
-                if matches!(
-                    spec.dialect,
-                    AdapterDialect::ClaudeStreamJson | AdapterDialect::AgyStreamJson
-                ) && p.prompt.is_none()
-                {
-                    return Err(IpcError::Remote {
-                        code: app_error::INVALID_PARAMS,
-                        message: format!(
-                            "profile {profile_id} uses a one-shot structured interface and requires an explicit prompt"
-                        ),
-                    });
-                }
-                structured_adapter = Some((spec.profile_id.clone(), spec.dialect));
-            }
-            profile_env = plan.env.into_iter().collect();
-            profile_meta = Some(json!({
-                "profile_id": plan.profile_id,
-                "interface": plan.interface.as_str(),
-                "use_pty": plan.use_pty,
-                "program": plan.program,
-                "adapter_mode": adapter_mode,
-                "transport": spec.transport,
-                "dialect": spec.dialect,
-                "native_resume": spec.resume,
-                "safe_capabilities": spec.safe_capabilities,
-                "native_resume_requested": p.native_session_id.is_some(),
-                "structured_requested": adapter_mode == "structured" || (adapter_mode == "auto" && !plan.use_pty),
-            }));
-            let mut argv = vec![plan.program];
-            argv.extend(plan.args);
             Some(argv)
         } else {
             None
@@ -642,16 +506,13 @@ install it or use an explicit path. {}",
             }
             other => other,
         };
-        // Own a live PTY for interactive sessions (E5) and profile PTY fallback (E6).
-        // Process-only kinds stay metadata until structured adapters stream events.
+        // Own a live PTY for interactive sessions. Process-only kinds stay
+        // metadata-only.
         // Failure to spawn is fail-closed so ChatGPT never sees a fake echo-only session.
-        let spawn_live = matches!(kind, SessionKind::Pty | SessionKind::ProfileAgent);
-        // Structured adapters always use the same persistent structured-pipe
-        // supervisor, including local CLI calls. This prevents local
-        // `profile start/resume` from silently taking a PTY path that never
-        // performs the documented handshake. Remote calls bind the verified
-        // Agent device identity; the local-only binding uses a stable marker
-        // that cannot be supplied through public request parameters.
+        let spawn_live = kind == SessionKind::Pty;
+        // Remote interactive sessions use the persistent sidecar and bind the
+        // verified Agent device identity. Local sessions use the in-process
+        // PTY host.
         let persistent_host_device_id =
             if spawn_live && is_remote_runtime_principal(&client.client_name) {
                 Some(
@@ -665,8 +526,6 @@ install it or use an explicit path. {}",
                         })?
                         .to_owned(),
                 )
-            } else if spawn_live && structured_adapter.is_some() {
-                Some("local-device".to_owned())
             } else {
                 None
             };
@@ -686,8 +545,6 @@ install it or use an explicit path. {}",
                 title,
                 principal,
                 Self::now(),
-                p.profile_id.clone(),
-                p.native_session_id.clone(),
                 command.clone(),
                 cwd.clone(),
                 None,
@@ -700,13 +557,7 @@ install it or use an explicit path. {}",
                     program: argv[0].clone(),
                     args: argv[1..].to_vec(),
                     cwd: cwd.clone(),
-                    env: {
-                        let mut env = profile_env.clone();
-                        if !env.iter().any(|(key, _)| key == "TERM") {
-                            env.push(("TERM".into(), "xterm-256color".into()));
-                        }
-                        env
-                    },
+                    env: vec![("TERM".into(), "xterm-256color".into())],
                 },
                 _ => {
                     let mut shell = default_shell_command();
@@ -745,15 +596,7 @@ install it or use an explicit path. {}",
                     },
                     cols: size.cols,
                     rows: size.rows,
-                    io_mode: if structured_adapter.is_some() {
-                        HostIoMode::StructuredPipes
-                    } else {
-                        HostIoMode::Pty
-                    },
-                    profile_id: structured_adapter.as_ref().map(|(id, _)| id.clone()),
-                    adapter_dialect: structured_adapter
-                        .as_ref()
-                        .map(|(_, dialect)| dialect.as_str().to_owned()),
+                    io_mode: HostIoMode::Pty,
                 };
                 let binding = match self.ensure_remote_supervisor().await {
                     Ok(supervisor) => match supervisor.spawn(request).await {
@@ -905,59 +748,6 @@ install it or use an explicit path. {}",
                 // already-persisted provisional record, not the pre-spawn
                 // snapshot, so the child remains recoverable.
                 self.commit_sessions(durable_snapshot)?;
-                if let Some((_, dialect)) = structured_adapter {
-                    // The successful spawn above installed the authenticated
-                    // supervisor client. Do not re-run global reattachment
-                    // here: an unrelated stale session must not strand this
-                    // newly created child before its metadata is committed.
-                    let supervisor = self
-                        .supervisor
-                        .as_ref()
-                        .expect("successful persistent sidecar spawn retains supervisor client");
-                    let (native_id, adapter_cursor) = match Self::bootstrap_structured_adapter(
-                        supervisor,
-                        &binding,
-                        dialect,
-                        p.prompt.as_deref(),
-                        driver_native_session_id.as_deref(),
-                        // `cwd` is always resolved from the selected workspace
-                        // before the session record is created.
-                        cwd.as_deref()
-                            .expect("session workspace always resolves an absolute cwd"),
-                    )
-                    .await
-                    {
-                        Ok(native_id) => native_id,
-                        Err(error) => {
-                            let _ = self
-                                .rollback_persistent_open(&info.id, &binding, "structured")
-                                .await;
-                            return Err(error);
-                        }
-                    };
-                    Self::spawn_fail_closed_adapter_pump(
-                        supervisor.clone(),
-                        binding.clone(),
-                        dialect,
-                        adapter_cursor,
-                    );
-                    if let Some(native_id) = native_id {
-                        let native_snapshot = self.sessions.clone();
-                        if let Err(error) = self.sessions.set_native_session_id(&info.id, native_id)
-                        {
-                            let _ = self
-                                .rollback_persistent_open(&info.id, &binding, "native-id")
-                                .await;
-                            return Err(session_err(error));
-                        }
-                        if let Err(error) = self.commit_sessions(native_snapshot) {
-                            let _ = self
-                                .rollback_persistent_open(&info.id, &binding, "native-persist")
-                                .await;
-                            return Err(error);
-                        }
-                    }
-                }
                 let mut value =
                     serde_json::to_value(self.sessions.get(&info.id).map_err(session_err)?)
                         .map_err(|e| IpcError::Remote {
@@ -967,9 +757,6 @@ install it or use an explicit path. {}",
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("live_pty".into(), json!(true));
                     obj.insert("persistent_sidecar".into(), json!(true));
-                    if let Some(meta) = profile_meta {
-                        obj.insert("profile".into(), meta);
-                    }
                 }
                 return self.store_session_open_receipt(journal_key.as_ref(), &operation_id, value);
             }
@@ -999,9 +786,6 @@ install it or use an explicit path. {}",
                     if let Some(obj) = value.as_object_mut() {
                         obj.insert("live_pty".into(), json!(true));
                         obj.insert("pty_backend".into(), json!(backend));
-                        if let Some(meta) = profile_meta {
-                            obj.insert("profile".into(), meta);
-                        }
                     }
                     return self.store_session_open_receipt(
                         journal_key.as_ref(),
@@ -1025,9 +809,6 @@ install it or use an explicit path. {}",
         })?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("live_pty".into(), json!(false));
-            if let Some(meta) = profile_meta {
-                obj.insert("profile".into(), meta);
-            }
         }
         self.store_session_open_receipt(journal_key.as_ref(), &operation_id, value)
     }
@@ -2109,137 +1890,6 @@ install it or use an explicit path. {}",
         self.close_persistent_session_record(session_id)
     }
 
-    pub(super) async fn handle_session_cancel(
-        &mut self,
-        params: Option<Value>,
-        client: &ClientIdentity,
-    ) -> IpcResult<Value> {
-        #[derive(Deserialize)]
-        struct P {
-            id: String,
-            #[serde(default)]
-            lease_id: Option<String>,
-            #[serde(default)]
-            controller_epoch: Option<u64>,
-            #[serde(default)]
-            workspace_id: Option<String>,
-            #[serde(default)]
-            idempotency_key: Option<String>,
-        }
-        let p: P = parse_params(params)?;
-        let remote = is_remote_runtime_principal(&client.client_name);
-        if remote && p.idempotency_key.as_deref().is_none_or(str::is_empty) {
-            return Err(IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message: "session.cancel requires idempotency_key for remote principals".into(),
-            });
-        }
-        let journal_key = p
-            .idempotency_key
-            .as_ref()
-            .filter(|key| !key.is_empty())
-            .map(|key| principal_journal_key(&client.client_name, key));
-        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
-            return Ok(replayed);
-        }
-        let now = self.prepare_session_access()?;
-        let workspace_id = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
-        if remote {
-            let lease_id = p
-                .lease_id
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| IpcError::Remote {
-                    code: app_error::INVALID_PARAMS,
-                    message: "session.cancel requires lease_id for remote principals".into(),
-                })?;
-            let epoch = p.controller_epoch.ok_or_else(|| IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message: "session.cancel requires controller_epoch for remote principals".into(),
-            })?;
-            self.sessions
-                .authorize_controller_lease(&p.id, &client.client_name, lease_id, epoch, now)
-                .map_err(session_err)?;
-        } else {
-            self.require_controller(&p.id, &client.client_name, now)?;
-        }
-        self.fence_ambiguous_transition(&p.id)?;
-        let info = self.sessions.get(&p.id).map_err(session_err)?.clone();
-        let profile_id = info.profile_id.as_deref().ok_or_else(|| IpcError::Remote {
-            code: app_error::CONFLICT,
-            message: "capability_not_advertised: session is not a structured profile".into(),
-        })?;
-        let spec = official_adapter_spec(profile_id).ok_or_else(|| IpcError::Remote {
-            code: app_error::CONFLICT,
-            message: "capability_not_advertised: profile has no official cancellation contract"
-                .into(),
-        })?;
-        let native_session_id = info.native_session_id.as_deref().unwrap_or(&info.id);
-        let binding = self.sidecar_binding(&p.id)?;
-        let operation_id = self
-            .active_remote_operation_id
-            .clone()
-            .unwrap_or_else(|| Self::new_id("op_"));
-        let active_turn_id = if matches!(spec.dialect, AdapterDialect::CodexAppServer) {
-            let supervisor = self.ensure_remote_supervisor().await?;
-            // Query the current spool extent with a one-byte page, then inspect
-            // only the bounded tail. Starting mid-record is safe because the
-            // extractor ignores malformed fragments before the next LF.
-            let extent = supervisor
-                .drain_stream(&binding, 0, 1, "stdout")
-                .await
-                .map_err(|error| IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!("structured adapter cancellation replay failed: {error}"),
-                })?;
-            let tail_offset = extent
-                .total_bytes
-                .saturating_sub(CODEX_CANCEL_REPLAY_BYTES as u64);
-            let page = supervisor
-                .drain_stream(&binding, tail_offset, CODEX_CANCEL_REPLAY_BYTES, "stdout")
-                .await
-                .map_err(|error| IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!("structured adapter cancellation replay failed: {error}"),
-                })?;
-            latest_codex_turn_id(&page.bytes)
-        } else {
-            None
-        };
-        let frame = cancel_protocol_frame(
-            spec.dialect,
-            native_session_id,
-            active_turn_id.as_deref(),
-            &operation_id,
-        )
-        .map_err(|message| IpcError::Remote {
-            code: app_error::CONFLICT,
-            message,
-        })?;
-        self.ensure_remote_supervisor().await?;
-        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
-        self.supervisor
-            .as_ref()
-            .ok_or_else(|| IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: "sidecar unavailable after cancellation preflight".into(),
-            })?
-            .write(&binding, frame)
-            .await
-            .map_err(|error| IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: format!("structured adapter cancellation write failed: {error}"),
-            })?;
-        let body = json!({
-            "cancel_requested": true,
-            "session_id": p.id,
-            "workspace_id": workspace_id,
-            "profile_id": profile_id,
-            "operation_id": operation_id,
-        });
-        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
-    }
-
     pub(super) async fn handle_session_close(
         &mut self,
         params: Option<Value>,
@@ -2856,29 +2506,6 @@ install it or use an explicit path. {}",
             .unwrap_or(false);
         let sidecar_next_cursor = sidecar_page.as_ref().and_then(|page| page.next_offset);
         let sidecar_total_bytes = sidecar_page.as_ref().map(|page| page.total_bytes);
-        // Structured profiles additionally expose a bounded, normalized view
-        // over the exact raw sidecar spool cursor. Raw bytes remain local to
-        // the sidecar; callers receive only the bounded normalized view and
-        // an explicit continuation cursor. Malformed vendor output becomes an
-        // explicit adapter error rather than disappearing into a terminal.
-        let profile_events = self
-            .sessions
-            .get(&p.id)
-            .ok()
-            .and_then(|info| info.profile_id.as_deref())
-            .and_then(official_adapter_spec)
-            .filter(|spec| spec.structured_events)
-            .and_then(|spec| {
-                sidecar_page.as_ref().map(|spool| {
-                    let byte_len = u64::try_from(spool.bytes.len()).unwrap_or(u64::MAX);
-                    let tail_after_page = spool.next_offset.unwrap_or(spool.total_bytes);
-                    let base = tail_after_page.saturating_sub(byte_len);
-                    parse_adapter_event_page_for_dialect(&spool.bytes, base, spec.dialect)
-                })
-            });
-        let profile_event_cursor = profile_events.as_ref().map(|page| page.next_cursor);
-        let profile_event_truncated =
-            profile_events.as_ref().is_some_and(|page| page.has_more) || sidecar_truncated;
         Ok(json!({
             "chunks": page.chunks,
             "session_id": p.id,
@@ -2890,9 +2517,6 @@ install it or use an explicit path. {}",
             "live_pty": self.live_hosts.contains_key(&p.id) || sidecar_page.is_some(),
             "sidecar_next_cursor": sidecar_next_cursor,
             "sidecar_total_bytes": sidecar_total_bytes,
-            "profile_events": profile_events.as_ref().map(|page| &page.events),
-            "profile_event_cursor": profile_event_cursor,
-            "profile_event_truncated": profile_event_truncated,
         }))
     }
 
@@ -3295,7 +2919,6 @@ struct SystemDiagnosisFacts {
     op_journal_recoverable_orphaned: usize,
     op_journal_uncertain: usize,
     op_journal_degraded: bool,
-    profile_discovery: (&'static str, Vec<String>),
     credential_store: (&'static str, Option<String>, usize),
     /// Live Agent-route presence observed by the transport (#141): the same
     /// condition the control plane reports to MCP clients as
@@ -3342,77 +2965,6 @@ fn credential_store_health(
         Some(snapshot.backend_name),
         snapshot.residual_fallback_entries,
     )
-}
-
-/// Profile-discovery health canary (P1-D/P1-F): runs official profile
-/// discovery against the daemon's deterministic search (system PATH +
-/// user-local dirs) and compares it with the bare system PATH. Notes are
-/// emitted when:
-///
-/// - user-local bin dirs exist but are not searched (would report installed
-///   CLIs as not-installed);
-/// - an official profile resolves only through user-local dirs, i.e. a login
-///   shell would find it but the bare service PATH would not (detected-vs-
-///   login mismatch).
-///
-/// Discovery never spawns version probes: observation must not run binaries.
-/// Returns `(status, notes)` with status `ok` or `warn`.
-fn profile_discovery_health() -> (&'static str, Vec<String>) {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    profile_discovery_health_with(home.as_deref(), std::env::var_os("PATH").as_deref())
-}
-
-/// Pure core of [`profile_discovery_health`]; parameters keep the comparison
-/// unit-testable without mutating the process environment.
-fn profile_discovery_health_with(
-    home: Option<&Path>,
-    path_var: Option<&std::ffi::OsStr>,
-) -> (&'static str, Vec<String>) {
-    let mut notes = Vec::new();
-    if cfg!(windows) {
-        // Windows user bins are already reachable through the inherited user
-        // PATH; no separate user-local discovery step exists there.
-        return ("ok", notes);
-    }
-    let Some(home) = home else {
-        notes
-            .push("HOME unset on this Unix daemon; user-local CLI discovery is unavailable".into());
-        return ("warn", notes);
-    };
-    let system_dirs: Vec<PathBuf> = std::env::split_paths(path_var.unwrap_or_default()).collect();
-    let user_dirs = ownmesh_exec::user_cli_search_dirs(Some(home));
-    let full_dirs: Vec<PathBuf> = {
-        let mut dirs = system_dirs.clone();
-        for dir in &user_dirs {
-            if !dirs.contains(dir) {
-                dirs.push(dir.clone());
-            }
-        }
-        dirs
-    };
-    let registry = ProfileRegistry::with_official();
-    for profile in registry.list() {
-        let id = &profile.id;
-        let via_system = registry
-            .resolve_binary_in_dirs(id, &system_dirs)
-            .ok()
-            .flatten();
-        let via_full = registry
-            .resolve_binary_in_dirs(id, &full_dirs)
-            .ok()
-            .flatten();
-        if via_full.is_some() && via_system.is_none() {
-            notes.push(format!(
-                "official profile `{id}` resolves only through user-local search dirs, not the \
-service PATH; a login shell finds it but the daemon service would report it not-installed"
-            ));
-        }
-    }
-    if notes.is_empty() {
-        ("ok", notes)
-    } else {
-        ("warn", notes)
-    }
 }
 
 fn workspace_diagnosis_state(bound: bool, enforce_workspace: bool) -> &'static str {
@@ -3493,7 +3045,6 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     } else {
         "ok"
     };
-    let (profile_status, profile_notes) = &facts.profile_discovery;
     let (credential_store_status, credential_store_backend, residual_fallback_entries) =
         &facts.credential_store;
     // #141: a daemon that is up but whose Agent route is not ready must not
@@ -3529,8 +3080,6 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "agent_route_offline"
     } else if *credential_store_status != "ok" {
         "credential_store_issues"
-    } else if *profile_status == "warn" {
-        "profile_discovery_issues"
     } else if facts.stale_sessions > 0 {
         "stale_sessions"
     } else if facts.workspace_state == "unbound_enforced" {
@@ -3548,8 +3097,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         | "op_journal_recoverable_orphaned"
         | "op_journal_in_progress"
         | "agent_route_offline"
-        | "credential_store_issues"
-        | "profile_discovery_issues" => "run_local_doctor",
+        | "credential_store_issues" => "run_local_doctor",
         "stale_sessions" => "reconcile_stale_sessions",
         "workspace_selection_required" => "select_workspace",
         _ => "none",
@@ -3648,10 +3196,6 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
             "backend": credential_store_backend,
             "residual_fallback_entries": residual_fallback_entries,
         },
-        "profile_discovery": {
-            "status": profile_status,
-            "notes": profile_notes,
-        },
         "recommendation": recommendation,
     })
 }
@@ -3659,8 +3203,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
 #[cfg(test)]
 mod system_diagnosis_tests {
     use super::{
-        profile_discovery_health_with, system_diagnosis_payload, workspace_diagnosis_state,
-        SystemDiagnosisFacts, SYSTEM_DIAGNOSIS_CONTRACT,
+        system_diagnosis_payload, workspace_diagnosis_state, SystemDiagnosisFacts,
+        SYSTEM_DIAGNOSIS_CONTRACT,
     };
 
     /// #161: the payload declares an explicit, parseable diagnosis contract
@@ -3686,7 +3230,6 @@ mod system_diagnosis_tests {
             op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
-            profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
             in_flight_external: 0,
@@ -3736,62 +3279,6 @@ mod system_diagnosis_tests {
         );
     }
 
-    /// P1-D/P1-F: the profile-discovery health canary actually runs official
-    /// profile discovery (no version probes) and compares the bare service
-    /// PATH with the daemon's full search — a login-shell-installed CLI that
-    /// only resolves through user-local dirs must be surfaced, not healthy.
-    #[cfg(not(windows))]
-    #[test]
-    fn profile_discovery_health_runs_official_discovery_and_compares_paths() {
-        let home = tempfile::tempdir().unwrap();
-        let bin = home.path().join(".local/bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let codex = bin.join("codex");
-        std::fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&codex).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&codex, perms).unwrap();
-        }
-        let system_only = std::ffi::OsString::from("/usr/bin:/bin");
-        let (status, notes) = profile_discovery_health_with(Some(home.path()), Some(&system_only));
-        assert_eq!(status, "warn");
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.contains("codex") && n.contains("user-local")),
-            "user-local-only resolution must be surfaced: {notes:?}"
-        );
-        // The login-like full search (user dirs appended) finds it, so the
-        // note is about the service PATH mismatch, not a missing binary.
-        assert!(
-            notes.iter().all(|n| !n.contains("not searched")),
-            "existing user dirs are searched: {notes:?}"
-        );
-
-        // With the bin dir on the daemon PATH the same home is healthy.
-        let full = std::ffi::OsString::from(format!("/usr/bin:/bin:{}", bin.display()));
-        let (status, notes) = profile_discovery_health_with(Some(home.path()), Some(&full));
-        assert_eq!(status, "ok", "{notes:?}");
-
-        // HOME unset → warn (discovery unavailable).
-        let (status, _) = profile_discovery_health_with(None, Some(&system_only));
-        assert_eq!(status, "warn");
-    }
-
-    /// Windows inherits user-level CLI directories through PATH and has no
-    /// Unix HOME-local search supplement, so the Unix mismatch canary is not
-    /// applicable and must not emit a false warning.
-    #[cfg(windows)]
-    #[test]
-    fn profile_discovery_health_skips_unix_user_local_canary_on_windows() {
-        let (status, notes) = profile_discovery_health_with(None, None);
-        assert_eq!(status, "ok");
-        assert!(notes.is_empty());
-    }
-
     #[test]
     fn common_device_local_states_are_typed_and_redacted() {
         let healthy_facts = || SystemDiagnosisFacts {
@@ -3811,7 +3298,6 @@ mod system_diagnosis_tests {
             op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
-            profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
             in_flight_external: 0,
@@ -3894,8 +3380,8 @@ mod system_diagnosis_tests {
     }
 
     /// P0-A/P0-B/P1-F: a poisoned transition journal, dangerous op-journal
-    /// pressure and profile-discovery failures must each move `overall` away
-    /// from `healthy` with an actionable recommendation, while the 6 check ids
+    /// pressure must move `overall` away from `healthy` with an actionable
+    /// recommendation, while the check ids
     /// stay stable (additive top-level fields only).
     #[test]
     fn journal_and_discovery_issues_are_not_reported_healthy() {
@@ -3916,7 +3402,6 @@ mod system_diagnosis_tests {
             op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
-            profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
             agent_route: None,
             in_flight_external: 0,
@@ -4082,24 +3567,11 @@ mod system_diagnosis_tests {
         );
         assert_eq!(value["overall"], "op_journal_uncertain");
 
-        // Profile-discovery failure → not healthy.
-        let value = system_diagnosis_payload(
-            "2026-08-13T00:00:00Z",
-            SystemDiagnosisFacts {
-                profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
-                ..healthy.clone()
-            },
-        );
-        assert_eq!(value["overall"], "profile_discovery_issues");
-        assert_eq!(value["recommendation"], "run_local_doctor");
-        assert_eq!(value["profile_discovery"]["status"], "warn");
-
         // All-clear stays healthy with ok journal states.
         let value = system_diagnosis_payload("2026-08-13T00:00:00Z", healthy);
         assert_eq!(value["overall"], "healthy");
         assert_eq!(value["journals"]["transition"]["status"], "ok");
         assert_eq!(value["journals"]["op_journal"]["status"], "ok");
-        assert_eq!(value["profile_discovery"]["status"], "ok");
         assert_eq!(value["checks"].as_array().map(Vec::len), Some(7));
     }
 
@@ -4124,7 +3596,6 @@ mod system_diagnosis_tests {
             op_journal_recoverable_orphaned: 0,
             op_journal_uncertain: 0,
             op_journal_degraded: false,
-            profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
             credential_store: ("warn", Some("preferred(encrypted-file)".into()), 1),
             agent_route: None,
             in_flight_external: 0,

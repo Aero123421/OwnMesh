@@ -31,6 +31,6 @@ receipts that remain open.
 - A ChatGPT plugin publisher must scan, submit, and publish a new metadata
   version for catalog changes. A new conversation alone is insufficient for a
   published snapshot.
-- Live vendor-profile, macOS/Windows broker, external ChatGPT, native-signing,
-  and independent-review receipts remain the `W-*` waivers in the generated
-  release evidence.
+- macOS/Windows broker, external ChatGPT, native-signing, and
+  independent-review receipts remain the `W-*` blockers in generated release
+  evidence.

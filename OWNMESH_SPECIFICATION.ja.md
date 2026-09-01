@@ -10,11 +10,11 @@
 
 ## 0. 文書の目的
 
-本書は、OwnMesh を実装し、OSS として公開・保守するための製品仕様、システム設計、セキュリティ境界、CLI/TUI、MCP、Cloudflare コントロールプレーン、OS エージェント、CLI プロファイル、テスト、リリース要件を一つにまとめた基準文書である。
+本書は、OwnMesh を実装し、OSS として公開・保守するための製品仕様、システム設計、セキュリティ境界、CLI/TUI、MCP、Cloudflare コントロールプレーン、OS エージェント、外部 CLI の汎用実行、テスト、リリース要件を一つにまとめた基準文書である。
 
 OwnMesh は、ChatGPT を含む任意の MCP クライアント、人間が使う OwnMesh CLI/TUI、別の PC から、Windows・macOS・Linux 上のコマンド、ファイル、ログ、プロセス、対話セッション、コーディング CLI を安全に利用するための OSS 実行基盤である。
 
-OwnMesh は AI オーケストレーターではない。ChatGPT、Codex CLI、Claude Code、Kimi Code、OpenCode、Pi Coding Agent、Antigravity CLI、Qwen Code、Hermes Agent、Qoder CLI の上下関係や役割を固定しない。OwnMesh が提供するのは、AI と人間が自由に組み合わせて使える能力、接続、認証、権限、セッション、監査である。
+OwnMesh は AI オーケストレーターではない。外部 CLI の種類や上下関係、役割を固定しない。OwnMesh が提供するのは、AI と人間が自由に組み合わせて使える能力、接続、認証、権限、汎用セッション、監査である。
 
 ### 0.1 規範語
 
@@ -45,7 +45,7 @@ OwnMesh は AI オーケストレーターではない。ChatGPT、Codex CLI、C
 ## 1.3 中核思想
 
 1. **能力を提供し、役割を固定しない。**  
-   ChatGPT をオーケストレーター、Codex や Claude Code を worker とする隠しプロンプトや強制ワークフローを持たない。
+   ChatGPT をオーケストレーター、特定の外部 CLI を worker とする隠しプロンプトや強制ワークフローを持たない。
 
 2. **ユーザーが所有する。**  
    コントロールプレーンは利用者自身の Cloudflare アカウントへデプロイする。OwnMesh プロジェクト運営者の中央サービスを必須にしない。
@@ -99,7 +99,8 @@ OwnMesh 1.0 は次を目的としない。
 - 独自 LLM、独自コーディングエージェントの開発。
 - AI のタスク分解、担当者選択、上下関係の固定。
 - ChatGPT 会話履歴の完全ミラーリング。
-- Codex と Claude Code の意味的コンテキストを自動で同一化すること。
+- 異なる外部 CLI の意味的コンテキストを自動で同一化すること。
+- coding agent 専用 Profile、認証検出、vendor event 正規化、native session resume。
 - OwnMesh 運営者が管理する中央 SaaS を必須にすること。
 - 標準でのクラウドファイル保管。
 - 初期リリースにおける Web 管理画面。
@@ -124,9 +125,8 @@ OwnMesh 1.0 は次を目的としない。
 | Grant | Principal が Resource に対して持つ Capability の許可 |
 | Policy | 操作を allow / ask / deny に決定する規則 |
 | Operation | 一つのコマンド、ファイル変更、セッション開始等の実行記録 |
-| Session | 継続的なプロセス、PTY、またはコーディング CLI の接続単位 |
-| Profile | 特定 CLI の検出、起動、認証状態、構造化接続方法を記述する定義 |
-| Adapter | CLI 固有の ACP、RPC、JSONL、HTTP 等を OwnMesh に変換する実装 |
+| Session | 継続的なプロセスまたは PTY の接続単位 |
+| External CLI | generic exact `program` / `args` で起動する外部 executable |
 | Skill | MCP や CLI の能力を AI に説明する任意の知識パック |
 | Relay | ファイル本体を第三者・クラウド経由で中継する機能 |
 
@@ -153,7 +153,7 @@ flowchart TB
         Host[session-host\nPTY / long process]
         Priv[ownmesh-privileged\n任意・管理者権限]
         Runtime[Shell / Files / Logs / Git]
-        CLIs[Codex / Claude / Kimi / OpenCode / Pi\nAGY / Qwen / Hermes / Qoder / 任意 CLI]
+        CLIs[任意の external CLI\nexact program / args]
     end
 
     ChatGPT -->|Streamable HTTP MCP + OAuth| Worker
@@ -226,7 +226,7 @@ flowchart TB
 - Tenant、User、Membership。
 - OAuth client、grant、token family のメタデータ。
 - Device 公開鍵、状態、最終接続時刻。
-- Workspace、Profile のメタデータ。
+- Workspace のメタデータ。
 - Capability Grant、Policy のクラウド側規則。
 - Operation と Audit Event のメタデータ。
 
@@ -293,7 +293,7 @@ flowchart TB
 - 依存クレート・npm パッケージは目的を明示する。
 - OS 特権境界、暗号、アップデート、OAuth は小規模で監査可能な依存を優先する。
 - ローカル TUI のために Node.js/Bun を要求しない。
-- Community adapter を動的ライブラリとしてプロセス内ロードしない。
+- 外部 CLI を動的ライブラリとしてプロセス内ロードしない。
 - `cargo-deny` と npm lockfile でライセンス・脆弱性・重複依存を監査する。
 
 ---
@@ -473,7 +473,6 @@ Device は原則として **OS ユーザー + ホスト** の組として登録�
 ```text
 devices:read
 workspaces:read
-profiles:read
 sessions:read
 sessions:control
 filesystem:read
@@ -482,7 +481,6 @@ logs:read
 commands:run
 commands:shell
 commands:elevated
-profiles:run
 transfers:send
 policies:manage
 tenant:admin
@@ -492,8 +490,8 @@ tenant:admin
 
 | Preset | Scope |
 |---|---|
-| Observe | devices/workspaces/profiles/sessions/files/logs の read |
-| Develop | Observe + filesystem write + command run + session control + profile run |
+| Observe | devices/workspaces/sessions/files/logs の read |
+| Develop | Observe + filesystem write + command run + session control |
 | Full | Develop + raw shell + elevated + transfer |
 | Custom | ユーザー選択 |
 
@@ -503,7 +501,7 @@ MCP server は OAuth scope に応じて tool を公開または拒否する。sc
 > 出荷している scope は 6 つである。
 >
 > ```text
-> ownmesh.read     読み取り・discovery（devices, fs read/list/stat, git, workspace, profile, review, transfer 状態, operation）
+> ownmesh.read     読み取り・discovery（devices, fs read/list/stat, git, workspace, review, transfer 状態, operation）
 > ownmesh.write    内容・資源の変更（fs write/patch/delete, workspace CRUD, review start, transfer plan/send/cancel）
 > ownmesh.exec     コマンド実行（command_run, command_shell, cancel_operation）
 > ownmesh.session  対話セッション（session_* 一式）
@@ -950,7 +948,7 @@ Redaction は設定可能であり、Full Access でも強制ではない。
 - local IPC。
 - terminal/PTY support。
 - workspace path。
-- official profile detection/auth status。
+- generic executable resolution と session-host status。
 - ChatGPT MCP endpoint metadata。
 - protocol version compatibility。
 - Cloudflare bindings/migrations。
@@ -966,7 +964,6 @@ Redaction は設定可能であり、Full Access でも強制ではない。
 ```text
 process       非対話の長時間プロセス
 terminal      PTY セッション
-profile       CLI profile/adapter セッション
 local-shell   人間向け shell
 ```
 
@@ -979,7 +976,6 @@ session_id
 session_type
 device_id
 workspace_id
-profile_id
 state
 created_by
 created_at
@@ -987,7 +983,6 @@ controller_principal
 controller_lease_version
 controller_lease_expires_at
 last_event_seq
-native_session_id
 process_id
 ```
 
@@ -1044,15 +1039,16 @@ ChatGPT は永続 socket を持たないため、Principal 単位の controller 
 - Client detach で process を終了しない。
 - `close` と `terminate` を区別する。
 - `ownmeshd` 再起動後、Session Host へ再接続する。
-- OS 再起動を跨ぐ再開は Profile 固有 native session resume がある場合のみ可能。
+- OS 再起動後に external CLI の vendor-native conversation を自動再開しない。
 - PTY file descriptor 自体の OS 再起動跨ぎは保証しない。
 
-## 12.8 Profile native session
+## 12.8 External CLI state
 
-- `native_session_id` は Codex/Claude/Kimi 等の session id を保存する。
-- OwnMesh session id と CLI native session id は別である。
-- Profile adapter が対応していれば resume を提供する。
-- ChatGPT 会話コンテキストを暗黙に native session へコピーしない。
+- OwnMesh session id は OwnMesh が監督する process/PTY だけを識別する。
+- vendor-native session id は保存・解釈しない。
+- 外部 CLI 固有の resume が必要なら、利用者が公開 CLI contract を exact
+  `program` / `args` として指定する。
+- ChatGPT 会話コンテキストを外部 CLI へ暗黙にコピーしない。
 
 ## 12.9 Context Bundle
 
@@ -1070,134 +1066,65 @@ human-authored notes
 - full conversation history を自動収集しない。
 - bundle 内容を preview できる。
 - secret scan/redaction を設定できる。
-- 受信先へ plain prompt、file、adapter-specific message として渡す。
+- 受信先へ user-selected file または exact generic CLI argument として明示的に渡す。
 
 ---
 
-# 13. CLI Profile と Adapter
+# 13. 外部 CLI の汎用実行
 
-## 13.1 公式対応 Profile
+## 13.1 単一の実行モデル
 
-OwnMesh 1.0 は次の 9 profile を公式に対応する。
-
-| Profile ID | 表示名 | 主な command |
-|---|---|---|
-| `codex` | OpenAI Codex CLI | `codex` |
-| `claude-code` | Claude Code | `claude` |
-| `kimi-code` | Kimi Code | `kimi` |
-| `opencode` | OpenCode | `opencode` |
-| `pi` | Pi Coding Agent | `pi` |
-| `agy` | Antigravity CLI | `agy` |
-| `qwen-code` | Qwen Code | `qwen` |
-| `hermes-agent` | Hermes Agent | `hermes` |
-| `qoder` | Qoder CLI | `qoder`（旧 `qodercli` も検出互換） |
-
-Gemini CLI、Cline、Goose、Kiro CLI、Amp は公式同梱 Profile に含めない。Community profile として追加することは妨げない。
-
-## 13.2 未知の CLI
-
-Profile は必須ではない。任意 CLI はそのまま実行できる。
+OwnMesh は coding agent 専用 Profile、ベンダー allowlist、認証検出、または
+ベンダー固有 Adapter を持たない。外部 CLI は他の executable と同じ exact
+`program` / `args` の command、process、PTY、session として扱う。
 
 ```bash
 ownmesh exec <device> -- my-cli --flag value
-ownmesh session open <device> -- my-interactive-cli
+ownmesh session open <device> --idempotency-key <key> -- my-cli --interactive
 ```
 
-MCP でも generic command/terminal tool を使用する。
+MCP では `ownmesh_command_run` または `ownmesh_session_open` に、呼び出す
+`program` と順序を保持した `args` を渡す。OwnMesh はベンダー名から引数、
+prompt、protocol mode、login command、resume id を推測してはならない。
 
-Profile の価値は次の追加情報にある。
+## 13.2 認可境界
 
-- 自動検出。
-- version/auth status。
-- structured protocol。
-- native session resume。
-- permission event mapping。
-- usage/cost/status。
-- login/update helper。
+OwnMesh が認可・監査するのは external process/session の起動、入出力、終了、
+workspace binding、controller lease、および OwnMesh 自身が受けた operation で
+ある。子 CLI が内部で実行する tool call、filesystem access、network access、
+approval protocol の意味は観測・認可しない。
 
-## 13.3 接続優先順位
+`workspace_id` と `cwd` は OwnMesh の path resolution と policy context で
+あり、spawn した process に対する OS sandbox ではない。子 process の ambient
+user authority を制限する必要がある場合、利用者は namespaces、sandbox
+profiles、restricted token、container 等の OS isolation を別途使用する。
 
-Profile ごとに利用可能な最良 interface を選ぶ。
+## 13.3 出力と再開
 
-```text
-1. 公式 ACP
-2. 公式 App Server / RPC / SDK / HTTP API
-3. 公式 JSON / JSONL / stream-json 非対話 mode
-4. PTY
-```
+OwnMesh は generic PTY/process の raw stdout/stderr、bounded replay、exit state、
+controller handoff を提供する。次は提供しない。
 
-ACP を一律必須にはしない。各 CLI の公式安定 interface を優先する。
+- vendor event の正規化、reasoning/tool/assistant message の分類。
+- vendor credential または login/authenticated/readiness の検出。
+- vendor-native conversation/session id の保存や resume。
+- vendor permission request と OwnMesh approval の自動 bridge。
+- vendor CLI の install、login、update helper。
 
-## 13.4 公式 Adapter 方針
+会話や状態の再開が必要な場合は、利用者が当該 CLI の公開 command line contract
+を exact `program` / `args` として明示する。その意味と互換性は外部 CLI 側の
+責任であり、OwnMesh の session resume claim にはしない。
 
-| Profile | 優先 interface | Fallback |
-|---|---|---|
-| Codex | `codex app-server` JSON-RPC | `codex exec --json`, PTY |
-| Claude Code | print/SDK `stream-json` | PTY、native resume |
-| Kimi Code | ACP | `--prompt --output-format stream-json`, PTY |
-| OpenCode | `opencode acp` | CLI JSON、PTY |
-| Pi | `--mode rpc` JSONL | PTY |
-| AGY | 公式 structured mode が利用可能なら使用 | PTY |
-| Qwen Code | ACP/daemon/SDK | headless `-p`, PTY |
-| Hermes Agent | ACP adapter または one-shot CLI | PTY、native resume |
-| Qoder | `qoder --acp` | 旧 executable 検出、SDK/PTY |
+## 13.4 旧 Profile 契約
 
-Adapter は起動時に version と capability を検出し、固定コマンドに過度に依存しない。
+削除済みの Profile IPC/MCP method は method-not-found を返す。
+`session.open` が旧 `profile_id`、`prompt`、`native_session_id`、
+`adapter_mode`、または `profile` / `profile_agent` kind を受けた場合は、
+generic `program` / `args` への移行案内を含む invalid-params を返す。
 
-## 13.5 Profile status
-
-```text
-not_installed
-installed
-needs_login
-authenticated
-unsupported_version
-adapter_degraded
-ready
-running
-```
-
-TUI は「何が足りないか」を説明し、各 CLI の公式ログイン command を attached terminal で開ける。
-
-OwnMesh は各 CLI の API key/token を Cloudflare へコピーしない。
-
-`installed` は、検出した同一 executable と shebang interpreter が deterministic
-child PATH で起動可能かつ対応 version であることだけを示す。auth probe が未定義なら
-authentication は `unknown`、protocol-only receipt がなければ structured protocol は
-`untested` とし、version 出力だけから `authenticated` / `ready` を推測してはならない。
-permission/tool request は OwnMesh の実行権限ではない。operation-bound bridge がない
-request は相関 ID を維持した typed denial とし、自動承認しない。
-
-## 13.6 Profile definition
-
-単純な profile は TOML で定義する。
-
-```toml
-id = "example"
-display_name = "Example Agent"
-commands = ["example"]
-interactive = true
-
-[detect]
-version_args = ["--version"]
-
-[non_interactive]
-args = ["--prompt", "{{prompt}}"]
-
-[capabilities]
-resume = false
-structured_output = false
-acp = false
-```
-
-## 13.7 External Adapter SDK
-
-- JSON-RPC 2.0 over stdio。
-- Adapter は別 process。
-- dynamic library loading はしない。
-- handshake、capability negotiation、start、resume、send_input、cancel、event stream を定義する。
-- Adapter が crash しても daemon は継続する。
-- Community adapter は署名/allowlist を設定可能。
+保存済み Profile session は argv や resume semantics を推測せず読み飛ばす。
+generic session に残った旧 Profile metadata は無視する。この破壊的変更は
+[ADR 0018](./docs/adr/0018-generic-external-cli-sessions.md) と MCP catalog v2 に
+記録する。
 
 ---
 
@@ -1212,16 +1139,17 @@ acp = false
 - 通常 Chat から利用する。
 - ChatGPT 固有のモード切替を OwnMesh の必須条件にしない。
 
-> **実装状況（v1.2.25 / [ADR 0017](./docs/adr/0017-dual-era-mcp-and-frozen-catalog-compatibility.md)）**
+> **実装状況（v1.2.26 / [ADR 0017](./docs/adr/0017-dual-era-mcp-and-frozen-catalog-compatibility.md)、[ADR 0018](./docs/adr/0018-generic-external-cli-sessions.md)）**
 > 共通の tool registry・scope・action binding・device policy route の前に、
 > `2025-03-26` legacy adapter（`initialize` / 任意 session id）と
 > `2026-07-28` modern adapter（stateless request metadata、mirrored HTTP
 > headers、`server/discover`、typed version/header error、cache hint）を置く。
-> 既存 ChatGPT client を壊す flag-day replacement は行わない。公開済み
+> protocol adapter は共通 registry の前段に限る。公開済み
 > ChatGPT plugin の metadata は OpenAI の review snapshot であり、server deploy
 > だけでは更新されないため、Scan Tools → submit → publish を別の operator
-> workflow として扱う。catalog v1 は旧名を `tools/call` で 1.x の間受理し、
-> CI が過去 snapshot に対する required parameter/property/effect 互換を検査する。
+> workflow として扱う。coding-agent Profile 契約の削除は catalog v2 として
+> 明示し、CI は v2 baseline に対する required parameter/property/effect 互換を
+> 検査する。catalog v1 は履歴証跡であり callable compatibility ではない。
 
 ## 14.2 Tool 命名
 
@@ -1252,8 +1180,6 @@ ownmesh_open_session
 ownmesh_list_devices
 ownmesh_get_device
 ownmesh_list_workspaces
-ownmesh_list_profiles
-ownmesh_get_profile
 ownmesh_list_sessions
 ownmesh_get_session
 ownmesh_read_session_output
@@ -1284,8 +1210,6 @@ ownmesh_resize_session
 ownmesh_claim_session
 ownmesh_release_session
 ownmesh_close_session
-ownmesh_start_profile
-ownmesh_resume_profile
 ownmesh_cancel_operation
 ownmesh_plan_transfer
 ownmesh_start_transfer
@@ -1400,27 +1324,19 @@ UI がなくてもすべての workflow を tool result だけで完結できな
 
 ## 14.10 Skill
 
-公式 Skill bundle:
+汎用 Skill bundle:
 
 ```text
 ownmesh-core
 ownmesh-sessions
 ownmesh-files-and-logs
-ownmesh-codex
-ownmesh-claude-code
-ownmesh-kimi-code
-ownmesh-opencode
-ownmesh-pi
-ownmesh-agy
-ownmesh-qwen-code
-ownmesh-hermes
-ownmesh-qoder
+ownmesh-external-cli-sessions
 ```
 
-Skill は使い方、制約、出力、resume、トラブルシュートを説明する。次を含めない。
+Skill は使い方、制約、raw 出力、トラブルシュートを説明する。次を含めない。
 
 - ChatGPT は必ず orchestrator になれ。
-- Codex は worker である。
+- 特定の外部 CLI は worker である。
 - 長い仕事は必ず特定 CLI へ委譲せよ。
 
 ---
@@ -1437,17 +1353,18 @@ ChatGPT:
 list_devices → query_logs → search_files → read_file → run_command
 ```
 
-## 15.2 CLI agent を起動
+## 15.2 外部 CLI を起動
 
 ```text
 ユーザー:
-MacのこのリポジトリでClaude Codeを起動して。
+Macのこのリポジトリで my-cli を `--interactive` 付きで起動して。
 
 ChatGPT:
-list_workspaces → start_profile(profile=claude-code)
+list_workspaces → session_open(program="my-cli", args=["--interactive"])
 ```
 
-OwnMesh は Claude Code を worker と定義しない。単に profile session を開始する。
+OwnMesh は外部 CLI の役割や内部 tool action を定義しない。exact argv の generic
+session を開始するだけである。
 
 ## 15.3 人間が引き継ぐ
 
@@ -1465,7 +1382,7 @@ ChatGPT は observer として出力を確認できる。
 このPCでmy-custom-agentを対話モードで起動して。
 ```
 
-Profile 登録なしで generic terminal session を開始する。
+exact `program` / `args` で generic terminal session を開始する。
 
 ## 15.5 研究・分析
 
@@ -1531,18 +1448,9 @@ ownmesh
 │   ├── attach
 │   ├── claim
 │   ├── release
-│   ├── cancel
 │   ├── give
 │   ├── close
 │   └── terminate
-├── profile
-│   ├── scan
-│   ├── list
-│   ├── show
-│   ├── login
-│   ├── test
-│   ├── start
-│   └── resume
 ├── approval
 │   ├── list
 │   ├── show
@@ -1593,7 +1501,7 @@ ownmesh
 | 5 | Device offline/unreachable |
 | 6 | Timeout/cancelled |
 | 7 | Conflict/stale snapshot/controller conflict |
-| 8 | Profile/dependency unavailable |
+| 8 | Dependency unavailable |
 | 9 | Internal error |
 
 ## 16.4 JSON output
@@ -1647,15 +1555,15 @@ Terminal に font を同梱・配布しない。利用者の font に依存し�
 
 ```text
 ┌ OwnMesh ─ instance: personal ─ Connected ● ────────────────┐
-│ Devices  Sessions  Profiles  Approvals  Transfers  Settings │
+│ Devices  Workspaces  Sessions  Approvals  Transfers  Settings │
 ├───────────────────────┬──────────────────────────────────────┤
 │ DEVICES               │ dev-windows                         │
 │ ● dev-windows         │ Windows 11 · x64                    │
 │ ● macbook             │ Agent 1.0 · Full User Access        │
-│ ○ linux-server        │ 2 sessions · 9 profiles             │
+│ ○ linux-server        │ 2 sessions                          │
 │                       │                                      │
 │                       │ Recent activity                      │
-│                       │ 14:21 Codex session started          │
+│                       │ 14:21 external CLI session started   │
 │                       │ 14:18 npm test completed             │
 ├───────────────────────┴──────────────────────────────────────┤
 │ Ctrl+K Commands   / Search   ? Help   q Quit                 │
@@ -1674,12 +1582,11 @@ Terminal に font を同梱・配布しない。利用者の font に依存し�
 2. Devices。
 3. Workspaces。
 4. Sessions。
-5. Profiles。
-6. Approvals。
-7. Transfers。
-8. Activity/Audit。
-9. Diagnostics。
-10. Settings。
+5. Approvals。
+6. Transfers。
+7. Activity/Audit。
+8. Diagnostics。
+9. Settings。
 
 ## 17.6 Command palette
 
@@ -1689,7 +1596,7 @@ Terminal に font を同梱・配布しない。利用者の font に依存し�
 
 ```text
 > enroll device
-> start codex on dev-windows
+> start my-cli on dev-windows
 > change language
 > full access
 > check updates
@@ -1709,9 +1616,8 @@ fuzzy matching、最近使った操作、context-aware action を提供する。
 7. Privileged access
 8. Approval behavior
 9. Workspace convenience labels
-10. Profile scan
-11. ChatGPT connection guide
-12. Final diagnostics
+10. ChatGPT connection guide
+11. Final diagnostics
 ```
 
 > **実装状況（v1.2.3）**
@@ -1723,9 +1629,9 @@ fuzzy matching、最近使った操作、context-aware action を提供する。
 > - `ownmesh-tui` の wizard: Welcome → Language → Preset → Confirm の 4 段。
 >
 > device 名、background service、privileged access、approval 挙動、workspace
-> label、profile scan、ChatGPT 接続案内、最終 diagnostics は、それぞれ独立した
+> label、ChatGPT 接続案内、最終 diagnostics は、それぞれ独立した
 > コマンド（`device enroll`、`service install`、`privileged install`、
-> `profile scan`、`doctor`）として提供しており、単一 wizard には統合していない。
+> `doctor`）として提供しており、単一 wizard には統合していない。
 > `setup --quickstart` が device 登録と autostart までを 1 コマンドで実行する。
 
 各画面は右側または下部に次を表示する。
@@ -1892,8 +1798,6 @@ erDiagram
     PRINCIPAL ||--o{ MEMBERSHIP : joins
     TENANT ||--o{ DEVICE : owns
     DEVICE ||--o{ WORKSPACE : exposes
-    DEVICE ||--o{ DEVICE_PROFILE : detects
-    PROFILE_DEFINITION ||--o{ DEVICE_PROFILE : defines
     DEVICE ||--o{ SESSION : runs
     PRINCIPAL ||--o{ SESSION : creates
     TENANT ||--o{ POLICY : has
@@ -1978,20 +1882,12 @@ policy_id
 created_at
 ```
 
-## 20.6 ProfileDefinition / DeviceProfile
+## 20.6 External executable metadata
 
-ProfileDefinition は repo 同梱、versioned data。DeviceProfile は検出結果。
+OwnMesh はベンダー/Profile registry を Control Plane に保存しない。Session の
+command vector は Device 側の bounded session metadata と audit binding に必要な
+範囲だけ保持し、credential や vendor-native session state は保存しない。
 
-```text
-profile_id
-device_id
-command_path
-version
-auth_status
-adapter_mode
-capabilities_json
-last_checked_at
-```
 
 ## 20.7 Session
 
@@ -2042,7 +1938,7 @@ agent -> server: hello(protocols, device_id, agent_version, nonce_a)
 server -> agent: challenge(nonce_b, connection_id)
 agent -> server: proof(signature(transcript))
 server -> agent: accepted(selected_protocol, session_parameters)
-agent -> server: ready(capabilities, profiles_summary)
+agent -> server: ready(capabilities, workspace_summary)
 ```
 
 ## 21.3 Envelope
@@ -2110,7 +2006,6 @@ agent -> server: ready(capabilities, profiles_summary)
 config.toml       人間が編集可能
 policy.toml       allow/ask/deny
 state.db          ローカル状態
-profiles/         local override
 locales/          追加翻訳（任意）
 ```
 
@@ -2185,7 +2080,7 @@ full log cloud persistence: off
 - session count。
 - output bytes。
 - Cloudflare request estimate。
-- profile usage。
+- generic external process/session usage。
 
 これを OwnMesh 運営者へ送信しない。
 
@@ -2212,7 +2107,7 @@ ownmesh report submit <bundle>
 3. Control Plane ↔ Device Agent。
 4. Agent ↔ local user processes/files。
 5. Agent ↔ Privileged Broker。
-6. Agent ↔ external CLI adapter。
+6. Agent ↔ external CLI process/session。
 7. Device ↔ Device file transfer。
 
 ## 26.2 Threats
@@ -2222,7 +2117,7 @@ ownmesh report submit <bundle>
 - Replayed operation。
 - Compromised MCP client。
 - Prompt injection from repository/logs。
-- Malicious CLI/profile/adapter。
+- Malicious external CLI process。
 - Path traversal、symlink race。
 - Shell injection。
 - Privilege escalation。
@@ -2246,7 +2141,7 @@ ownmesh report submit <bundle>
 - append-oriented audit。
 - no central telemetry。
 - secret storage in OS keychain。
-- adapter process isolation。
+- bounded process/session supervision。
 - protocol fuzzing。
 
 ## 26.4 AI risk judgment
@@ -2321,8 +2216,6 @@ ownmesh/
 │   ├── ownmesh-filesystem/
 │   ├── ownmesh-logs/
 │   ├── ownmesh-sessions/
-│   ├── ownmesh-profiles/
-│   ├── ownmesh-adapter-sdk/
 │   ├── ownmesh-transport/
 │   ├── ownmesh-ipc/
 │   ├── ownmesh-i18n/
@@ -2339,16 +2232,6 @@ ownmesh/
 │   ├── test/
 │   ├── package.json
 │   └── wrangler.jsonc
-├── profiles/
-│   ├── codex/
-│   ├── claude-code/
-│   ├── kimi-code/
-│   ├── opencode/
-│   ├── pi/
-│   ├── agy/
-│   ├── qwen-code/
-│   ├── hermes-agent/
-│   └── qoder/
 ├── skills/
 ├── locales/
 │   ├── en-US/
@@ -2368,7 +2251,7 @@ ownmesh/
 >
 > ```text
 > crates/   ownmesh-domain, -protocol, -policy, -config, -identity, -persist,
->           -ipc, -exec, -fs, -logs, -session, -session-host, -profiles,
+>           -ipc, -exec, -fs, -logs, -session, -session-host,
 >           -transfer, -update, -diagnostics, -broker, -broker-client,
 >           ownmesh (CLI), ownmesh-tui, ownmeshd
 > packages/ control-plane (Cloudflare Worker), ownmesh-schema
@@ -2381,7 +2264,7 @@ ownmesh/
 > `ownmesh-keystore` は `-identity` に、`ownmesh-cli` は `ownmesh` に対応する。
 > `ownmesh-i18n` は独立クレートにせず `ownmesh-tui` 内のコンパイル時カタログと
 > した（[ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）。
-> `ownmesh-adapter-sdk` / `-testkit` / `skills/` / `locales/` は未実装、
+> `ownmesh-testkit` / `skills/` / `locales/` は未実装、
 > `ownmesh-privileged` は `ownmesh-broker` として出荷している。
 
 ## 28.1 Dependency direction
@@ -2406,7 +2289,7 @@ TUI から DB、OS、Cloudflare binding を直接呼ばない。
 - domain type に primitive string を乱用しない。
 - secret type は Debug/Display で内容を出さない。
 - async task は cancellation と shutdown path を持つ。
-- giant `match profile_id` を避け、registry/trait を使用する。
+- executable ごとの特別分岐を持たず、exact generic `program` / `args` を使用する。
 - config と protocol に schema/version を持たせる。
 - OS 固有分岐を feature flag と adapter に隔離する。
 - UI snapshot、protocol golden test、property test を活用する。
@@ -2457,19 +2340,16 @@ TUI から DB、OS、Cloudflare binding を直接呼ばない。
 
 プラン・ロールアウト差分がある場合は capability matrix をドキュメント化する。OwnMesh 実装は full tool set を保持する。
 
-## 30.4 Profile conformance
+## 30.4 Generic external CLI conformance
 
-各公式 Profile について:
+- exact `program` / `args` が shell 展開なしで保持される。
+- command、process、PTY、session の lifecycle と bounded replay。
+- policy、approval、workspace、controller lease、idempotency の binding。
+- removed Profile method は method-not-found。
+- legacy Profile session input は explicit invalid-params。
+- persisted Profile session は generic session に誤変換されない。
+- cwd/workspace を OS sandbox と表示しない。
 
-- detect command。
-- version parse。
-- auth status。
-- interactive start。
-- structured start（対応時）。
-- cancel。
-- resume（対応時）。
-- PTY fallback。
-- unsupported version error。
 
 ## 30.5 TUI
 
@@ -2540,7 +2420,7 @@ TUI から DB、OS、Cloudflare binding を直接呼ばない。
 8. Privileged Broker。
 9. Session Host、PTY、handoff。
 10. MCP tool set、ChatGPT integration。
-11. Official Profile 9 種。
+11. Generic external CLI の exact command/process/PTY/session conformance。
 12. P2P transfer と optional transport addon interface。
 13. Rich TUI と 4 言語完成。
 14. Update、audit、diagnostics、telemetry-off confirmation。
@@ -2561,7 +2441,7 @@ TUI から DB、OS、Cloudflare binding を直接呼ばない。
 - CLI/TUI から Full User Access と Full Access を設定可能。
 - Privileged Broker が OS ごとに動く。
 - generic command と任意 CLI PTY が動く。
-- 公式 9 Profile が conformance test を通る。
+- external CLI の generic exact `program` / `args` conformance test が通る。
 - Session observer/controller handoff が動く。
 - TUI が英語、日本語、簡体字中国語、ロシア語に対応。
 - R2/TURN relay が標準 disabled。
@@ -2587,8 +2467,8 @@ TUI から DB、OS、Cloudflare binding を直接呼ばない。
 | 管理者権限 | networkless Privileged Broker |
 | Policy | allow / ask / deny。全 allow 可能 |
 | Session | 複数 observer、単一 controller lease |
-| Official profiles | Codex, Claude, Kimi, OpenCode, Pi, AGY, Qwen, Hermes, Qoder |
-| Unknown CLI | Profile 不要。generic exec/PTY で実行 |
+| External CLI | vendor 専用 Profile なし。exact `program` / `args` の generic exec/PTY/session |
+| Authorization boundary | external process/session の起動と制御まで。vendor-internal tool action は範囲外 |
 | File relay | 標準オフ |
 | Web admin | 1.0 ではなし |
 | Telemetry | 標準オフ |
@@ -2616,24 +2496,9 @@ TUI から DB、OS、Cloudflare binding を直接呼ばない。
   https://developers.cloudflare.com/workers/platform/deploy-buttons/  
   https://developers.cloudflare.com/durable-objects/
 
-- Agent Client Protocol  
-  https://agentclientprotocol.com/  
-  https://github.com/agentclientprotocol/rust-sdk
-
 - Ratatui / Fluent  
   https://ratatui.rs/  
   https://github.com/projectfluent/fluent-rs
-
-- Official profile sources  
-  https://github.com/openai/codex  
-  https://docs.anthropic.com/en/docs/claude-code/cli-usage  
-  https://github.com/MoonshotAI/kimi-code  
-  https://opencode.ai/docs/cli/  
-  https://pi.dev/docs/latest/rpc  
-  https://github.com/google-antigravity/antigravity-cli  
-  https://github.com/QwenLM/qwen-code  
-  https://github.com/NousResearch/hermes-agent  
-  https://docs.qoder.com/cli/acp
 
 ---
 
@@ -2646,15 +2511,16 @@ OwnMeshでdev-macのappリポジトリを確認して、失敗しているテス
 原因が小さな修正なら直して再テストして。
 ```
 
-ChatGPT は OwnMesh tools を直接使用する。Codex 等を起動する義務はない。
+ChatGPT は OwnMesh tools を直接使用する。外部 CLI を起動する義務はない。
 
-## A.2 Codex を起動
+## A.2 外部 CLI を起動
 
 ```text
-OwnMeshでwindows-devのD:\projects\inventoryを開き、Codex CLIを起動して。
+OwnMeshでwindows-devのD:\projects\inventoryを開き、my-cliを `--interactive` で起動して。
 ```
 
-OwnMesh は profile session を開始するだけで、役割は規定しない。
+OwnMesh は exact `program` / `args` の generic session を開始するだけで、役割や
+子 CLI 内部の tool action は規定しない。
 
 ## A.3 人間へ制御を移す
 
@@ -2693,5 +2559,5 @@ ADR が必要な例:
 - MCP tool の破壊的 schema 変更。
 - local IPC protocol の変更。
 - Privileged Broker boundary の変更。
-- official profile の追加・削除。
+- external CLI の generic process/session 認可境界の変更。
 - telemetry/file relay default の変更。

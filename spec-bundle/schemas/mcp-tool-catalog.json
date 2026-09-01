@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ownmesh.dev/schemas/mcp-tool-catalog.json",
   "title": "OwnMesh MCP tool catalog",
-  "description": "Initial MCP tool catalog for OwnMesh 1.0. Extracted from OWNMESH_SPECIFICATION.ja.md §14.3–14.5.",
-  "version": "0.1.0",
+    "description": "Generic OwnMesh MCP capability catalog. Coding-agent profiles and vendor-specific adapters are intentionally excluded.",
+    "version": "2.0.0",
   "result_envelope": {
     "operation_id": "op_...",
     "status": "completed",
@@ -48,26 +48,6 @@
     },
     {
       "name": "ownmesh_list_workspaces",
-      "group": "discovery_read",
-      "annotations": {
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "idempotentHint": true
-      }
-    },
-    {
-      "name": "ownmesh_list_profiles",
-      "group": "discovery_read",
-      "annotations": {
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "idempotentHint": true
-      }
-    },
-    {
-      "name": "ownmesh_get_profile",
       "group": "discovery_read",
       "annotations": {
         "readOnlyHint": true,
@@ -313,26 +293,6 @@
         "readOnlyHint": false,
         "destructiveHint": true,
         "openWorldHint": false,
-        "idempotentHint": false
-      }
-    },
-    {
-      "name": "ownmesh_start_profile",
-      "group": "write_execute",
-      "annotations": {
-        "readOnlyHint": false,
-        "destructiveHint": true,
-        "openWorldHint": true,
-        "idempotentHint": false
-      }
-    },
-    {
-      "name": "ownmesh_resume_profile",
-      "group": "write_execute",
-      "annotations": {
-        "readOnlyHint": false,
-        "destructiveHint": true,
-        "openWorldHint": true,
         "idempotentHint": false
       }
     },

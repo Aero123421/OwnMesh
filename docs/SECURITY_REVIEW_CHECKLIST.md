@@ -153,7 +153,7 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
   **Tests:** redaction helpers; buffer size caps
 - [x] disconnected client の古い input を再送しない  
   **Tests:** session input sequencing tests
-- [x] native CLI session id を別 tenant/device へ漏らさない  
+- [x] session metadata を別 tenant/device へ漏らさない
   **Tests:** device-room isolation tests
 
 ## 9. MCP / ChatGPT
@@ -165,7 +165,7 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 - [x] tool arguments を device-side policy でも再検証する  
   **Tests:** `ownmeshd` prompt-injection cannot bypass device policy
 - [x] untrusted repository/log content による prompt injection を想定する  
-  **Tests:** `mcp.test.ts`, `security-harden.test.ts`, profiles adapter isolation
+  **Tests:** `mcp.test.ts`, `security-harden.test.ts`, generic session policy tests
 - [x] MCP result に token、内部 stack trace、local absolute secret path を不用意に含めない  
   **Tests:** `security-harden.test.ts` redaction expectations
 - [x] pagination/truncation で access boundary を越えない  
@@ -173,22 +173,19 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 - [x] OAuth scope と tool capability mapping を automated test する  
   **Tests:** oauth scope + mcp tool authz tests
 
-## 10. Profiles と External Adapters
+## 10. Generic external CLI sessions
 
-- [x] Profile なしでも generic exec/PTY が機能する  
-  **Tests:** `ownmesh-profiles` generic_launch tests; `adapter_isolation.rs`
-- [x] external adapter は別 process で、本体へ dynamic library load しない  
-  **Tests:** `adapter_isolation.rs` (no dylib/so load API; process argv plans only)
-- [x] adapter executable の trust policy/allowlist を設定できる  
-  **Tests:** custom profile TOML allowlist shape tests
-- [x] adapter crash、hang、malformed JSON-RPC を隔離する  
-  **Tests:** `normalize_event_json` malformed inputs; launch plans externalize process
-- [x] CLI version drift で structured parser が誤操作しない  
-  **Tests:** unsupported version → error in launch_plan
-- [x] structured interface failure 時の PTY fallback を明示する  
-  **Tests:** `force_pty` / interface order tests
-- [x] CLI credential を Cloudflare へコピーしない  
-  **Tests:** wrangler bindings deny credential stores; CP does not accept raw CLI key copy APIs
+- [x] external CLI は exact `program` / `args` の generic exec/PTY/session を使う
+  **Tests:** `ownmesh-exec`, `ownmesh-session`, `ownmesh-session-host`
+- [x] vendor 専用 detection/auth/normalization/resume surface を公開しない
+  **Tests:** CLI/IPC/MCP catalog snapshots and catalog-v2 baseline
+- [x] removed Profile RPC と session input を explicit に拒否する
+  **Tests:** daemon method-not-found / invalid-params regression tests
+- [x] persisted Profile session を generic session に推測変換しない
+  **Tests:** `ownmesh-session::persist`
+- [x] cwd/workspace が OS sandbox ではないことを表示する
+  **Docs:** README, SECURITY.md, threat model, ADR 0018
+
 
 ## 11. File Transfer
 
@@ -211,8 +208,6 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
   **CI:** `.github/workflows/security.yml` (`cargo-audit`, `pnpm audit`, SBOM jobs)
 - [x] CI provenance と release signing key 管理を文書化する  
   **Docs:** ADR-0001; SECURITY.md
-- [x] profile definitions/translation packs の update trust を定義する ⚠  
-  **Docs:** threat model + profiles fixtures (content-addressed fixtures in-repo)
 
 ## 13. Privacy と Diagnostics
 
@@ -233,7 +228,7 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 
 - [x] Windows、macOS、Linux で threat-driven integration tests が通る  
   **CI:** `.github/workflows/ci.yml` (Windows/macOS/Linux all required; Rust 1.92 locked gates)
-- [x] protocol、path、broker、adapter fuzzing の重大 crash がない  
+- [x] protocol、path、broker、session fuzzing の重大 crash がない
   **Tests:** fuzz harness + security_* suites
 - [x] critical/high vulnerability が解消または公開された受容判断を持つ  
   **Docs:** `THREAT_MODEL.md` §7 findings log

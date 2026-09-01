@@ -135,7 +135,7 @@
     },
     "session_type": {
       "type": "string",
-      "enum": ["process", "terminal", "profile", "local_shell"]
+      "enum": ["process", "terminal", "local_shell"]
     },
     "session_state": {
       "type": "string",
@@ -387,7 +387,6 @@
         "session_type": { "$ref": "#/$defs/session_type" },
         "device_id": { "$ref": "#/$defs/device_id" },
         "workspace_id": { "$ref": "#/$defs/workspace_id" },
-        "profile_id": { "type": "string" },
         "state": { "$ref": "#/$defs/session_state" },
         "created_by": { "$ref": "#/$defs/principal_id" },
         "created_at": { "$ref": "#/$defs/timestamp" },
@@ -395,7 +394,6 @@
         "controller_lease_version": { "type": "integer", "minimum": 0 },
         "controller_lease_expires_at": { "$ref": "#/$defs/timestamp" },
         "last_event_seq": { "type": "integer", "minimum": 0 },
-        "native_session_id": { "type": "string" },
         "process_id": { "type": "integer", "minimum": 0 }
       }
     },

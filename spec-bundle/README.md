@@ -35,7 +35,7 @@ differs. Do not derive a client, a config file, or a policy file from them.
 | `schemas/policy.schema.json` | The engine evaluates `ownmesh_policy::PolicyRule` (capability, `when_elevated`, `when_kind`, `path_prefix`, `program_equals`, `when_tag`), persisted by `ownmesh-config` as `PolicyFile` in `policy.toml`. The schema's `operation_classes` / `path_globs` / `principal_ids` model is not implemented. |
 | `examples/policy.recommended.toml`, `examples/policy.full-access.toml` | Illustrations of the schema above. They are **not** loadable as a real `policy.toml`. Generate a real one with `ownmesh policy preset <name>`. |
 | `schemas/config.schema.json` | `ownmesh-config` `OwnMeshConfig` is the shipped shape and validates itself. |
-| `schemas/profile.schema.json`, `examples/profile.custom.toml` | `ownmesh-profiles` owns the shipped profile model. |
+| `schemas/mcp-tool-catalog.json` | Generic MCP command, session, filesystem, transfer, and policy capability catalog. |
 | `schemas/mcp-tool-catalog.json` | The shipped catalog is `MCP_TOOLS` in `packages/control-plane/src/mcp.ts`; `tools/list` publishes `PUBLISHED_MCP_TOOLS`. See [ADR 0004](../docs/adr/0004-mcp-tool-naming-and-aliases.md). |
 | `examples/ownmesh.example.toml` | Illustrative only; `ownmesh setup` writes the authoritative file. |
 

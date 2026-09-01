@@ -15,7 +15,6 @@ import {
   MCP_COMMAND_TIMEOUT_DETACH_HINT,
   MCP_COMMAND_TIMEOUT_DETACH_WARNING,
   MCP_DETACHED_OPERATION_TTL_MS,
-  OFFICIAL_PROFILE_CATALOG,
   OperationTracker,
   handleMcp,
   createHarnessRouter,
@@ -336,6 +335,25 @@ test("catalog surfaces are smaller, disjoint, and enforced at invocation", async
   const blockedBody = (await blocked.json()) as { error: { code: number; data: { code: string } } };
   assert.equal(blockedBody.error.code, -32601);
   assert.equal(blockedBody.error.data.code, "OWNMESH_E_TOOL_SURFACE");
+});
+
+test("catalog v2 removes Profile tools instead of keeping hidden aliases", async () => {
+  const removed = ["ownmesh_list_profiles", "ownmesh_profile_show", "ownmesh_session_cancel"];
+  const registered = new Set(MCP_TOOLS.map((tool) => tool.name));
+  for (const name of removed) assert.equal(registered.has(name), false);
+
+  const { store, token } = await authed();
+  for (const name of removed) {
+    const response = await handleMcp(
+      modernRpc("tools/call", { name, arguments: {} }, token),
+      store,
+      new URL("https://cp.test/mcp"),
+    );
+    assert.equal(response.status, 404);
+    const body = (await response.json()) as { error: { code: number; message: string } };
+    assert.equal(body.error.code, -32601);
+    assert.match(body.error.message, /unknown tool/i);
+  }
 });
 
 test("modern tools/call returns resultType and no protocol session", async () => {
@@ -979,44 +997,11 @@ test("timed-out command results include a detach hint", () => {
   assert.ok(env.warnings.includes(MCP_COMMAND_TIMEOUT_DETACH_WARNING));
 });
 
-test("session open canonically exposes explicit profile adapter inputs", () => {
-  for (const name of ["ownmesh_session_open", "ownmesh_open_session"]) {
-    const tool = MCP_TOOLS.find((candidate) => candidate.name === name)!;
-    const properties = tool.inputSchema.properties as Record<string, unknown>;
-    assert.ok(properties.profile_id, `${name} profile_id`);
-    assert.ok(properties.prompt, `${name} prompt`);
-    assert.ok(properties.native_session_id, `${name} native_session_id`);
-    assert.deepEqual((properties.adapter_mode as { enum?: string[] }).enum, ["auto", "structured", "pty"]);
-  }
-});
-
 test("session replay exposes an explicit raw sidecar diagnostic opt-in", () => {
   const replay = MCP_TOOLS.find((candidate) => candidate.name === "ownmesh_session_replay")!;
   const properties = replay.inputSchema.properties as Record<string, unknown>;
   assert.deepEqual(properties.raw_sidecar, { type: "boolean", default: false });
   assert.ok(properties.sidecar_cursor);
-});
-
-test("official profile catalog is 9 entries matching spec ids", () => {
-  assert.equal(OFFICIAL_PROFILE_CATALOG.length, 9);
-  const ids = OFFICIAL_PROFILE_CATALOG.map((p) => p.id);
-  for (const id of [
-    "codex",
-    "claude-code",
-    "kimi-code",
-    "opencode",
-    "pi",
-    "agy",
-    "qwen-code",
-    "hermes-agent",
-    "qoder",
-  ]) {
-    assert.ok(ids.includes(id as never), id);
-  }
-  assert.deepEqual(
-    OFFICIAL_PROFILE_CATALOG.find((p) => p.id === "qoder")?.binaries,
-    ["qodercli"],
-  );
 });
 
 test("legacy initialize preserves version negotiation for older clients", async () => {
@@ -1506,7 +1491,6 @@ test("system diagnosis folds device-local journal and discovery health into over
         transition: { status: "fail", pending: 2, expired_pending: 2, retained_unresolved: 1 },
         op_journal: { status: "ok", entries: 3, in_progress: 0 },
       },
-      profile_discovery: { status: "ok", notes: [] },
     },
     device,
     "online",
@@ -1615,26 +1599,6 @@ test("system diagnosis folds device-local journal and discovery health into over
     "warn",
   );
 
-  // Profile-discovery failure.
-  const discovery = normalizeSystemDiagnosis(
-    {
-      schema: "ownmesh.system_diagnosis/1.0",
-      observed_at: observedAt,
-      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
-      checks: baseChecks,
-      profile_discovery: { status: "warn", notes: ["user-local bin dir not searched"] },
-    },
-    device,
-    "online",
-    observedAt,
-  );
-  assert.equal(discovery.overall, "profile_discovery_issues");
-  assert.equal(discovery.recommendation, "run_local_doctor");
-  assert.deepEqual(
-    (discovery.profile_discovery as Record<string, unknown>).notes,
-    ["user-local bin dir not searched"],
-  );
-
   // Old Agents (no fields) stay healthy and additive fields default to ok —
   // no schema version bump, no exfiltration surface.
   const oldAgentNoRoute = normalizeSystemDiagnosis(
@@ -1676,7 +1640,6 @@ test("system diagnosis folds device-local journal and discovery health into over
         transition: { status: "bogus", path: "C:\\secret", credential: "x" },
         op_journal: { status: 42 },
       },
-      profile_discovery: { status: "bogus", notes: ["ok", "leak", 42, "ok2"] },
       path: "C:\\secret",
       credential: "must-not-persist",
     },
@@ -1700,138 +1663,6 @@ test("system diagnosis folds device-local journal and discovery health into over
   );
   const malformedJson = JSON.stringify(malformed);
   assert.doesNotMatch(malformedJson, /must-not-persist|C:\\secret/);
-  assert.equal(((malformed.profile_discovery as { notes: unknown[] }).notes).length, 3);
-
-  // P1-F/redaction: free-form profile notes are redacted before exposure or
-  // persistence — a semi-trusted device must not be able to inject secrets,
-  // credential assignments, or user-home paths into the normalized diagnosis
-  // or the persisted operation record. Credential-assignment lines are
-  // dropped entirely; embedded assignments, space-delimited bearer
-  // credentials, and user-home paths are replaced with `[REDACTED]`; benign
-  // notes pass through; every persisted note stays bounded (up to 160 chars)
-  // and the note list is capped at 8 entries.
-  const notes = normalizeSystemDiagnosis(
-    {
-      schema: "ownmesh.system_diagnosis/1.0",
-      observed_at: observedAt,
-      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
-      checks: baseChecks,
-      profile_discovery: {
-        status: "warn",
-        notes: [
-          "token=sk-secret1234",
-          "AWS_SECRET_ACCESS_KEY: x",
-          "-----BEGIN RSA PRIVATE KEY-----\nMIIEpQIBAAKCAQEA...",
-          "installed at /home/tonakai/.local/bin/codex",
-          "note mentions token=sk-inline999 in passing",
-          "Bearer sk-secret123",
-          "authorization eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
-          "ok note",
-        ],
-      },
-    },
-    device,
-    "online",
-    observedAt,
-  );
-  const notesOut = ((notes.profile_discovery as { notes: unknown[] }).notes) as string[];
-  assert.equal(
-    notesOut.length,
-    5,
-    "credential-assignment notes are dropped; path/embedded/space-delimited secrets are redacted and kept; benign notes pass through",
-  );
-  const notesJson = JSON.stringify(notesOut);
-  assert.doesNotMatch(
-    notesJson,
-    /sk-secret1234|aks-secret5678|sk-inline999|sk-secret123|eyJhbGci|MIIEpQIBAAKCAQEA|tonakai/,
-    "secrets must not persist",
-  );
-  assert.match(notesJson, /\[REDACTED\]/);
-  assert.match(notesJson, /ok note/);
-  for (const note of notesOut) {
-    assert.ok(note.length <= 160, "each redacted note stays bounded");
-  }
-  // The whole normalized payload must also stay free of the secrets.
-  assert.doesNotMatch(JSON.stringify(notes), /sk-secret1234|aks-secret5678|sk-inline999|sk-secret123|eyJhbGci/);
-
-  // Benign prose that merely mentions a credential word must survive
-  // redaction: only token-like values after a credential marker are replaced.
-  const benign = normalizeSystemDiagnosis(
-    {
-      schema: "ownmesh.system_diagnosis/1.0",
-      observed_at: observedAt,
-      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
-      checks: baseChecks,
-      profile_discovery: {
-        status: "warn",
-        notes: ["the token was refreshed", "api key rotated"],
-      },
-    },
-    device,
-    "online",
-    observedAt,
-  );
-  const benignJson = JSON.stringify(
-    (benign.profile_discovery as { notes: unknown[] }).notes,
-  );
-  assert.match(
-    benignJson,
-    /token was refreshed/,
-    "benign prose mentioning a credential word must survive redaction",
-  );
-  assert.match(
-    benignJson,
-    /api key rotated/,
-    "short plain words after a credential marker are not secrets",
-  );
-
-  // P1-F review (marker-plus-filler bypass): a token-like value separated from
-  // its credential marker by short filler words (`token is <opaque>`, `api key
-  // was <opaque>`) must be redacted too — previously only the immediately
-  // following token was matched, so `token is sk-…` passed the opaque value
-  // through unchanged and contradicted the documented redaction claim.
-  const fillerNotes = normalizeSystemDiagnosis(
-    {
-      schema: "ownmesh.system_diagnosis/1.0",
-      observed_at: observedAt,
-      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
-      checks: baseChecks,
-      profile_discovery: {
-        status: "warn",
-        notes: [
-          "token is sk-abcdefghijklmnopqrstuvwxyz012345",
-          "api key was AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPp",
-          "the bearer token for the device is eyJhbGciOiJIUzI1NiJ9.morepayload.extra",
-          "password happens to be: secret-inline-value",
-        ],
-      },
-    },
-    device,
-    "online",
-    observedAt,
-  );
-  const fillerNotesOut = ((fillerNotes.profile_discovery as { notes: unknown[] })
-    .notes) as string[];
-  const fillerJson = JSON.stringify(fillerNotesOut);
-  assert.doesNotMatch(
-    fillerJson,
-    /sk-abcdefghijklmnopqrstuvwxyz012345|AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPp|eyJhbGciOiJIUzI1NiJ9|secret-inline-value/,
-    "marker-plus-filler forms must not leak an opaque credential value",
-  );
-  assert.match(
-    fillerJson,
-    /\[REDACTED\]/,
-    "marker-plus-filler forms must be replaced with [REDACTED]",
-  );
-  for (const note of fillerNotesOut) {
-    assert.ok(note.length <= 160, "each redacted note stays bounded");
-  }
-  assert.doesNotMatch(
-    JSON.stringify(fillerNotes),
-    /sk-abcdefghijklmnopqrstuvwxyz012345|AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPp|eyJhbGciOiJIUzI1NiJ9/,
-    "the whole normalized payload must stay free of filler-form secrets",
-  );
-
   // P1-F: a *present-but-null* status field is a malformed value, not an
   // absent field — it must be surfaced as `malformed` and lift `overall` away
   // from healthy instead of being normalized to `ok`.
@@ -1845,7 +1676,6 @@ test("system diagnosis folds device-local journal and discovery health into over
         transition: { status: null },
         op_journal: { status: null },
       },
-      profile_discovery: { status: null },
     },
     device,
     "online",
@@ -1864,19 +1694,14 @@ test("system diagnosis folds device-local journal and discovery health into over
     ((nullStatus.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
     "malformed",
   );
-  assert.equal(
-    (nullStatus.profile_discovery as { status: string }).status,
-    "malformed",
-  );
   assert.equal(nullStatus.recommendation, "run_local_doctor");
 
   // P1-F: a *present but incomplete* subtree is an incomplete payload from a
   // newer Agent, not a legacy omission — `{journals:{transition:{}}}`,
-  // `{journals:{}}`, and `{profile_discovery:{}}` must be surfaced as
-  // `malformed` and lift `overall` away from healthy instead of normalizing
-  // to `ok` (which would hide device-side corruption). Only the *whole*
-  // subtree being absent (no `journals`/`profile_discovery` key at all) is a
-  // legacy omission and stays `ok`.
+  // and `{journals:{}}` must be surfaced as `malformed` and lift `overall`
+  // away from healthy instead of normalizing to `ok` (which would hide
+  // device-side corruption). Only the whole subtree being absent is a legacy
+  // omission and stays `ok`.
   const incomplete = normalizeSystemDiagnosis(
     {
       schema: "ownmesh.system_diagnosis/1.0",
@@ -1884,7 +1709,6 @@ test("system diagnosis folds device-local journal and discovery health into over
       agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
       checks: baseChecks,
       journals: { transition: {}, op_journal: {} },
-      profile_discovery: {},
     },
     device,
     "online",
@@ -1901,10 +1725,6 @@ test("system diagnosis folds device-local journal and discovery health into over
   );
   assert.equal(
     ((incomplete.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
-    "malformed",
-  );
-  assert.equal(
-    (incomplete.profile_discovery as { status: string }).status,
     "malformed",
   );
   assert.equal(incomplete.recommendation, "run_local_doctor");
@@ -1938,39 +1758,6 @@ test("system diagnosis folds device-local journal and discovery health into over
     "malformed",
   );
 
-  // P1-F/redaction: Windows user-home paths (`C:\Users\Alice\...` and the
-  // relative `\Users\Alice\...` form) are redacted exactly like POSIX
-  // `/home/alice` paths — a semi-trusted device must not be able to name a
-  // host account through a Windows-style note.
-  const winNotes = normalizeSystemDiagnosis(
-    {
-      schema: "ownmesh.system_diagnosis/1.0",
-      observed_at: observedAt,
-      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
-      checks: baseChecks,
-      profile_discovery: {
-        status: "warn",
-        notes: [
-          "installed at C:\\Users\\Alice\\AppData\\Local\\codex",
-          "config under \\Users\\Bob\\AppData\\Roaming\\claude",
-          "ok note",
-        ],
-      },
-    },
-    device,
-    "online",
-    observedAt,
-  );
-  const winNotesOut = ((winNotes.profile_discovery as { notes: unknown[] }).notes) as string[];
-  const winNotesJson = JSON.stringify(winNotesOut);
-  assert.doesNotMatch(
-    winNotesJson,
-    /Alice|Bob/,
-    "Windows user-home account names must be redacted",
-  );
-  assert.match(winNotesJson, /\[REDACTED\]/);
-  assert.match(winNotesJson, /ok note/);
-  assert.doesNotMatch(JSON.stringify(winNotes), /Alice|Bob/);
 });
 
 // #161: Control Plane N must interpret Agent N-1, N and N+1 diagnoses.
@@ -2758,7 +2545,7 @@ test("router reporting unavailable surfaces failed (not pending/approval)", asyn
   );
 });
 
-test("local tools still work without router (list_devices/get_device/list_profiles/get_operation)", async () => {
+test("local tools still work without router (list_devices/get_device/get_operation)", async () => {
   const { store, token } = await authed();
   const deviceId = "dev_mcp_local_01abcdef01";
   await store.putDevice({
@@ -2795,9 +2582,6 @@ test("local tools still work without router (list_devices/get_device/list_profil
   }).device;
   assert.equal(gotDevice.enrollment_status, "active");
   assert.equal(gotDevice.connection_status, "online");
-
-  const profiles = await callTool(store, token, "ownmesh_list_profiles", {});
-  assert.equal(profiles.body.result!.structuredContent!.status, "completed");
 
   // Seed op in authoritative store (tracker is cache-only; no tracker fallback).
   const tracker = new OperationTracker();

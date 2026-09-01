@@ -102,7 +102,7 @@ fn locked_replace_preserves_previous_session_snapshot() {
         .expect("exclusive destination lock");
     let mut replacement = SessionManager::new();
     replacement
-        .open(SessionKind::Pty, "new", "owner", 1, None)
+        .open(SessionKind::Pty, "new", "owner", 1)
         .expect("open session");
     save_manager(&path, &replacement).expect_err("locked atomic replace must fail");
     drop(guard);

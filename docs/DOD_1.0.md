@@ -1,6 +1,6 @@
 # OwnMesh 1.x Definition of Done — release-quality audit
 
-**Release train:** v1.2.25 baseline
+**Release train:** v1.2.26 baseline
 
 **Audit date:** 2026-09-01
 
@@ -11,13 +11,15 @@
 
 ## Conclusion
 
-OwnMesh v1.2.25 is a stable release for the product surface admitted by the
+OwnMesh v1.2.26 is a stable release for the product surface admitted by the
 machine-checked registry. The Rust unsupported registries and the manifest both
 contain zero intentionally unimplemented CLI surfaces. Parser acceptance alone
 does not count: the admitted commands have fail-closed handlers and the relevant
-local or authenticated control-plane route. `completeness_claim` is currently
-**false**, because the nine-profile live receipt waiver is intentionally still
-open; fixture coverage is not live-provider evidence.
+local or authenticated control-plane route. Registry `completeness_claim` is
+**true** because there are no admitted-but-unimplemented surfaces or
+surface-specific evidence waivers. The separate release-evidence receipt stays
+false while external platform, packaging, ChatGPT automation, and independent
+review blockers remain.
 
 The stability/MCP hardening shipped in v1.2.25 is tracked in
 [`STABILITY_MCP_HARDENING.md`](./STABILITY_MCP_HARDENING.md). Release workflows
@@ -44,11 +46,11 @@ v1.2.16 stable product surface.
 | 2 | Deploy to own Cloudflare | **done** | Guided deployment creates/reuses account resources, applies D1 migrations, deploys the Worker, provisions required secrets, and reports connection URLs. |
 | 3 | D1/DO/Worker auto provision | **done** | Wrangler configuration, migrations, Durable Object binding, and guided resource provisioning are shipped; the user still supplies and owns the Cloudflare account. |
 | 4 | OAuth ChatGPT Personal Plugin | **partial** | DCR, bounded CIMD validation, authorization-code/PKCE, RFC 9207 issuer responses, rotating refresh, passkey owner login, and exact callbacks are implemented. A manual live ChatGPT compatibility receipt exists; reproducible automated external E10 evidence remains open. |
-| 5 | Normal Chat read/write/command/session tools | **done** | Public MCP routing serves legacy `2025-03-26` and stateless modern `2026-07-28` from one authorization core with frozen catalog-v1 call compatibility. Bounded `ownmesh mcp serve --stdio` is implemented with authenticated issuer binding, bounded messages, and no local-routing fallback. |
+| 5 | Normal Chat read/write/command/session tools | **done** | Public MCP routing serves legacy `2025-03-26` and stateless modern `2026-07-28` from one authorization core with catalog-v2 compatibility. Catalog v1 is retained only as historical release evidence. Bounded `ownmesh mcp serve --stdio` is implemented with authenticated issuer binding, bounded messages, and no local-routing fallback. |
 | 6 | CLI/TUI set Full User / Full Access | **done** | No-argument TUI launch, setup policy selection, typed presets, and structured policy mutation are supported. Sensitive mutation uses fresh passkey approval. |
 | 7 | Privileged Broker per OS | **partial** | Networkless native lifecycle is implemented on Linux, macOS, and Windows while `ownmeshd` remains unprivileged. Linux has a native root receipt; macOS/Windows native release receipts and the full public E8 route remain open evidence. |
 | 8 | Generic command + arbitrary CLI PTY | **done** | Local exact-argv execution, authenticated remote exec/session creation, PTY lifecycle, bounded replay, process-tree termination, and explicit idempotency are supported. Raw shell is an explicit mode and never silently replaces structured execution. v1.2.16 binds command approval to the exact invocation entry, canonical backing identity, classification, and `argv[0]`; drift returns `OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT`, and generic/review command spawn consumes a prepared executable whose verified image remains under custody through OS spawn (ADR 0013). v1.2.25 extends Linux custody to the shebang script/interpreter compound with sealed snapshots and a bounded Node loader, and moves elevated broker waits outside the runtime mutex while retaining captured request authority and exact finalization. On macOS, ordinary images use private snapshot custody while `SF_RESTRICTED` Apple platform images use a revalidated, root-owned, daemon-non-writable backing path with the approved invocation preserved as `argv[0]`. Completed op-journal receipts have a bounded 30-day terminal lifecycle (ADR 0010), with fail-closed persistence/recovery and schema-stable compact receipts; prior-process in-progress markers become durable orphaned state and are never auto-retried. Default interactive sessions resolve their shell through the same shared resolver as detection/execution, so a bare `cmd.exe` that a workspace/current-directory file could shadow is rewritten to the absolute system path. Windows batch shims (`.cmd`/`.bat`) are classified `raw_shell` (their content is shell semantics), so a raw_shell-denying policy cannot authorize them. |
-| 9 | Official 9 profiles conformance | **partial** | Nine dialect-aware structured adapters, deterministic executable/shebang launch, bounded normalized replay, capability-gated resume, and typed denial-only permission handling are implemented with fixtures. Authentication/protocol readiness is no longer inferred from binary presence. Current real-provider receipts for every profile on Linux/macOS/Windows remain release evidence and the shipped completeness claim stays false until they exist. |
+| 9 | External CLI interoperability | **done** | External CLIs use the same generic exact-`program`/`args` command, process, PTY, and session model as every executable. OwnMesh ships no coding-agent Profile registry, vendor adapter, authentication probe, normalized vendor event model, or native vendor-session resume claim. ADR 0018 defines the process authorization boundary. |
 | 10 | Session observer/controller handoff | **done** | Session list/show/attach/claim/release/give/close/terminate, observer ACLs, expiring controller leases, durable handoff, and bounded replay are shipped and regression-tested. Journal-health surfacing (system.diagnose + doctor) covers transition and op-journal state, and controller-mutating, terminal, and sidecar-input operations are fenced while a session transition is unresolved. |
 | 11 | TUI en/ja/zh-Hans/ru | **done** | The Ratatui UI and no-argument CLI handoff ship with en-US, ja-JP, zh-Hans, and ru-RU resources plus locale/snapshot coverage. |
 | 12 | R2/TURN relay default disabled | **done** | Relay is absent/disabled by default and the fail-closed invariant is tested. LAN/P2P discovery depth is not required for the v1.2.16 transfer route. |
@@ -69,7 +71,7 @@ v1.2.16 stable product surface.
   failed prerequisite prevents build and publish.
 - Publication also depends on a downloaded, checksum-verified Linux x64
   release archive passing the deterministic workerd device, filesystem,
-  command, profile, session, restart/recovery, and two-Agent transfer suites.
+  command, generic session, restart/recovery, and two-Agent transfer suites.
 - Every platform archive must contain the current LICENSE, NOTICE, README, and
   tag-selected release notes. Empty SBOM fallback is forbidden.
 - Formal publication requires the enrolled minisign key; unsigned degraded
@@ -77,8 +79,8 @@ v1.2.16 stable product surface.
 - `scripts/check_release_quality.py` checks the publish graph, fail-closed
   workflow patterns, exact-artifact E2E dependency, toolchain/version alignment,
   release-note selection, and the registry-backed surface manifest. For the
-  v1.2.25 baseline the unsupported CLI count is zero, but the evidence-backed
-  `completeness_claim` is false while `W-E6-RECEIPTS` remains open.
+  v1.2.26 baseline the unsupported CLI count and surface-specific evidence
+  waiver count are both zero.
 - Release tags are annotated. Per
   [ADR 0001](./adr/0001-release-signing-sbom-provenance.md) they are also
   **signed** (GPG or SSH) when the release operator has signing configured:
@@ -99,7 +101,6 @@ v1.2.16 stable product surface.
 |---|---|---|
 | W-SIGN | Authenticode / Apple signing and notarization | Portable minisign is enrolled and mandatory; native platform signing is not claimed. |
 | W-E8-RECEIPTS | macOS/Windows native broker receipt and full public privileged route | Implementation and unit/loopback evidence do not substitute for the missing opt-in native/public receipts. |
-| W-E6-RECEIPTS | Nine-profile live compatibility matrix | Dialect-aware code and versioned fixtures ship, but bounded real-provider receipts on Linux, macOS, and Windows are still required before restoring the E6 completeness claim. |
 | W-E10-AUTO | Automated external ChatGPT exercise | Manual live compatibility plus local reproducible suites do not equal a fully automated third-party receipt. |
 | W-EXT-SEC | Independent external security review | Internal tests and review do not constitute an independent audit. |
 | W-PACKAGING | MSI/NSIS and native/universal macOS package | Portable signed archives and verified one-line installers are the v1.2.16 distribution contract. |

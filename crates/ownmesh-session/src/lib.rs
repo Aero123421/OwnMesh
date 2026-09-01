@@ -137,7 +137,6 @@ pub enum SessionState {
 pub enum SessionKind {
     Pty,
     Process,
-    ProfileAgent,
 }
 
 /// Output chunk with sequence for replay.
@@ -206,10 +205,6 @@ pub struct SessionInfo {
     pub cols: u16,
     pub rows: u16,
     pub next_seq: u64,
-    pub profile_id: Option<String>,
-    /// Profile / coding-CLI native session id (distinct from OwnMesh id).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_session_id: Option<String>,
     /// View mode preference (raw/cooked).
     #[serde(default)]
     pub view_mode: PtyViewMode,
@@ -375,14 +370,11 @@ impl SessionManager {
         title: impl Into<String>,
         creator: impl Into<String>,
         now_unix: i64,
-        profile_id: Option<String>,
     ) -> SessionResult<SessionInfo> {
-        self.open_with(
-            kind, title, creator, now_unix, profile_id, None, None, None, None, None,
-        )
+        self.open_with(kind, title, creator, now_unix, None, None, None, None)
     }
 
-    /// Open with optional command/cwd/native id/workspace binding.
+    /// Open with optional command, cwd, PTY size, and workspace binding.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with(
         &mut self,
@@ -390,8 +382,6 @@ impl SessionManager {
         title: impl Into<String>,
         creator: impl Into<String>,
         now_unix: i64,
-        profile_id: Option<String>,
-        native_session_id: Option<String>,
         command: Option<Vec<String>>,
         cwd: Option<String>,
         size: Option<PtySize>,
@@ -420,8 +410,6 @@ impl SessionManager {
             cols: size.cols,
             rows: size.rows,
             next_seq: 1,
-            profile_id,
-            native_session_id,
             view_mode: PtyViewMode::Raw,
             host_pid: None,
             sidecar_host: None,
@@ -1108,16 +1096,6 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn set_native_session_id(
-        &mut self,
-        id: &str,
-        native_id: impl Into<String>,
-    ) -> SessionResult<()> {
-        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
-        s.info.native_session_id = Some(native_id.into());
-        Ok(())
-    }
-
     /// Test/recovery helper: overwrite controller lease expiry without extending TTL policy.
     pub fn set_controller_expires_unix(
         &mut self,
@@ -1240,7 +1218,7 @@ mod tests {
         let mut mgr = SessionManager::new();
         let now = 1_700_000_000;
         let ses = mgr
-            .open(SessionKind::Pty, "agent-work", "chatgpt", now, None)
+            .open(SessionKind::Pty, "agent-work", "chatgpt", now)
             .unwrap();
         mgr.push_output(&ses.id, "hello from agent\n", StreamKind::Stdout)
             .unwrap();
@@ -1268,7 +1246,7 @@ mod tests {
     fn give_and_release() {
         let mut mgr = SessionManager::new();
         let now = 100;
-        let ses = mgr.open(SessionKind::Process, "t", "a", now, None).unwrap();
+        let ses = mgr.open(SessionKind::Process, "t", "a", now).unwrap();
         mgr.give_controller(&ses.id, "a", "b", now).unwrap();
         assert_eq!(
             mgr.get(&ses.id)
@@ -1287,7 +1265,7 @@ mod tests {
     #[test]
     fn stale_lease_recovery() {
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(SessionKind::Pty, "t", "a", 0, None).unwrap();
+        let ses = mgr.open(SessionKind::Pty, "t", "a", 0).unwrap();
         let n = mgr.expire_stale_leases(10_000_000);
         assert_eq!(n, 1);
         assert!(mgr.get(&ses.id).unwrap().controller.is_none());
@@ -1298,9 +1276,7 @@ mod tests {
     fn expired_controller_loses_mutations_and_stdin_fail_closed() {
         let mut mgr = SessionManager::new();
         let open_at = 1_000i64;
-        let ses = mgr
-            .open(SessionKind::Pty, "t", "ctrl", open_at, None)
-            .unwrap();
+        let ses = mgr.open(SessionKind::Pty, "t", "ctrl", open_at).unwrap();
         mgr.attach_observer(&ses.id, "obs", open_at).unwrap();
         mgr.push_output(&ses.id, "line\n", StreamKind::Stdout)
             .unwrap();
@@ -1363,9 +1339,7 @@ mod tests {
     fn renew_and_detach_require_the_exact_active_controller_seat() {
         let mut mgr = SessionManager::new();
         let now = 10_000i64;
-        let ses = mgr
-            .open(SessionKind::Pty, "lease", "owner", now, None)
-            .unwrap();
+        let ses = mgr.open(SessionKind::Pty, "lease", "owner", now).unwrap();
         let initial = mgr.get(&ses.id).unwrap().controller.clone().unwrap();
 
         let renewed = mgr
@@ -1435,9 +1409,7 @@ mod tests {
     #[test]
     fn renew_rejects_expired_bounds_and_expiry_overflow() {
         let mut mgr = SessionManager::new();
-        let ses = mgr
-            .open(SessionKind::Pty, "lease", "owner", 0, None)
-            .unwrap();
+        let ses = mgr.open(SessionKind::Pty, "lease", "owner", 0).unwrap();
         let lease = mgr.get(&ses.id).unwrap().controller.clone().unwrap();
         for ttl in [0, 3601] {
             assert!(matches!(
@@ -1452,7 +1424,7 @@ mod tests {
         );
 
         let ses2 = mgr
-            .open(SessionKind::Pty, "overflow", "overflow-owner", 1, None)
+            .open(SessionKind::Pty, "overflow", "overflow-owner", 1)
             .unwrap();
         let lease2 = mgr.get(&ses2.id).unwrap().controller.clone().unwrap();
         mgr.set_controller_expires_unix(&ses2.id, i64::MAX).unwrap();
@@ -1473,7 +1445,7 @@ mod tests {
     fn push_output_rejects_oversized_chunk_and_bounds_replay_page() {
         let mut mgr = SessionManager::new();
         let now = 1i64;
-        let ses = mgr.open(SessionKind::Pty, "bound", "a", now, None).unwrap();
+        let ses = mgr.open(SessionKind::Pty, "bound", "a", now).unwrap();
         let huge = "x".repeat(MAX_CHUNK_BYTES + 1);
         assert_eq!(
             mgr.push_output(&ses.id, huge, StreamKind::Stdout),
@@ -1498,10 +1470,10 @@ mod tests {
     fn session_count_limit_fail_closed() {
         let mut mgr = SessionManager::new();
         mgr.max_sessions = 2;
-        mgr.open(SessionKind::Pty, "a", "p", 1, None).unwrap();
-        mgr.open(SessionKind::Pty, "b", "p", 1, None).unwrap();
+        mgr.open(SessionKind::Pty, "a", "p", 1).unwrap();
+        mgr.open(SessionKind::Pty, "b", "p", 1).unwrap();
         assert_eq!(
-            mgr.open(SessionKind::Pty, "c", "p", 1, None).unwrap_err(),
+            mgr.open(SessionKind::Pty, "c", "p", 1).unwrap_err(),
             SessionError::SessionLimit
         );
     }
@@ -1514,13 +1486,7 @@ mod tests {
 
         let mut mgr = SessionManager::new();
         let ses = mgr
-            .open(
-                SessionKind::Pty,
-                "persist-me",
-                "chatgpt",
-                now,
-                Some("codex".into()),
-            )
+            .open(SessionKind::Pty, "persist-me", "chatgpt", now)
             .unwrap();
         mgr.push_output(&ses.id, "line-1\n", StreamKind::Stdout)
             .unwrap();
@@ -1528,7 +1494,6 @@ mod tests {
             .unwrap();
         mgr.push_output(&ses.id, "line-2-from-human\n", StreamKind::Stdout)
             .unwrap();
-        mgr.set_native_session_id(&ses.id, "native_abc").unwrap();
         mgr.save_to_path(&path).unwrap();
 
         // Simulate daemon restart.
@@ -1541,7 +1506,6 @@ mod tests {
             Some("human")
         );
         assert!(info.observers.iter().any(|o| o == "chatgpt"));
-        assert_eq!(info.native_session_id.as_deref(), Some("native_abc"));
 
         let readers = restored.readers(&ses.id, now + 10).unwrap();
         assert!(readers.contains("chatgpt"));
@@ -1564,7 +1528,7 @@ mod tests {
     fn resize_and_view_mode() {
         let mut mgr = SessionManager::new();
         let now = 1i64;
-        let ses = mgr.open(SessionKind::Pty, "t", "a", now, None).unwrap();
+        let ses = mgr.open(SessionKind::Pty, "t", "a", now).unwrap();
         mgr.resize(&ses.id, "a", 120, 40, now).unwrap();
         mgr.set_view_mode(&ses.id, "a", PtyViewMode::Cooked, now)
             .unwrap();
@@ -1577,7 +1541,7 @@ mod tests {
     #[test]
     fn input_and_resize_sequences_are_monotonic_gap_free() {
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(SessionKind::Pty, "t", "a", 1, None).unwrap();
+        let ses = mgr.open(SessionKind::Pty, "t", "a", 1).unwrap();
         assert_eq!(mgr.advance_input_seq(&ses.id, 1).unwrap(), 1);
         assert_eq!(mgr.advance_input_seq(&ses.id, 2).unwrap(), 2);
         // Same seq + empty digest after apply is an exact-once replay, not stale.
@@ -1607,7 +1571,7 @@ mod tests {
     #[test]
     fn input_seq_binds_payload_digest_before_side_effects() {
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(SessionKind::Pty, "t", "a", 1, None).unwrap();
+        let ses = mgr.open(SessionKind::Pty, "t", "a", 1).unwrap();
         assert_eq!(
             mgr.reserve_input_seq(&ses.id, 1, "digest-a").unwrap(),
             SeqReserveOutcome::Deliver { seq: 1 }

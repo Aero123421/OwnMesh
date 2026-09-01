@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Generate a bounded, non-secret release evidence receipt.
 
-The receipt describes what the release workflow actually consumed. It never
-turns repository fixtures into live-provider evidence and keeps the
-completeness claim false while disclosed external receipts remain absent.
+The receipt describes what the release workflow actually consumed and keeps
+the completeness claim false while disclosed external receipts remain absent.
 """
 
 from __future__ import annotations
@@ -65,7 +64,6 @@ def main() -> int:
         raise ValueError("catalog baseline/current major mismatch")
 
     blockers = [
-        "W-E6-RECEIPTS: live nine-profile Linux/macOS/Windows receipts incomplete",
         "W-E8-RECEIPTS: macOS/Windows native broker and full public-route receipts incomplete",
         "W-E10-AUTO: external published-ChatGPT canary requires operator infrastructure",
         "W-EXT-SEC: independent security review incomplete",
@@ -92,10 +90,6 @@ def main() -> int:
             "local_workerd": True,
             "device_restart_and_recovery": True,
             "resumable_two_agent_transfer": True,
-        },
-        "profile_evidence": {
-            "fixture_profiles": 9,
-            "live_provider_matrix_complete": False,
         },
         "external_blockers": blockers,
         "completeness_claim": False,

@@ -14,7 +14,7 @@ use std::process::Command;
 
 /// Path to the `ownmesh` binary built alongside this test.
 fn ownmesh_bin() -> PathBuf {
-    // target/<profile>/deps/<test-exe> → target/<profile>/ownmesh
+    // target/<build-mode>/deps/<test-exe> → target/<build-mode>/ownmesh
     let mut path = std::env::current_exe().expect("test executable path");
     path.pop();
     if path.ends_with("deps") {
@@ -57,7 +57,6 @@ const FAILING_COMMANDS: &[&[&str]] = &[
     &["workspace", "list"],
     &["session", "list"],
     &["approval", "list"],
-    &["profile", "list"],
     &["process", "status", "op_missing"],
     &["transfer", "status", "tr_missing"],
     &["transfer", "list"],

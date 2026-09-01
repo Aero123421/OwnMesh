@@ -38,7 +38,7 @@ pub const fn code_for(exit: ExitCode) -> &'static str {
         ExitCode::DeviceOffline => "OWNMESH_E_DEVICE_OFFLINE",
         ExitCode::TimeoutCancelled => "OWNMESH_E_TIMEOUT_CANCELLED",
         ExitCode::Conflict => "OWNMESH_E_CONFLICT",
-        ExitCode::ProfileUnavailable => "OWNMESH_E_PROFILE_UNAVAILABLE",
+        ExitCode::DependencyUnavailable => "OWNMESH_E_DEPENDENCY_UNAVAILABLE",
         ExitCode::Internal => "OWNMESH_E_INTERNAL",
     }
 }

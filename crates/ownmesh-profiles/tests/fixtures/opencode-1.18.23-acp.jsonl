@@ -1,4 +1,0 @@
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"opencode-fixture","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"OPENCODE_ADAPTER_OK"}}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"opencode-fixture","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Read file","kind":"read","status":"pending"}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"opencode-fixture","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","content":[{"type":"text","text":"done"}]}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"opencode-fixture","update":{"sessionUpdate":"usage_update","used":4,"size":100}}}

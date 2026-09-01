@@ -14,7 +14,6 @@ members = [
     "crates/ownmesh-session",
     "crates/ownmesh-transition-journal",
     "crates/ownmesh-broker-client",
-    "crates/ownmesh-profiles",
     "crates/ownmesh-transfer",
     "crates/ownmesh-update",
     "crates/ownmesh-diagnostics",
@@ -26,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.25"
+version = "1.2.26"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"

@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.25 · **Last updated:** 2026-09-01
+**Baseline:** v1.2.26 · **Last updated:** 2026-09-01
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -14,8 +14,9 @@ Two documents bound this one and win where they disagree:
   the `W-*` evidence waivers.
 
 Nothing here is a dated commitment. Items are ordered by what would most improve
-the product, not by effort. The stability/MCP hardening shipped in v1.2.25 and
-its explicit partial boundaries are recorded in
+the product, not by effort. Generic external CLI sessions replace the removed
+coding-agent Profile layer in v1.2.26 (ADR 0018). The stability/MCP hardening
+shipped in v1.2.25 and its explicit partial boundaries are recorded in
 [`STABILITY_MCP_HARDENING.md`](./STABILITY_MCP_HARDENING.md).
 
 ## Now — the gap between what the presets promise and what they do
@@ -30,7 +31,7 @@ the deny exists and lists the candidate designs; picking one is the open work.
 **OS process confinement.** The reason the middle rung is hard: binding `cwd`
 does not confine a spawned process, and a PTY's stdin is arbitrary execution.
 Real confinement (namespaces/seccomp, Job Objects with restricted tokens, sandbox
-profiles) is what would let a restricted preset honestly allow execution. It is
+sandbox policies) is what would let a restricted preset honestly allow execution. It is
 per-platform work, and the weakest platform sets the guarantee.
 
 ## Next — evidence, not implementation
@@ -41,7 +42,6 @@ These are the `W-*` waivers. The code exists; the receipt does not.
 | --- | --- | --- |
 | macOS/Windows native broker receipts | `W-E8-RECEIPTS` | Run the privileged lifecycle on real macOS/Windows hosts and publish the transcript, plus the full public MCP → agent → broker route |
 | Automated external ChatGPT exercise | `W-E10-AUTO` | A reproducible harness against a live ChatGPT connector, replacing today's manual compatibility receipt |
-| Nine-profile live compatibility receipts | `W-E6-RECEIPTS`, issue #170 | Exercise each available current vendor CLI on Linux, macOS, and Windows without exporting credentials; publish only bounded non-secret launch/auth/protocol receipts before restoring the E6 completeness claim |
 | Independent security review | `W-EXT-SEC` | An external firm, not the internal checklist |
 | Native signing and packaging | `W-SIGN`, `W-PACKAGING` | Authenticode, Apple notarization, MSI/NSIS, native macOS packages. Portable minisign archives stay the contract until then |
 | Release tag signing | ADR 0001 follow-up | Annotated tags are already required; GPG/SSH tag signing is configured but not yet claimed as enforced |
@@ -75,8 +75,6 @@ These are the `W-*` waivers. The code exists; the receipt does not.
   `workspace_not_available` window for brand-new device-local workspaces.
 - **LAN discovery and direct P2P transfer depth** (`W-§12`). Relay stays off by
   default regardless.
-- **External adapter SDK** (§13.7) for community CLI adapters as separate
-  processes.
 
 ## Explicitly not planned
 
@@ -85,6 +83,9 @@ These are the `W-*` waivers. The code exists; the receipt does not.
 - Cloud file relay as an automatic fallback when direct transfer fails.
 - Treating model judgment, tool argument text, or repository content as an
   authorization input.
+- First-class coding-agent profiles, vendor-specific protocol adapters,
+  authentication detection, normalized vendor events, or native vendor-session
+  resume. External CLIs use exact `program`/`args` generic sessions.
 - Hidden hard denies under Full Access.
 
 ## Working on one of these

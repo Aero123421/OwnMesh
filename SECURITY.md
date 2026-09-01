@@ -22,7 +22,7 @@ Please report vulnerabilities privately via one of:
 
 Include as much of the following as you can:
 
-- Affected component (CLI, `ownmeshd`, broker, control plane, MCP, profile, …)
+- Affected component (CLI, `ownmeshd`, broker, control plane, MCP, session, …)
 - OwnMesh version / git commit
 - OS and architecture
 - Reproduction steps or proof-of-concept (non-destructive preferred)
@@ -52,7 +52,9 @@ Reports in these areas are especially valuable:
 
 - Denial of service requiring unrealistic local resources
 - Issues only present with intentionally misconfigured Full Access **and** compromised local OS user (report still welcome if OwnMesh amplifies impact)
-- Vulnerabilities in third-party CLIs invoked via profiles, unless OwnMesh mishandles their I/O or credentials
+- Vulnerabilities wholly inside third-party CLIs launched as generic processes,
+  unless OwnMesh violates the exact program/args, process-control, I/O,
+  credential, policy, approval, or audit boundary it promises
 - Social engineering of the human operator
 
 ## Hardening defaults
@@ -60,6 +62,10 @@ Reports in these areas are especially valuable:
 - Telemetry and cloud file relay are **off** by default
 - Secrets belong in the OS keychain / secure store, never in `config.toml` or git
 - The privileged broker is **networkless** by design
+- OwnMesh authorizes launching and controlling an external process/session. It
+  does not interpret or authorize vendor-internal tool calls made by that child.
+- A workspace or `cwd` binding constrains OwnMesh path resolution; it is **not**
+  an operating-system sandbox for a spawned process.
 - Release signing, SBOM, and provenance approach is recorded in [`docs/adr/0001-release-signing-sbom-provenance.md`](./docs/adr/0001-release-signing-sbom-provenance.md)
 
 Thank you for helping keep OwnMesh and its users safe.

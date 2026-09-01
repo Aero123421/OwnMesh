@@ -1,5 +1,0 @@
-{"type":"system","subtype":"init","session_id":"claude-fixture"}
-{"type":"assistant","session_id":"claude-fixture","message":{"content":[{"type":"thinking","thinking":"must-not-be-exposed"},{"type":"text","text":"Hello from Claude"}]}}
-{"type":"assistant","session_id":"claude-fixture","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"redacted"}}]}}
-{"type":"user","session_id":"claude-fixture","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"text","text":"bounded result"}]}]}}
-{"type":"result","subtype":"success","is_error":false,"session_id":"claude-fixture","result":"Hello from Claude"}

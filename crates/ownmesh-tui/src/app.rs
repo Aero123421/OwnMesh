@@ -16,7 +16,6 @@ use ownmesh_diagnostics::{
 };
 use ownmesh_ipc::DaemonStatus;
 use ownmesh_policy::AccessPreset;
-use ownmesh_profiles::official_profiles;
 use serde_json::Value;
 use std::fs;
 
@@ -27,7 +26,6 @@ pub enum Screen {
     Devices,
     Workspaces,
     Sessions,
-    Profiles,
     Approvals,
     Transfers,
     Activity,
@@ -42,7 +40,6 @@ impl Screen {
         Self::Devices,
         Self::Workspaces,
         Self::Sessions,
-        Self::Profiles,
         Self::Approvals,
         Self::Transfers,
         Self::Activity,
@@ -67,7 +64,6 @@ impl Screen {
             Self::Devices => Msg::NavDevices,
             Self::Workspaces => Msg::NavWorkspaces,
             Self::Sessions => Msg::NavSessions,
-            Self::Profiles => Msg::NavProfiles,
             Self::Approvals => Msg::NavApprovals,
             Self::Transfers => Msg::NavTransfers,
             Self::Activity => Msg::NavActivity,
@@ -347,7 +343,6 @@ impl App {
     pub fn active_list_len(&self) -> usize {
         match self.screen {
             Screen::Sessions => self.sessions.len(),
-            Screen::Profiles => self.profile_lines().len(),
             Screen::Transfers => self.transfer_lines().len(),
             Screen::Activity => self.activity.len(),
             _ => 0,
@@ -656,14 +651,6 @@ impl App {
     }
 
     #[must_use]
-    pub fn profile_lines(&self) -> Vec<String> {
-        official_profiles()
-            .into_iter()
-            .map(|p| format!("{} — {}", p.id, p.display_name))
-            .collect()
-    }
-
-    #[must_use]
     pub fn transfer_lines(&self) -> Vec<String> {
         vec![
             t(self.lang, Msg::TransfersLocalPlan).to_owned(),
@@ -846,7 +833,6 @@ fn doctor_input_from_local(
         },
         service: ServiceObservation::default(),
         journals: ownmesh_diagnostics::JournalsObservation::default(),
-        profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
         layout_custody: tui_layout_custody(paths),
     }
 }

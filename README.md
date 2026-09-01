@@ -104,6 +104,23 @@ plane's `/health`:
 ownmesh doctor --json
 ```
 
+## Generic external CLI sessions
+
+OwnMesh intentionally has no first-class coding-agent profiles or
+vendor-specific adapters. Launch any external CLI through the generic session
+surface by supplying its exact executable and argument vector:
+
+```bash
+ownmesh session open dev_example --idempotency-key session-001 -- my-tool --mode batch
+```
+
+The MCP equivalent is `ownmesh_session_open` with `program: "my-tool"` and
+`args: ["--mode", "batch"]`. OwnMesh authorizes and audits launching and
+controlling that process/session; it does not interpret or authorize tools that
+the external CLI invokes internally. `workspace_id` and `cwd` select path
+resolution context but are not an operating-system sandbox. Use OS isolation
+when the child process itself must be confined.
+
 ## Security model
 
 - You own the control plane. There is no mandatory central service.
@@ -171,7 +188,7 @@ See [CONTRIBUTING](./CONTRIBUTING.md) for setup and PR expectations.
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [Roadmap](./docs/ROADMAP.md) — what is planned next, and what is not
-- [v1.2.25 release notes](./docs/RELEASE_NOTES_v1.2.25.md)
+- [v1.2.26 release notes](./docs/RELEASE_NOTES_v1.2.26.md)
 - [Target specification](./OWNMESH_SPECIFICATION.ja.md) — roadmap authority,
   not a claim that every optional target is shipped
 

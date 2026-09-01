@@ -194,7 +194,7 @@ function legacyCapability(op: string, payload: Record<string, unknown>): string 
   if (op.startsWith("ownmesh_fs_write") || op.startsWith("ownmesh_fs_delete")) {
     return "filesystem.write";
   }
-  if (op.startsWith("ownmesh_fs_") || op.startsWith("ownmesh_profile")) {
+  if (op.startsWith("ownmesh_fs_")) {
     return "filesystem.read";
   }
   if (op.startsWith("ownmesh_command") || op === "ownmesh_cancel_operation") {
@@ -244,7 +244,6 @@ function requiredScopeForCapability(capability: string, actionOrOp: string): str
     actionOrOp === "ownmesh_system_diagnose" ||
     actionOrOp === "system.diagnose" ||
     actionOrOp.startsWith("ownmesh_fs_") ||
-    actionOrOp.startsWith("ownmesh_profile") ||
     actionOrOp.startsWith("fs.")
   ) {
     return "ownmesh.read";

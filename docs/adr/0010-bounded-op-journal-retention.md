@@ -108,16 +108,13 @@ replay against.
    in-progress count, uncertain count, warn ≥ 60% and critical at cap
    statuses) and `ownmesh doctor` gains a read-only `journals.op_journal`
    check. New additive overall values (`journal_degraded`,
-   `op_journal_pressure`, `op_journal_uncertain`, `transition_journal_issues`,
-   `profile_discovery_issues`) may appear; the 5-check id contract is
+   `op_journal_pressure`, `op_journal_uncertain`, `transition_journal_issues`)
+   may appear; the 5-check id contract is
    unchanged. An unreadable journal reports `journals.op_journal.status =
    degraded` and overall `journal_degraded` instead of refusing daemon
    startup. Entries the runtime refuses to replay/compact/evict (unknown
    forward-version state, malformed state values, or non-object entries) are
-   counted as uncertain and never reported healthy. The Control Plane
-   redacts free-form profile-discovery notes (credential assignments
-   dropped, embedded secrets and user-home paths replaced) before exposure
-   or persistence.
+   counted as uncertain and never reported healthy.
 
 ## Consequences
 

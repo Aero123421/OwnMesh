@@ -40,10 +40,6 @@ pub struct HostManifest {
     pub owner_principal: String,
     #[serde(default)]
     pub io_mode: HostIoMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapter_dialect: Option<String>,
     /// `false` after exact detach: the PTY/spool remains alive but no binding
     /// may mutate it until a claim CAS installs a successor controller.
     #[serde(default = "default_controller_attached")]
@@ -100,8 +96,6 @@ impl HostManifest {
             workspace_id: workspace_id.into(),
             owner_principal: owner_principal.into(),
             io_mode: HostIoMode::Pty,
-            profile_id: None,
-            adapter_dialect: None,
             controller_attached: true,
             host_nonce: format!("host_{}", Uuid::new_v4().simple()),
             controller_epoch,
@@ -131,31 +125,12 @@ impl HostManifest {
         {
             return Err("invalid supervisor epoch or expiry".into());
         }
-        match self.io_mode {
-            HostIoMode::Pty => {
-                if self.profile_id.is_some() || self.adapter_dialect.is_some() {
-                    return Err("PTY supervisor manifest cannot carry adapter facts".into());
-                }
-            }
-            HostIoMode::StructuredPipes => {
-                for (field, value) in [
-                    ("profile_id", self.profile_id.as_deref()),
-                    ("adapter_dialect", self.adapter_dialect.as_deref()),
-                ] {
-                    if !value.is_some_and(valid_component) {
-                        return Err(format!(
-                            "structured supervisor manifest requires valid {field}"
-                        ));
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
     /// Make a fresh controller-generation manifest while preserving immutable
-    /// process I/O facts.  A handoff must never silently turn a structured
-    /// adapter process into a generic PTY session (or vice versa).
+    /// process I/O facts. A handoff must never silently change the host I/O
+    /// mode.
     pub fn successor(
         &self,
         owner_principal: impl Into<String>,
@@ -172,8 +147,6 @@ impl HostManifest {
             self.host_expires_unix,
         )?;
         next.io_mode = self.io_mode;
-        next.profile_id.clone_from(&self.profile_id);
-        next.adapter_dialect.clone_from(&self.adapter_dialect);
         next.validate()?;
         Ok(next)
     }
@@ -431,8 +404,6 @@ impl OwnerSpool {
             || next.device_id != self.manifest.device_id
             || next.workspace_id != self.manifest.workspace_id
             || next.io_mode != self.manifest.io_mode
-            || next.profile_id != self.manifest.profile_id
-            || next.adapter_dialect != self.manifest.adapter_dialect
         {
             return Err("supervisor binding identity cannot change".into());
         }
@@ -459,8 +430,6 @@ impl OwnerSpool {
             || next.controller_epoch != self.manifest.controller_epoch
             || !next.controller_attached
             || next.io_mode != self.manifest.io_mode
-            || next.profile_id != self.manifest.profile_id
-            || next.adapter_dialect != self.manifest.adapter_dialect
         {
             return Err("supervisor renewal identity cannot change".into());
         }
@@ -668,22 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn structured_manifest_requires_and_preserves_exact_adapter_facts() {
+    fn structured_manifest_preserves_generic_io_mode() {
         let mut structured = manifest();
         structured.io_mode = HostIoMode::StructuredPipes;
-        structured.profile_id = Some("codex".into());
-        structured.adapter_dialect = Some("codex-app-server".into());
         structured.validate().unwrap();
         let next = structured.successor("owner_b", 2, 1_800_000_200).unwrap();
         assert_eq!(next.io_mode, HostIoMode::StructuredPipes);
-        assert_eq!(next.profile_id.as_deref(), Some("codex"));
-        assert_eq!(next.adapter_dialect.as_deref(), Some("codex-app-server"));
-
-        let mut bad = structured.clone();
-        bad.adapter_dialect = None;
-        assert!(bad.validate().is_err());
-        let mut pty = manifest();
-        pty.profile_id = Some("codex".into());
-        assert!(pty.validate().is_err());
     }
 }

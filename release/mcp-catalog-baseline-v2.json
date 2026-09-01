@@ -1,0 +1,1607 @@
+{
+  "schema_version": 1,
+  "catalog_version": 2,
+  "release": "v1.2.26",
+  "catalog_revision": "bedce0fc4c7f7a20",
+  "tools": [
+    {
+      "name": "ownmesh_list_devices",
+      "required": [],
+      "property_schema_sha256": [
+        "a0218afe9606734ef3202fe8afb2bc9bffbbe3414ad20967a0b8087155bea953",
+        "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1"
+      ],
+      "property_names": [
+        "cursor",
+        "limit",
+        "max_bytes"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_device",
+      "required": [
+        "device_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      ],
+      "property_names": [
+        "device_id"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_system_diagnose",
+      "required": [
+        "device_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "212d3de6bf53e02442d7f3debf8a3000df554632e5df98bc364fbfbb5e92916b"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_policy_show",
+      "required": [
+        "device_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1"
+      ],
+      "property_names": [
+        "device_id",
+        "async"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_policy_preset",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "name"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "6e846b5ad3409cf6658fd1df0f8a865447b34648b8b024ac83d1da58bb0e2ac9",
+        "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "name",
+        "delegate_remote_mcp",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_policy_rule_add",
+      "required": [
+        "capability",
+        "device_id",
+        "id",
+        "idempotency_key",
+        "rule_decision"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "8f655530afd983ca97a5bac1810d344d5e5c2ef53a5b376d27befca94afafee1",
+        "76c833aedf8f8ff972b578c646df4035b3cadb041e0bdf90a98e1b52e932b7df",
+        "4876df4b78eb1afc7ac90fb6402d0b389ef50847c2f866a746227ada5aa44d98",
+        "1d49c2a324a2f2e607e6438717f2a72fb1c46a18ca0f77cef67c482af081ce8c",
+        "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "9be01fcd4cdff142838b72fd31c7545a6c19663f092e7154df406661f40ba353",
+        "d1c441e03e7f6707b5bf93bd7906e7d80acefd6a461a48750d6cc5b64be0416f",
+        "8358cadf116c10bee998c7adfdf128ea6d2055b3ddcbd4b324085039cb294655",
+        "8358cadf116c10bee998c7adfdf128ea6d2055b3ddcbd4b324085039cb294655",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "id",
+        "rule_decision",
+        "capability",
+        "priority",
+        "when_elevated",
+        "when_kind",
+        "path_prefix",
+        "program_equals",
+        "description",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_policy_rule_remove",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "8f655530afd983ca97a5bac1810d344d5e5c2ef53a5b376d27befca94afafee1",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_daemon_unlock",
+      "required": [
+        "device_id",
+        "idempotency_key"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_token_revoke",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "target_principal"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "8358cadf116c10bee998c7adfdf128ea6d2055b3ddcbd4b324085039cb294655",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "target_principal",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_request_approval",
+      "required": [
+        "approval_id",
+        "device_id",
+        "idempotency_key",
+        "requested_decision",
+        "temporary_grant"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "47f3faa6f024b71da699146a7d29c62701968c732a338d870e66f0bca864513c",
+        "7c4c6ec95986d3bcc5f3bff34a5dfba8916ba5691621bf4595d148d1f39428cd",
+        "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "6e8af5da59ddf1604e4d88a79e312c4a54eba9b700375a8d791eee7c3364ea28",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "approval_id",
+        "requested_decision",
+        "temporary_grant",
+        "grant_seconds",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_grants_mint",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "tools",
+        "ttl_seconds"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "6bc65eb85f4cbaf9b6c43cc6349f31af74682893ea734e684ca7de9c2b1a04d8",
+        "b69ce6ad0eb1ad42d247f258a0c96e913500b1b420fc5a6889587b30cab48e8d",
+        "83e78c15ef73a7d3ceb62219df948e50b1535b2833c19d2bf8a780b78b478f75",
+        "c51e0a9b62f9658aa2f71f14feb42a7f67c1c6bf2ce2e2fb2d373bda4f994af1",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "tools",
+        "ttl_seconds",
+        "max_uses",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_grants_list",
+      "required": [
+        "device_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1"
+      ],
+      "property_names": [
+        "device_id",
+        "async"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_grants_revoke",
+      "required": [
+        "device_id",
+        "id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "c51e0a9b62f9658aa2f71f14feb42a7f67c1c6bf2ce2e2fb2d373bda4f994af1"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "id"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_list",
+      "required": [
+        "device_id",
+        "path",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "a0218afe9606734ef3202fe8afb2bc9bffbbe3414ad20967a0b8087155bea953",
+        "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1",
+        "a56ef1497d5ac1afd3abdb546bb1b8bbcbeddb0121df349a325b355a311554d5"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id",
+        "path",
+        "cursor",
+        "limit",
+        "max_bytes",
+        "max_entries"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_read",
+      "required": [
+        "device_id",
+        "path",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "456d1b4c2062af0caee22c32f64764b40ee628c4fc3097ee404522623bd730ba",
+        "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1",
+        "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id",
+        "path",
+        "cursor",
+        "limit",
+        "max_bytes",
+        "offset"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_write",
+      "required": [
+        "content",
+        "device_id",
+        "idempotency_key",
+        "path",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d11cfb445a9a6f0904d0a8f6c1f63670adcb39e058793ee1a4fe4d9fd913610a"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id",
+        "path",
+        "content",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_fs_stat",
+      "required": [
+        "device_id",
+        "path",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d6562426576609bd6617372aee543cbf92534028f7ea8803360d8c24855733e7",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "path",
+        "hash",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_fs_delete",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "path",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d6562426576609bd6617372aee543cbf92534028f7ea8803360d8c24855733e7",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "3a145d85564be42e3a92611f86064faadce04a25e95022f39ac8c70e724edf14"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "path",
+        "recursive",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_fs_patch",
+      "required": [
+        "content",
+        "device_id",
+        "idempotency_key",
+        "path",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "e35fe4a8caf6392c5f2b80c63ba909372dac2d1181bbed9fedca73f72fb63258",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "9286cb6f790b399c7107739f2d7fe10e9b8063fb86df78b0a985805292a23c60"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "path",
+        "content",
+        "expected_sha256",
+        "patch_format",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_command_run",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "program",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d7a19ad6de43b74d74eee1584d61d8a1cd8e3460563dc8378a32bea8f4cbeb1e",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "16d583e0b4cc46d423f3838c23045228be96bda3794582ba068674c5b8851554",
+        "0233a0275c8f3a9a6c303f34a2eae1011922dc5ddf041f4657de1f5762ff84ea",
+        "a2a05936abee445f1cac9eac55b081d92fb6c65d1adae3f3b26e320300676dad",
+        "b1af3b612b81a0deabc54c3c330e94ad7f0ea60bb58f5ac51e4a39900f2cf52f",
+        "80a17d2b910d316de586c62726d7f30a60c0353e3434460c2b9fc1770f7a2dbf",
+        "9d8c5df32237046b437b4b33b9b12643bd9cf7cfc19a7dfd46d8d2b5f9ad471b"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id",
+        "program",
+        "args",
+        "cwd",
+        "idempotency_key",
+        "timeout_ms",
+        "max_output_bytes",
+        "env",
+        "elevated",
+        "detach"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_command_shell",
+      "required": [
+        "command",
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "09cbcc599ad2147c4520599bf64d44820ddffd67625a417f482855b97442a956",
+        "0233a0275c8f3a9a6c303f34a2eae1011922dc5ddf041f4657de1f5762ff84ea",
+        "a2a05936abee445f1cac9eac55b081d92fb6c65d1adae3f3b26e320300676dad",
+        "b1af3b612b81a0deabc54c3c330e94ad7f0ea60bb58f5ac51e4a39900f2cf52f"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id",
+        "command",
+        "cwd",
+        "idempotency_key",
+        "timeout_ms",
+        "max_output_bytes",
+        "env"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_open",
+      "required": [
+        "device_id",
+        "idempotency_key"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d7a19ad6de43b74d74eee1584d61d8a1cd8e3460563dc8378a32bea8f4cbeb1e",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "768989b3d6265aa73544b0ee01bd05a9c3e1c04350fa99aa654fcae9b858e69b"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "title",
+        "program",
+        "args",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_attach",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "role",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "34640f1706eb221861f41705ebc31eafd48fac7fae6db5a3a775f690f31c4a18",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "e8a4596d51a2e72945ccff98f54c88477570eee88af29de300eca826ed16aece"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "role",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_write",
+      "required": [
+        "controller_epoch",
+        "data",
+        "device_id",
+        "idempotency_key",
+        "input_seq",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "489afb365fea584a18fc53db46239968b86c4dca3c7a3420452c8a20ac7253fd",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "32b4bcbe8161fef278298ed71189179192a33c00b2a3ffcaae20d812f8eb8501"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "data",
+        "workspace_id",
+        "input_seq",
+        "lease_id",
+        "controller_epoch",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_resize",
+      "required": [
+        "cols",
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "resize_seq",
+        "rows",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "a492f76ad1b65340f191cefd9809d2675869f7eb8778fdb1b3517be3e0d54b1f",
+        "a492f76ad1b65340f191cefd9809d2675869f7eb8778fdb1b3517be3e0d54b1f",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "82c9f88dd6b0e6fa906a7f391f03372b3300de9c6a93a3bd23a14ee58aca5e7f",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "1c0802661ce407e7a58880e52ae5d587bda346de4117139213f23d528c9854f1"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "cols",
+        "rows",
+        "workspace_id",
+        "resize_seq",
+        "lease_id",
+        "controller_epoch",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_replay",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "d6562426576609bd6617372aee543cbf92534028f7ea8803360d8c24855733e7",
+        "6d892361aa31ee8d9b24f2664292e55b80ec39d415f24249d2d8cfe58d469b4d",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "f39480055976f4a0b5ebb9d5bff16f715e1f23f8f577625321690a14e36e3190"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "from_seq",
+        "sidecar_cursor",
+        "raw_sidecar",
+        "limit",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_close",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "lease_id",
+        "controller_epoch",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_list",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_show",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_claim",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "9372e19fe3a5728d5af69a6fadaebec0c7c728dce2f4416275f099b11476866f"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_renew",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "ttl_secs",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "07ad65f14ecf1553d1bf4282bcdaad18c8750030292342c47cb095190d41d55f",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "lease_id",
+        "controller_epoch",
+        "ttl_secs",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_detach",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "lease_id",
+        "controller_epoch",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_session_give",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "to",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "e3cea944fe93110b521b50caaa724857eaaeb289bc7f0d91e71563da4db2a448"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "to",
+        "lease_id",
+        "controller_epoch",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_session_terminate",
+      "required": [
+        "controller_epoch",
+        "device_id",
+        "idempotency_key",
+        "lease_id",
+        "session_id",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "be5ac72348ac0f643845bd6d067291b863394c92680a17cba91f49f5e165e46c",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "session_id",
+        "lease_id",
+        "controller_epoch",
+        "workspace_id",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_git_status",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "6d892361aa31ee8d9b24f2664292e55b80ec39d415f24249d2d8cfe58d469b4d",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "path",
+        "workspace_id",
+        "cursor",
+        "limit",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_git_diff",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "7cb541e84f226754a46c21c79f131fa2898354e1242456e6fd1c162bce319553",
+        "e5899e7df0806c0047473bbd7da4aca8f46cbe1d48cde9c3f07ef439e79465f0",
+        "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "660728f94b437c00351c1fc12c87f6f6487a0bee41b9d2e730fb0fe96139d78b",
+        "0e1ba20d2b435ee22bd686cc5f04d00e82349daa7084b239d0164df5666acbe5",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "path",
+        "pathspec",
+        "staged",
+        "workspace_id",
+        "cursor",
+        "limit",
+        "max_bytes",
+        "idempotency_key"
+      ],
+      "additional_properties": true,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_review_start",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "tests",
+        "workspace_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "b3ee1d079b6182127b38fbb006094137be1f4c805c9529f88590923be8ead663",
+        "1fe7f89eb78cc571d09b0085b86bebd058b1f2e35e11860a3117bc2134a838ff",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "workspace_id",
+        "path",
+        "command",
+        "tests",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_review_show",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "review_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "review_id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_review_page",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "review_id"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "5a4223d309dc00fcf19d49d1e972626b932fa9a6c01fba62c5182a85eb7daf36",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "review_id",
+        "cursor",
+        "max_bytes",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_list",
+      "required": [
+        "device_id",
+        "idempotency_key"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_show",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_add",
+      "required": [
+        "device_id",
+        "idempotency_key",
+        "path"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "200b69f48657a9e634817552677abf46083657dccb21f6173a71e89229856f71"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "path",
+        "id",
+        "label",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_update",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "id",
+        "path",
+        "label",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_workspace_remove",
+      "required": [
+        "device_id",
+        "id",
+        "idempotency_key"
+      ],
+      "property_schema_sha256": [
+        "44adb1541b085bdde79ed13c0c6d6316caeb8deadfb14a3b45f2ae34a4f4f708",
+        "5db19ff5bb7ad89fc6b00042a1bbbbf32513b38f10da9c061ad4d55568a3dbf1",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "d77c4af4d1dcc39fbed9486a7b6dbd7313ca701712e64e0b6df4160affd170a6"
+      ],
+      "property_names": [
+        "device_id",
+        "async",
+        "id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_operation",
+      "required": [
+        "operation_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "871d7ea392f0ae5359e1f951109d17ad01b4190e7e51c48497169fddc63a48e6",
+        "f39e63450410945388f2fa4d532972e9b62aff1a60793418788af865a54aa757"
+      ],
+      "property_names": [
+        "operation_id",
+        "device_id",
+        "wait_ms",
+        "include_diagnostics"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_cancel_operation",
+      "required": [
+        "operation_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "c18315417125b92556d92c612393cf18baec82ec4e691a9cf1da6eb0898c0c06"
+      ],
+      "property_names": [
+        "operation_id",
+        "device_id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_plan",
+      "required": [
+        "destination_device_id",
+        "destination_path",
+        "destination_workspace_id",
+        "idempotency_key",
+        "source_device_id",
+        "source_path",
+        "source_workspace_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "64580224374d66c9b26bf0c0ffaa17d4df916043edd23ef221792d9fb6debe4f",
+        "8b98d16d1105073871a93221b6426407723c125a287c3d37cd7de6cdeea486fb",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "source_device_id",
+        "destination_device_id",
+        "source_workspace_id",
+        "destination_workspace_id",
+        "source_path",
+        "destination_path",
+        "ttl_seconds",
+        "overwrite_expected_sha256",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_send",
+      "required": [
+        "idempotency_key",
+        "transfer_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "transfer_id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_get",
+      "required": [
+        "transfer_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "686f40289f17bc2d6be905d9268764859f8b4cc81d29306a4bc83ff1a337caae",
+        "5a56d2a1e62afa684bb1d2a4e8c51cec19f8662b92d0c02002f8829e1d493420"
+      ],
+      "property_names": [
+        "transfer_id",
+        "offset",
+        "max_bytes"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_list",
+      "required": [],
+      "property_schema_sha256": [
+        "a0218afe9606734ef3202fe8afb2bc9bffbbe3414ad20967a0b8087155bea953",
+        "2f397e74194c83b045ce19e4e0146d529df8e8f78c8030f01c4e055992986575",
+        "8c7870bd7b9ac511b6df24e22b0434a1764864013d8fa08ccd9aae74fcd063d1"
+      ],
+      "property_names": [
+        "cursor",
+        "limit",
+        "max_bytes"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_status",
+      "required": [
+        "transfer_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96"
+      ],
+      "property_names": [
+        "transfer_id"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_transfer_cancel",
+      "required": [
+        "idempotency_key",
+        "transfer_id"
+      ],
+      "property_schema_sha256": [
+        "00404e686415370f1711c4d7acfa2905444d3cf23cef2e10c47d445ebe690f96",
+        "32bb68e731c59d1fb864c354caa513807e7900a535b52d8f00900dd038c43ceb"
+      ],
+      "property_names": [
+        "transfer_id",
+        "idempotency_key"
+      ],
+      "additional_properties": false,
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    }
+  ]
+}

@@ -42,10 +42,6 @@ pub struct SupervisorSpawnRequest {
     pub rows: u16,
     #[serde(default)]
     pub io_mode: HostIoMode,
-    #[serde(default)]
-    pub profile_id: Option<String>,
-    #[serde(default)]
-    pub adapter_dialect: Option<String>,
 }
 
 /// Serializable bounded command description for local IPC only.
@@ -422,8 +418,6 @@ async fn dispatch(
             )
             .map_err(invalid)?;
             manifest.io_mode = params.io_mode;
-            manifest.profile_id.clone_from(&params.profile_id);
-            manifest.adapter_dialect.clone_from(&params.adapter_dialect);
             let binding = state
                 .spawn_with_io(
                     manifest,
@@ -638,13 +632,6 @@ fn validate_spawn(params: &SupervisorSpawnRequest) -> IpcResult<()> {
     }
     if let Some(cwd) = &params.command.cwd {
         require_component(cwd, "cwd")?;
-    }
-    if matches!(params.io_mode, HostIoMode::StructuredPipes) {
-        require_component(params.profile_id.as_deref().unwrap_or(""), "profile_id")?;
-        require_component(
-            params.adapter_dialect.as_deref().unwrap_or(""),
-            "adapter_dialect",
-        )?;
     }
     Ok(())
 }
