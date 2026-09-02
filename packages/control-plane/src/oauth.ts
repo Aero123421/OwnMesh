@@ -355,7 +355,10 @@ async function fetchClientMetadataDocument(
   try {
     const response = await fetcher(clientId, {
       method: "GET",
-      redirect: "error",
+      // Cloudflare Workers supports only "follow" and "manual". Using
+      // "manual" keeps CIMD fail-closed because every redirect response is
+      // non-ok and rejected below without following its Location target.
+      redirect: "manual",
       signal: controller.signal,
       headers: { accept: "application/json" },
     });

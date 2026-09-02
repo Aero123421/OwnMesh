@@ -234,7 +234,7 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 | Symptom | Check |
 |---|---|
 | OAuth fails | `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, redirect URI exact match, PKCE S256 |
-| `unauthorized_client` / `client metadata validation failed` | Upgrade the control plane to v1.2.28 or later. These releases negotiate ChatGPT's plural CIMD token-auth capability list while still selecting only public-client `none`. |
+| `unauthorized_client` / `client metadata validation failed` | Upgrade the control plane to v1.2.29 or later. v1.2.29 fixes the Cloudflare Workers CIMD fetch mode; it also negotiates ChatGPT's plural token-auth capability list while still selecting only public-client `none`. |
 | Connector dies after hours | Include `offline_access`; confirm refresh tokens issued. Expired access tokens must get HTTP 401 + `WWW-Authenticate` from `/mcp` so ChatGPT can refresh |
 | ChatGPT reports 502 after idle | New chat, then re-consent if 401 refresh still fails. `GET /mcp` with `Accept: text/event-stream` is 405 by design (no long-lived SSE on Workers) |
 | CLI vs Worker version skew | `ownmesh doctor --check-network` warns when `/health` version does not match the CLI |
