@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.28 · **Last updated:** 2026-09-02
+**Baseline:** v1.2.29 · **Last updated:** 2026-09-02
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -24,7 +24,7 @@ admission and retention are table-size independent, MCP waits and uncertain
 delivery retries are bounded, long-command correlation TTLs align with admitted
 timeouts, and Agent reconnect uses jitter.
 
-ChatGPT CIMD interoperability was refreshed in v1.2.28: OwnMesh negotiates the
+ChatGPT CIMD interoperability was refreshed in v1.2.29: OwnMesh negotiates the
 current plural token-auth capability list and continues to select only the
 public-client `none` method supported by its PKCE token endpoint.
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.2.29 — Cloudflare CIMD fetch compatibility
+
+- Replaced the unsupported Workers `fetch` redirect mode used for ChatGPT
+  client metadata with a Cloudflare-compatible manual redirect response.
+- Kept CIMD fail-closed: redirects are never followed, every non-2xx response
+  is rejected, and metadata remains bounded and exactly client-id/redirect bound.
+- Added regression coverage for the Workers request mode and hostile redirect
+  responses, plus a live Cloudflare edge-runtime verification.
+
 ## v1.2.28 — ChatGPT CIMD compatibility
 
 - Negotiated token endpoint authentication from the current plural CIMD

@@ -591,7 +591,7 @@ test("CIMD registration is bounded, exact, and rejects metadata substitution", a
   const fetchClientMetadata = (async (input: RequestInfo | URL, init?: RequestInit) => {
     fetches += 1;
     assert.equal(String(input), clientId);
-    assert.equal(init?.redirect, "error");
+    assert.equal(init?.redirect, "manual");
     const headers = new Headers(init?.headers);
     assert.equal(headers.has("authorization"), false);
     return new Response(JSON.stringify({
@@ -663,6 +663,21 @@ test("CIMD registration is bounded, exact, and rejects metadata substitution", a
   });
   assert.equal(substituted.status, 401);
   assert.equal(((await substituted.json()) as { error: string }).error, "unauthorized_client");
+
+  let redirectFetches = 0;
+  const redirected = await handleAuthorize(request, store, "https://cp.test", {
+    principal: { id: "prin_owner", tenant_id: "ten_default" },
+    fetchClientMetadata: (async () => {
+      redirectFetches += 1;
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://attacker.example/client.json" },
+      });
+    }) as typeof fetch,
+  });
+  assert.equal(redirected.status, 401);
+  assert.equal(redirectFetches, 1);
+  assert.equal(((await redirected.json()) as { error: string }).error, "unauthorized_client");
 });
 
 test("CIMD negotiates the plural token auth capability list over the legacy preference", async () => {
