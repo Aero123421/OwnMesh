@@ -665,6 +665,53 @@ test("CIMD registration is bounded, exact, and rejects metadata substitution", a
   assert.equal(((await substituted.json()) as { error: string }).error, "unauthorized_client");
 });
 
+test("CIMD negotiates the plural token auth capability list over the legacy preference", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const clientId = "https://chatgpt.com/oauth/client.json";
+  const redirect = "https://chatgpt.com/connector_platform_oauth_redirect";
+  const request = new Request(
+    `https://cp.test/oauth/authorize?${new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: redirect,
+      scope: "ownmesh.read offline_access",
+      code_challenge: "A".repeat(43),
+      code_challenge_method: "S256",
+    })}`,
+  );
+
+  const currentChatGptMetadata = {
+    client_id: clientId,
+    client_name: "ChatGPT",
+    redirect_uris: [redirect],
+    token_endpoint_auth_methods_supported: ["none", "private_key_jwt"],
+    token_endpoint_auth_method: "private_key_jwt",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    jwks_uri: "https://chatgpt.com/oauth/jwks.json",
+  };
+  const accepted = await handleAuthorize(request, store, "https://cp.test", {
+    principal: { id: "prin_owner", tenant_id: "ten_default" },
+    fetchClientMetadata: (async () => new Response(JSON.stringify(currentChatGptMetadata), {
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch,
+  });
+  assert.equal(accepted.status, 200);
+  assert.deepEqual((await store.getClient(clientId))?.redirect_uris, [redirect]);
+
+  const noPublicIntersection = await handleAuthorize(request, store, "https://cp.test", {
+    principal: { id: "prin_owner", tenant_id: "ten_default" },
+    fetchClientMetadata: (async () => new Response(JSON.stringify({
+      ...currentChatGptMetadata,
+      token_endpoint_auth_methods_supported: ["private_key_jwt"],
+      token_endpoint_auth_method: "none",
+    }), { headers: { "content-type": "application/json" } })) as typeof fetch,
+  });
+  assert.equal(noPublicIntersection.status, 401);
+  assert.equal(((await noPublicIntersection.json()) as { error: string }).error, "unauthorized_client");
+});
+
 test("CIMD URL policy rejects local/private identifiers and OAuth responses include RFC 9207 iss", async () => {
   for (const value of [
     "http://client.example/client.json",

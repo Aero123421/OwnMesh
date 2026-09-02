@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.2.28 — ChatGPT CIMD compatibility
+
+- Negotiated token endpoint authentication from the current plural CIMD
+  capability list while retaining legacy singular-field compatibility.
+- Kept OwnMesh public-client-only: CIMD is accepted only when `none` is in the
+  client/server method intersection; confidential token authentication remains
+  rejected.
+- Added regression coverage using ChatGPT's current production metadata shape.
+
 ## v1.2.27 — Bounded Cloudflare control-plane cost
 
 - Replaced `mcp_operations` full scans with an atomic per-tenant admission

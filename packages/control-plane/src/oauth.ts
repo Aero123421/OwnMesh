@@ -247,9 +247,31 @@ type ClientMetadataDocument = {
   client_name: string;
   redirect_uris: string[];
   token_endpoint_auth_method?: string;
+  token_endpoint_auth_methods_supported?: string[];
   grant_types?: string[];
   response_types?: string[];
 };
+
+/**
+ * Select public-client token authentication from current or legacy CIMD.
+ *
+ * SEP-3149 clients publish the methods they can use in the plural field and
+ * may retain a different singular legacy preference. The plural capability
+ * list is authoritative when present; OwnMesh still accepts only `none` and
+ * therefore never enables a confidential-client method by trusting metadata.
+ */
+function supportsPublicClientTokenAuth(document: Partial<ClientMetadataDocument>): boolean {
+  if (document.token_endpoint_auth_methods_supported !== undefined) {
+    return Array.isArray(document.token_endpoint_auth_methods_supported)
+      && document.token_endpoint_auth_methods_supported.length >= 1
+      && document.token_endpoint_auth_methods_supported.length <= 8
+      && document.token_endpoint_auth_methods_supported.every(
+        (method) => typeof method === "string" && method.length >= 1 && method.length <= 128,
+      )
+      && document.token_endpoint_auth_methods_supported.includes("none");
+  }
+  return document.token_endpoint_auth_method === "none";
+}
 
 /** URL-form client identifiers allowed to trigger a bounded metadata fetch. */
 export function isAllowedCimdClientId(clientId: string): boolean {
@@ -355,7 +377,7 @@ async function fetchClientMetadataDocument(
     || document.redirect_uris.length < 1
     || document.redirect_uris.length > 8
     || document.redirect_uris.some((uri) => typeof uri !== "string" || !isAllowedDcrRedirectUri(uri))
-    || document.token_endpoint_auth_method !== "none"
+    || !supportsPublicClientTokenAuth(document)
     || (document.response_types !== undefined && (!Array.isArray(document.response_types) || document.response_types.some((value) => value !== "code")))
     || (document.grant_types !== undefined && (!Array.isArray(document.grant_types) || document.grant_types.some((value) => value !== "authorization_code" && value !== "refresh_token")))
   ) throw new Error("invalid_client_metadata");
