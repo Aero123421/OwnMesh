@@ -588,8 +588,11 @@ async function deviceConnectionStatus(
   }
 }
 
-export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+async function handleFetch(
+  request: Request,
+  env: Env,
+  _ctx: ExecutionContext,
+): Promise<Response> {
     const url = new URL(request.url);
     const issuer = env.OAUTH_ISSUER || url.origin;
 
@@ -1057,6 +1060,50 @@ export default {
     }
 
     return json({ error: "not_found", path: url.pathname }, { status: 404 });
+}
+
+function isD1UnavailableError(error: unknown): boolean {
+  if (error instanceof MissingD1Error) return true;
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /D1(?:Database)?Error/i.test(name) || /\bD1_ERROR\b|\bD1 database\b/i.test(message);
+}
+
+function storageUnavailableResponse(request: Request): Response {
+  const pathname = new URL(request.url).pathname;
+  const headers = {
+    "cache-control": "no-store",
+    "retry-after": "60",
+  };
+  const browserFlow = request.headers.get("accept")?.includes("text/html") ||
+    pathname === "/login" || pathname === "/oauth/authorize" || pathname === "/oauth/device";
+  if (browserFlow) {
+    return new Response(
+      "<!doctype html><html><head><meta charset=\"utf-8\"><title>OwnMesh temporarily unavailable</title></head><body><main><h1>OwnMesh is temporarily unavailable</h1><p>The control-plane database could not be reached. Please wait a minute and try again.</p></main></body></html>",
+      {
+        status: 503,
+        headers: { ...headers, "content-type": "text/html; charset=utf-8" },
+      },
+    );
+  }
+  return json(
+    {
+      error: "storage_unavailable",
+      error_description: "control-plane storage is temporarily unavailable",
+      retry_after: 60,
+    },
+    { status: 503, noStore: true, headers: { "retry-after": "60" } },
+  );
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    try {
+      return await handleFetch(request, env, ctx);
+    } catch (error) {
+      if (!isD1UnavailableError(error)) throw error;
+      return storageUnavailableResponse(request);
+    }
   },
 };
 

@@ -1077,6 +1077,105 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
   assert.equal(routeCalls, 1, "dispatched outbox must not re-route");
 });
 
+test("get_operation leases and redelivers dispatch_uncertain without original tool retry", async () => {
+  const store = new MemoryStore();
+  const token = await seedAuthed(store);
+  const deviceId = "dev_poll_redelivery";
+  await putActiveDevice(store, deviceId);
+  const deviceOp = await buildDeviceOperation({
+    toolName: "ownmesh_fs_write",
+    args: {
+      device_id: deviceId,
+      workspace_id: null,
+      path: "/poll-redelivery.txt",
+      content: "exact-once",
+      idempotency_key: "idem_poll_redelivery",
+    },
+    operationId: "op_poll_redelivery",
+    deviceId,
+    principalId: "prin_dev",
+    tenantId: "ten_default",
+    principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+    claimVersion: 1,
+    oauthClientId: "client_mcp",
+  });
+  await store.putMcpOperation({
+    operation_id: "op_poll_redelivery",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "pending",
+    summary: "dispatch_uncertain",
+    data: withDispatchOutbox({ dispatch: "uncertain" }, buildDispatchOutbox(deviceOp)),
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_poll_redelivery",
+    payload_hash: deviceOp.payload_hash,
+    idempotency_key: "idem_poll_redelivery",
+    expires_at: deviceOp.expires_at,
+    claim_version: 1,
+    action: deviceOp.canonical_action,
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  let routeCalls = 0;
+  const router: OperationRouter = {
+    async routeToDevice(_id, operation) {
+      routeCalls += 1;
+      assert.equal(operation.correlation_id, "op_poll_redelivery");
+      return { status: "routed_to_device" };
+    },
+  };
+  await store.putClient({
+    client_id: "client_observer",
+    tenant_id: "ten_default",
+    client_name: "Observer",
+    redirect_uris: ["https://cp.test/observer"],
+    created_at: nowIso(),
+  });
+  const observer = await store.issueTokens("client_observer", "prin_dev", "ownmesh.read");
+  const poll = (accessToken = token.access_token) => handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "ownmesh_get_operation",
+          arguments: { operation_id: "op_poll_redelivery" },
+        },
+      }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    router,
+    { issuer: "https://cp.test" },
+  );
+
+  const observed = await poll(observer.access_token);
+  assert.equal(observed.status, 200);
+  assert.equal(routeCalls, 0, "a different read-only OAuth client cannot trigger redelivery");
+
+  const first = await poll();
+  assert.equal(first.status, 200);
+  assert.equal(routeCalls, 1);
+  assert.equal(readDispatchOutbox((await store.getMcpOperation("op_poll_redelivery"))?.data)?.state, "dispatched");
+  await poll();
+  assert.equal(routeCalls, 1, "dispatched receipt must suppress status-poll amplification");
+});
+
 test("dispatch_uncertain: timeout keeps pending outbox; delayed result finalizes; retry does not rerun", async () => {
   const store = new MemoryStore();
   const token = await seedAuthed(store);

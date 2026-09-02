@@ -100,6 +100,7 @@ function readyEnv(extra: Record<string, unknown> = {}): Record<string, unknown> 
 
 const MCP_SCHEMA_KEYS = [
   "mcp_operations",
+  "mcp_operation_tenant_counters",
   "mcp_approval_transactions",
   "mcp_approval_outbox",
 ] as const;
@@ -490,7 +491,8 @@ test("missing 0005 MCP objects → schema_ready:false while 0003/0004 retained",
       !f.startsWith("0006") &&
       !f.startsWith("0007") &&
       !f.startsWith("0008") &&
-      !f.startsWith("0009"),
+      !f.startsWith("0009") &&
+      !f.startsWith("0019"),
   );
   const { store } = openStoreWith(files);
   const readiness = await store.schemaReadiness();
@@ -679,4 +681,59 @@ test("unavailable storage without DB/testStore → /health/ready 503 schema_read
   assert.equal(body.schema_ready, false);
   assert.equal(body.storage, "unavailable");
   assert.equal(body.status, "not_ready");
+});
+
+test("runtime D1 failures become sanitized retryable 503 responses", async () => {
+  const originalConsoleError = console.error;
+  console.error = () => undefined;
+  try {
+    const apiStore = new MemoryStore();
+    await apiStore.ensureBootstrap();
+    apiStore.getAccess = async () => {
+      throw new Error("D1_ERROR: simulated daily row limit; secret detail");
+    };
+    __setTestStore(apiStore);
+    const api = await worker.fetch(
+      new Request("https://cp.test/v1/audit", {
+        headers: { authorization: "Bearer sensitive-token" },
+      }),
+      readyEnv(),
+      ctx,
+    );
+    assert.equal(api.status, 503);
+    assert.equal(api.headers.get("retry-after"), "60");
+    const apiBody = await api.json() as { error: string; error_description: string };
+    assert.deepEqual(apiBody, {
+      error: "storage_unavailable",
+      error_description: "control-plane storage is temporarily unavailable",
+      retry_after: 60,
+    });
+
+    const browserStore = new MemoryStore();
+    browserStore.getClient = async () => {
+      throw new Error("D1_ERROR: simulated outage; internal detail");
+    };
+    __setTestStore(browserStore);
+    const browser = await worker.fetch(
+      new Request(
+        "http://127.0.0.1/oauth/authorize?response_type=code&client_id=client_missing&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector_platform_oauth_redirect&scope=ownmesh.read&state=secret-state&code_challenge=challenge&code_challenge_method=S256",
+        {
+        headers: { accept: "text/html" },
+        },
+      ),
+      readyEnv({
+        OWNMESH_DEV_AUTH_BYPASS: "true",
+        OAUTH_ISSUER: "http://127.0.0.1",
+      }),
+      ctx,
+    );
+    assert.equal(browser.status, 503);
+    assert.equal(browser.headers.get("retry-after"), "60");
+    const html = await browser.text();
+    assert.match(html, /temporarily unavailable/i);
+    assert.doesNotMatch(html, /secret detail|internal detail|return_to/);
+  } finally {
+    __setTestStore(null);
+    console.error = originalConsoleError;
+  }
 });

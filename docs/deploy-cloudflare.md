@@ -149,6 +149,19 @@ and writes in the Cloudflare dashboard. A `429` from OwnMesh means the caller
 should honor `Retry-After`; a Cloudflare 1027/1102 means the account or CPU limit
 was reached.
 
+Operation admission does not run `COUNT(*)`: migration 0019 maintains an exact
+per-tenant counter transactionally. Retention is leased and limited to three
+index-backed batches of 128 rows, and a 25-second MCP wait performs at most two
+additional authoritative operation reads. A recognized D1 runtime outage
+returns sanitized HTTP 503 with `Retry-After: 60`.
+
+Persistent Workers observability is deliberately off by default. To opt in
+inside your own Cloudflare account, set `observability.enabled` to `true`, keep
+`logs.invocation_logs` disabled so OAuth callback query strings are not stored,
+and choose a bounded `head_sampling_rate` such as `0.1`. Do not log request
+bodies, authorization/cookie headers, device credentials, operation arguments,
+or file/command results.
+
 - **D1 Worker API**: https://developers.cloudflare.com/d1/worker-api/
 - **DO WebSocket hibernation**: https://developers.cloudflare.com/durable-objects/best-practices/websockets/
 - **Hibernation example**: https://developers.cloudflare.com/durable-objects/examples/websocket-hibernation-server/

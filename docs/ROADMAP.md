@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.26 · **Last updated:** 2026-09-01
+**Baseline:** v1.2.27 · **Last updated:** 2026-09-02
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -18,6 +18,11 @@ the product, not by effort. Generic external CLI sessions replace the removed
 coding-agent Profile layer in v1.2.26 (ADR 0018). The stability/MCP hardening
 shipped in v1.2.25 and its explicit partial boundaries are recorded in
 [`STABILITY_MCP_HARDENING.md`](./STABILITY_MCP_HARDENING.md).
+
+Cloudflare request-cost hardening shipped in v1.2.27 (ADR 0019): D1 operation
+admission and retention are table-size independent, MCP waits and uncertain
+delivery retries are bounded, long-command correlation TTLs align with admitted
+timeouts, and Agent reconnect uses jitter.
 
 ## Now — the gap between what the presets promise and what they do
 

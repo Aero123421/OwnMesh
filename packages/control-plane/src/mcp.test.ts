@@ -15,6 +15,9 @@ import {
   MCP_COMMAND_TIMEOUT_DETACH_HINT,
   MCP_COMMAND_TIMEOUT_DETACH_WARNING,
   MCP_DETACHED_OPERATION_TTL_MS,
+  MCP_DISPATCH_EXPIRES_MS,
+  MCP_DISPATCH_RESULT_GRACE_MS,
+  MCP_WAIT_MAX_STORE_READS,
   OperationTracker,
   handleMcp,
   createHarnessRouter,
@@ -31,6 +34,7 @@ import {
   mcpCatalogRevision,
   mcpSessionCatalogRevision,
   principalRevocationEpochOf,
+  mcpDispatchTtlMs,
   boundPrincipalAuthorityCurrent,
   PUBLISHED_MCP_TOOLS,
   __setGetOperationWaiterCapForTest,
@@ -2812,6 +2816,50 @@ test("get_operation wait_ms long-polls until a terminal snapshot or the wait win
   assert.equal(timed.body.result?.structuredContent?.status, "pending");
   assert.ok(elapsed >= 200, `waited only ${elapsed}ms`);
   assert.ok(elapsed < 1_200, `waited ${elapsed}ms`);
+});
+
+test("get_operation wait_ms uses a strict store-read budget", async () => {
+  const { store, token } = await authed();
+  await store.putMcpOperation({
+    operation_id: "op_wait_budget",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    tool: "ownmesh_fs_stat",
+    status: "pending",
+    summary: "still pending",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  const originalGet = store.getMcpOperation.bind(store);
+  let reads = 0;
+  store.getMcpOperation = async (operationId) => {
+    reads += 1;
+    return originalGet(operationId);
+  };
+  const result = await callTool(store, token, "ownmesh_get_operation", {
+    operation_id: "op_wait_budget",
+    wait_ms: 260,
+  });
+  assert.equal(result.body.result?.structuredContent?.status, "pending");
+  assert.ok(
+    reads <= 1 + MCP_WAIT_MAX_STORE_READS,
+    `wait performed ${reads} operation reads`,
+  );
+});
+
+test("dispatch correlation TTL covers long command timeout plus bounded grace", () => {
+  assert.equal(mcpDispatchTtlMs({}, false), MCP_DISPATCH_EXPIRES_MS);
+  assert.equal(
+    mcpDispatchTtlMs({ timeout_ms: 3_600_000 }, false),
+    3_600_000 + MCP_DISPATCH_RESULT_GRACE_MS,
+  );
+  assert.equal(mcpDispatchTtlMs({ timeout_ms: 3_600_000 }, true), MCP_DETACHED_OPERATION_TTL_MS);
 });
 
 test("get_operation wait_ms saturates to an immediate snapshot with a warning", async () => {
