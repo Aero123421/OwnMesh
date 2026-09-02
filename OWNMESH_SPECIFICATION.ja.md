@@ -1139,7 +1139,7 @@ generic session に残った旧 Profile metadata は無視する。この破壊�
 - 通常 Chat から利用する。
 - ChatGPT 固有のモード切替を OwnMesh の必須条件にしない。
 
-> **実装状況（v1.2.27 / [ADR 0017](./docs/adr/0017-dual-era-mcp-and-frozen-catalog-compatibility.md)、[ADR 0018](./docs/adr/0018-generic-external-cli-sessions.md)、[ADR 0019](./docs/adr/0019-bounded-cloudflare-control-plane-costs.md)）**
+> **実装状況（v1.2.28 / [ADR 0017](./docs/adr/0017-dual-era-mcp-and-frozen-catalog-compatibility.md)、[ADR 0018](./docs/adr/0018-generic-external-cli-sessions.md)、[ADR 0019](./docs/adr/0019-bounded-cloudflare-control-plane-costs.md)）**
 > 共通の tool registry・scope・action binding・device policy route の前に、
 > `2025-03-26` legacy adapter（`initialize` / 任意 session id）と
 > `2026-07-28` modern adapter（stateless request metadata、mirrored HTTP

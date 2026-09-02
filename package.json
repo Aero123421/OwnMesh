@@ -1,7 +1,7 @@
 {
   "name": "ownmesh",
   "private": true,
-  "version": "1.2.27",
+  "version": "1.2.28",
   "description": "OwnMesh monorepo — capability runtime for user-owned PCs",
   "license": "Apache-2.0",
   "packageManager": "pnpm@9.15.0",
