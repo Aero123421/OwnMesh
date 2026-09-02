@@ -6,10 +6,15 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "ownmesh-control-plane",
   "main": "src/index.ts",
-  "compatibility_date": "2024-12-01",
+  "compatibility_date": "2026-08-28",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "preview_urls": false,
+  "observability": {
+    // Privacy contract: persistence remains opt-in in the user's account.
+    // See docs/deploy-cloudflare.md for a query-safe sampled configuration.
+    "enabled": false
+  },
   "vars": {
     // OAUTH_ISSUER is intentionally omitted: the Worker uses its request origin.
     // Set it only when deploying behind a stable custom domain.

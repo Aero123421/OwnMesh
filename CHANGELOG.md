@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.2.27 — Bounded Cloudflare control-plane cost
+
+- Replaced `mcp_operations` full scans with an atomic per-tenant admission
+  counter and leased, index-backed 128-row retention batches.
+- Bounded MCP waits to two store reads, added leased/jittered uncertain-delivery
+  recovery, and aligned long-command correlation TTL with admitted timeout.
+- Added sanitized retryable D1-outage responses and full-jitter Agent reconnect.
+- Updated the Cloudflare compatibility date, Wrangler, and Workers types.
+
 ## v1.2.26 — Generic external CLI sessions
 
 ### Generic external CLI sessions (breaking)

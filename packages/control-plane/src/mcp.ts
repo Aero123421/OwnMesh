@@ -120,6 +120,26 @@ export const MCP_COMMAND_TIMEOUT_DETACH_WARNING = "mcp_command_timeout_detach_hi
 export const MCP_DETACHED_OPERATION_TTL_MS = 24 * 60 * 60 * 1000;
 /** Ordinary MCP dispatch envelope used when `detach` is not set. */
 export const MCP_DISPATCH_EXPIRES_MS = 5 * 60_000;
+/** Bounded result-delivery grace after the device-side command deadline. */
+export const MCP_DISPATCH_RESULT_GRACE_MS = 60_000;
+
+/**
+ * Keep DeviceRoom correlation alive for every timeout the control plane admits.
+ * This fixes the former five-minute correlation expiry for longer commands.
+ */
+export function mcpDispatchTtlMs(
+  args: Record<string, unknown>,
+  detached: boolean,
+): number {
+  if (detached) return MCP_DETACHED_OPERATION_TTL_MS;
+  const requested = typeof args.timeout_ms === "number" && Number.isFinite(args.timeout_ms)
+    ? Math.max(1, Math.floor(args.timeout_ms))
+    : 0;
+  return Math.max(
+    MCP_DISPATCH_EXPIRES_MS,
+    Math.min(MCP_MAX_TIMEOUT_MS_HARD_CEILING, requested) + MCP_DISPATCH_RESULT_GRACE_MS,
+  );
+}
 /**
  * Parse `MCP_MAX_TIMEOUT_MS` from Worker env / handle options.
  * Invalid, empty, or non-positive values fail closed to the documented default.
@@ -2655,7 +2675,10 @@ const SYNC_WAIT_NON_TERMINAL = new Set([
   "running",
   "cancel_requested",
 ]);
-const MCP_SYNC_WAIT_POLL_MS = 100;
+/** Strict D1 read budget for a wait request, independent of wait_ms. */
+export const MCP_WAIT_MAX_STORE_READS = 2;
+const MCP_WAIT_RETRY_BASE_MS = 100;
+const MCP_WAIT_RETRY_FACTOR = 4;
 const getOperationWaitersByTenant = new Map<string, number>();
 let getOperationWaiterCap = MCP_GET_OPERATION_WAITERS_MAX_PER_TENANT;
 
@@ -2686,10 +2709,10 @@ function clampGetOperationWaitMs(raw: unknown): number {
 }
 
 /**
- * Briefly observe only the authoritative operation row. This helper never
- * writes, retries delivery, or follows the command timeout, so exact-once and
- * cancellation semantics remain unchanged. A read failure falls back to the
- * last authoritative row already obtained by the request.
+ * Briefly observe only the authoritative operation row. This is the bounded
+ * fallback for cross-isolate completion (DeviceRoom cannot wake an arbitrary
+ * Worker isolate): exponential delays plus one final deadline read replace the
+ * old 100ms poll loop. The number of D1 reads never scales with wait_ms.
  */
 async function waitForAuthoritativeCompletion(
   store: ControlPlaneStore,
@@ -2706,11 +2729,17 @@ async function waitForAuthoritativeCompletion(
 
   const deadline = Date.now() + waitMs;
   let current = initial;
-  while (SYNC_WAIT_NON_TERMINAL.has(current.status)) {
+  for (let attempt = 0; attempt < MCP_WAIT_MAX_STORE_READS; attempt += 1) {
+    if (!SYNC_WAIT_NON_TERMINAL.has(current.status)) break;
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
+    const exponential = MCP_WAIT_RETRY_BASE_MS * MCP_WAIT_RETRY_FACTOR ** attempt;
+    // Reserve the final attempt for the authoritative deadline snapshot.
+    const delayMs = attempt === MCP_WAIT_MAX_STORE_READS - 1
+      ? remaining
+      : Math.min(exponential, remaining);
     await new Promise<void>((resolve) =>
-      setTimeout(resolve, Math.min(MCP_SYNC_WAIT_POLL_MS, remaining)),
+      setTimeout(resolve, delayMs),
     );
     try {
       const fresh = await loadOp(store, tracker, current.operation_id);
@@ -3076,9 +3105,15 @@ export type DispatchOutbox = {
   state: "pending" | "dispatched";
   body: DispatchOutboxBody;
   attempts?: number;
+  /** Earliest ISO timestamp for another identical, leased delivery attempt. */
+  next_attempt_at?: string;
   /** A transfer ticket is in-memory-only. Never retry a ticketless recipe. */
   non_redeliverable?: boolean;
 };
+
+export const MCP_DISPATCH_RETRY_MAX_ATTEMPTS = 5;
+const MCP_DISPATCH_RETRY_BASE_MS = 1_000;
+const MCP_DISPATCH_RETRY_MAX_MS = 30_000;
 
 export function buildDispatchOutbox(deviceOp: {
   type: string;
@@ -3116,6 +3151,7 @@ export function readDispatchOutbox(data: Record<string, unknown> | null | undefi
   return {
     state,
     attempts: Number.isFinite(Number(obj.attempts)) ? Number(obj.attempts) : 0,
+    next_attempt_at: typeof obj.next_attempt_at === "string" ? obj.next_attempt_at : undefined,
     non_redeliverable: obj.non_redeliverable === true,
     body: {
       type: b.type,
@@ -3322,7 +3358,11 @@ export function needsDispatchRedelivery(op: {
   const box = readDispatchOutbox(op.data || {});
   // Missing outbox on legacy rows is not redelivered (cannot reconstruct body).
   if (!box || box.non_redeliverable) return false;
-  return box.state === "pending";
+  if (box.state !== "pending" || (box.attempts || 0) >= MCP_DISPATCH_RETRY_MAX_ATTEMPTS) {
+    return false;
+  }
+  const nextAttempt = box.next_attempt_at ? Date.parse(box.next_attempt_at) : 0;
+  return !Number.isFinite(nextAttempt) || nextAttempt <= Date.now();
 }
 
 export function withDispatchOutbox(
@@ -3375,6 +3415,144 @@ export function markDispatchOutboxDispatched(
     body: compactDispatchOutboxBody(box.body),
   };
   return base;
+}
+
+function dispatchRetryDelayMs(attempt: number): number {
+  const cap = Math.min(
+    MCP_DISPATCH_RETRY_MAX_MS,
+    MCP_DISPATCH_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1),
+  );
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  // Equal jitter avoids a zero-delay retry loop while still spreading callers.
+  return Math.floor(cap / 2 + (random[0]! / 0x1_0000_0000) * (cap / 2));
+}
+
+/**
+ * Status polling may recover a dispatch_uncertain row without replaying the
+ * original tool call. A durable data CAS is the retry lease; only its winner
+ * may send the immutable bound body, and DeviceRoom repeats cancellation and
+ * correlation fences at the final socket boundary.
+ */
+async function retryPendingDispatchOnPoll(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  tracked: TrackedOperation,
+  router: OperationRouter,
+  caller: { clientId: string; scope: string },
+): Promise<TrackedOperation> {
+  if (!tracked.device_id) return tracked;
+  const box = readDispatchOutbox(tracked.data || {});
+  if (!box || box.state !== "pending" || box.non_redeliverable) return tracked;
+  const originalClientId = box.body.oauth_client_id;
+  const originalTool = MCP_TOOLS.find((tool) => tool.name === tracked.tool);
+  if (
+    typeof originalClientId !== "string" ||
+    originalClientId !== caller.clientId ||
+    !originalTool ||
+    !requireScope(caller.scope, originalTool.scope)
+  ) {
+    return tracked;
+  }
+
+  if (!(await boundCredentialGenerationCurrent(store, box.body))) {
+    const reason = await boundAuthorityInvalidationReason(store, box.body.payload);
+    return (await patchOp(
+      store,
+      tracker,
+      tracked.operation_id,
+      {
+        status: "failed",
+        summary: authorityInvalidationSummary(reason, "redelivery"),
+        data: {
+          ...(tracked.data || {}),
+          error: authorityInvalidationError(reason, "redelivery"),
+        },
+        approval_required: false,
+      },
+      ["pending", "running"],
+      tracked.data || {},
+    )) || tracked;
+  }
+  if (!needsDispatchRedelivery(tracked)) return tracked;
+
+  const attempt = Math.min(MCP_DISPATCH_RETRY_MAX_ATTEMPTS, (box.attempts || 0) + 1);
+  const leasedBox: DispatchOutbox = {
+    ...box,
+    attempts: attempt,
+    next_attempt_at: new Date(Date.now() + dispatchRetryDelayMs(attempt)).toISOString(),
+  };
+  const leasedData = withDispatchOutbox(tracked.data || {}, leasedBox);
+  const leased = await patchOp(
+    store,
+    tracker,
+    tracked.operation_id,
+    { data: leasedData, summary: "dispatch_retry_leased" },
+    ["pending", "running"],
+    tracked.data || {},
+  );
+  if (!leased) return (await loadOp(store, tracker, tracked.operation_id)) || tracked;
+
+  // Cancellation can win immediately after the retry lease. Observe its fence
+  // once more; DeviceRoom performs the same authoritative check after receipt.
+  const beforeRoute = await loadOp(store, tracker, tracked.operation_id);
+  if (!beforeRoute || beforeRoute.status === "cancel_requested") return beforeRoute || leased;
+
+  let routed: Awaited<ReturnType<OperationRouter["routeToDevice"]>>;
+  try {
+    routed = await router.routeToDevice(tracked.device_id, leasedBox.body);
+  } catch {
+    routed = { status: "dispatch_uncertain" };
+  }
+  if (
+    routed.status === "routed_to_device" ||
+    routed.status === "pending" ||
+    routed.status === "running" ||
+    routed.status === "completed" ||
+    routed.status === "approval_required" ||
+    routed.status === "denied" ||
+    routed.status === "device_offline"
+  ) {
+    return (await patchOp(
+      store,
+      tracker,
+      tracked.operation_id,
+      {
+        data: markDispatchOutboxDispatched(leasedData),
+        status:
+          routed.status === "device_offline"
+            ? "device_offline"
+            : routed.status === "approval_required"
+              ? "approval_required"
+              : routed.status === "denied"
+                ? "denied"
+                : routed.status === "completed"
+                  ? "completed"
+                  : leased.status,
+        summary: routed.status === "device_offline" ? "device offline" : "dispatch retry accepted",
+      },
+      ["pending", "running"],
+      leasedData,
+    )) || leased;
+  }
+
+  return (await patchOp(
+    store,
+    tracker,
+    tracked.operation_id,
+    {
+      data: {
+        ...leasedData,
+        dispatch: "uncertain",
+        route: { status: routed.status },
+      },
+      summary: attempt >= MCP_DISPATCH_RETRY_MAX_ATTEMPTS
+        ? "dispatch_retry_exhausted"
+        : "dispatch_uncertain",
+    },
+    ["pending", "running"],
+    leasedData,
+  )) || leased;
 }
 
 /** Strip internal dispatch outbox before any client-facing envelope. */
@@ -6158,6 +6336,12 @@ async function handleMcpCore(
           return mcpError(id, -32004, gate.error, { device_id: tracked.device_id, operation_id: oid });
         }
       }
+      if (router && tracked.device_id && readDispatchOutbox(tracked.data)?.state === "pending") {
+        tracked = await retryPendingDispatchOnPoll(store, tracker, tracked, router, {
+          clientId: rec.client_id,
+          scope: rec.scope,
+        });
+      }
       const waitMs = clampGetOperationWaitMs(args.wait_ms);
       const waitWarnings: string[] = [];
       if (waitMs > 0 && SYNC_WAIT_NON_TERMINAL.has(tracked.status)) {
@@ -6844,9 +7028,7 @@ async function handleMcpCore(
     const skipSyncWait = wantAsync || wantDetach;
     const opType = normalizeOpType(name);
     const isMutating = tool.risk === "write" || tool.risk === "exec";
-    const expiresAt = new Date(
-      Date.now() + (wantDetach ? MCP_DETACHED_OPERATION_TTL_MS : MCP_DISPATCH_EXPIRES_MS),
-    ).toISOString();
+    const expiresAt = new Date(Date.now() + mcpDispatchTtlMs(safeArgs, wantDetach)).toISOString();
     const claimVersion = 1;
 
     // Side-effect tools require an explicit caller idempotency key so a lost MCP
@@ -7043,85 +7225,17 @@ async function handleMcpCore(
       }
       let replayed = trackedFromRecord(prior);
       tracker.put(replayed);
-      // E3 crash-safe dispatch: if the claim was accepted but never marked
-      // dispatched, redeliver the original bound body exactly once per retry.
-      if (router && replayed.status !== "cancel_requested" && needsDispatchRedelivery(replayed)) {
-        const box = readDispatchOutbox(replayed.data || {});
-        if (box) {
-          if (!(await boundCredentialGenerationCurrent(store, box.body))) {
-            const reason = await boundAuthorityInvalidationReason(store, box.body.payload);
-            const rejected = await patchOp(
-              store,
-              tracker,
-              replayed.operation_id,
-              {
-                status: "failed",
-                summary: authorityInvalidationSummary(reason, "redelivery"),
-                data: {
-                  ...(replayed.data || {}),
-                  error: authorityInvalidationError(reason, "redelivery"),
-                },
-                approval_required: false,
-              },
-              ["pending", "running", "cancel_requested"],
-            );
-            if (rejected) replayed = rejected;
-            return mcpResult(id, toolContent(replayed));
-          }
-          const redelivered = await router.routeToDevice(deviceId, box.body);
-          // dispatch_uncertain: leave outbox pending for another identical retry;
-          // DeviceRoom correlation dedup prevents a second side-effect send.
-          if (redelivered.status === "dispatch_uncertain") {
-            const noted = await patchOp(
-              store,
-              tracker,
-              replayed.operation_id,
-              {
-                data: {
-                  ...(replayed.data || {}),
-                  route: redelivered,
-                  dispatch: "uncertain",
-                },
-                summary: "dispatch_uncertain",
-              },
-              ["pending", "running", "cancel_requested"],
-            );
-            if (noted) replayed = noted;
-          } else if (
-            redelivered.status === "routed_to_device" ||
-            redelivered.status === "pending" ||
-            redelivered.status === "running" ||
-            redelivered.status === "completed" ||
-            redelivered.status === "approval_required" ||
-            redelivered.status === "denied" ||
-            redelivered.status === "device_offline"
-          ) {
-            const marked = await patchOp(
-              store,
-              tracker,
-              replayed.operation_id,
-              {
-                data: markDispatchOutboxDispatched(replayed.data || {}),
-                status:
-                  redelivered.status === "device_offline"
-                    ? "device_offline"
-                    : redelivered.status === "approval_required"
-                      ? "approval_required"
-                      : redelivered.status === "denied"
-                        ? "denied"
-                        : redelivered.status === "completed"
-                          ? "completed"
-                          : replayed.status,
-                summary:
-                  redelivered.status === "device_offline"
-                    ? "device offline"
-                    : replayed.summary || "routing to device",
-              },
-              ["pending", "running", "cancel_requested"],
-            );
-            if (marked) replayed = marked;
-          }
-        }
+      // A durable data CAS leases redelivery across concurrent identical tool
+      // retries and get_operation polls. Only the lease winner may route.
+      if (
+        router &&
+        replayed.status !== "cancel_requested" &&
+        readDispatchOutbox(replayed.data)?.state === "pending"
+      ) {
+        replayed = await retryPendingDispatchOnPoll(store, tracker, replayed, router, {
+          clientId: rec.client_id,
+          scope: rec.scope,
+        });
       }
       if (!skipSyncWait) {
         replayed = await waitForAuthoritativeCompletion(

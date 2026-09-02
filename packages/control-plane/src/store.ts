@@ -449,6 +449,10 @@ export const MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES = 900_000;
 export const MCP_OPS_RESULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Tombstones older than this may be hard-deleted (idempotency window closed). */
 export const MCP_OPS_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** At most this many rows are touched by each retention phase. */
+export const MCP_OPS_MAINTENANCE_BATCH = 128;
+/** Amortize bounded retention work instead of running it on every claim. */
+export const MCP_OPS_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
 
 /** Internal durable-outbox key — must match mcp.ts DISPATCH_OUTBOX_KEY. */
 const DISPATCH_OUTBOX_DATA_KEY = "__ownmesh_dispatch_outbox";
@@ -1067,6 +1071,8 @@ export type SchemaReadiness = {
     authorize_transactions: boolean;
     /** 0005 MCP ops + 0006 claimed_at + 0007 claim ownership + 0008 action binding */
     mcp_operations: boolean;
+    /** 0019 constant-cost MCP operation admission and retention lease */
+    mcp_operation_tenant_counters: boolean;
     mcp_approval_transactions: boolean;
     mcp_approval_outbox: boolean;
     /** 0012 server-owned principal OAuth credential generation */
@@ -1264,7 +1270,15 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "idx_mcp_ops_idempotency",
       "idx_mcp_ops_payload_hash",
       "uq_mcp_ops_idempotency",
+      "uq_mcp_ops_idempotency_no_device",
+      "idx_mcp_ops_tombstone_expiry",
+      "idx_mcp_ops_terminal_keyless_expiry",
+      "idx_mcp_ops_terminal_keyed_expiry",
     ],
+  },
+  mcp_operation_tenant_counters: {
+    table: "mcp_operation_tenant_counters",
+    columns: ["tenant_id", "operation_count", "maintenance_after"],
   },
   mcp_approval_transactions: {
     table: "mcp_approval_transactions",
@@ -2803,7 +2817,10 @@ export class SqlStore implements ControlPlaneStore {
   async getMcpOperationQuota(tenantId: string): Promise<McpOperationQuotaSnapshot> {
     await this.compactMcpOperations(tenantId);
     const countRow = await this.db
-      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
+      .prepare(
+        `SELECT operation_count AS c
+         FROM mcp_operation_tenant_counters WHERE tenant_id = ?`,
+      )
       .bind(tenantId)
       .first<{ c: number }>();
     return snapshotMcpOperationQuota(Number(countRow?.c ?? 0), this.mcpOpsLimit);
@@ -4347,39 +4364,58 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Compact expired terminal rows. Keyed receipts become 30-day tombstones;
-   * keyless rows (and leftover keyless tombstones) are hard-deleted.
+   * Run three index-backed retention batches at most once per tenant/interval.
+   * Every statement touches at most MCP_OPS_MAINTENANCE_BATCH rows, so an MCP
+   * request never inherits work proportional to the operation table size.
    */
   private async compactMcpOperations(tenantId: string): Promise<void> {
     const now = Date.now();
     const resultCutoff = new Date(now - MCP_OPS_RESULT_TTL_MS).toISOString();
     const tombstoneCutoff = new Date(now - MCP_OPS_TOMBSTONE_TTL_MS).toISOString();
+    const maintenanceAfter = new Date(now + MCP_OPS_MAINTENANCE_INTERVAL_MS).toISOString();
 
-    // Drop keyless tombstones (no binding) and keyed tombstones past the 30d window.
-    await this.db
+    const lease = await this.db
+      .prepare(
+        `UPDATE mcp_operation_tenant_counters
+         SET maintenance_after = ?
+         WHERE tenant_id = ? AND maintenance_after <= ?
+         RETURNING tenant_id`,
+      )
+      .bind(maintenanceAfter, tenantId, new Date(now).toISOString())
+      .first<{ tenant_id: string }>();
+    if (!lease) return;
+
+    // Keyed tombstones preserve replay protection for 30 days after compaction.
+    const expiredTombstones = await this.db
       .prepare(
         `DELETE FROM mcp_operations
-         WHERE tenant_id = ? AND status = 'tombstone'
-           AND (idempotency_key IS NULL OR idempotency_key = '' OR updated_at < ?)`,
+         WHERE operation_id IN (
+           SELECT operation_id FROM mcp_operations
+           WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?
+           ORDER BY updated_at, operation_id LIMIT ?
+         )`,
       )
-      .bind(tenantId, tombstoneCutoff)
+      .bind(tenantId, tombstoneCutoff, MCP_OPS_MAINTENANCE_BATCH)
       .run();
 
-    // Hard-delete keyless terminal results past TTL — they occupy quota for no replay benefit.
-    await this.db
+    // Keyless terminal results protect no idempotency binding.
+    const expiredKeyless = await this.db
       .prepare(
         `DELETE FROM mcp_operations
-         WHERE tenant_id = ?
-           AND status IN ('completed','failed','denied','cancelled','device_offline')
-           AND updated_at < ?
-           AND (idempotency_key IS NULL OR idempotency_key = '')`,
+         WHERE operation_id IN (
+           SELECT operation_id FROM mcp_operations
+           WHERE tenant_id = ?
+             AND status IN ('completed','failed','denied','cancelled','device_offline')
+             AND updated_at < ?
+             AND (idempotency_key IS NULL OR idempotency_key = '')
+           ORDER BY updated_at, operation_id LIMIT ?
+         )`,
       )
-      .bind(tenantId, resultCutoff)
+      .bind(tenantId, resultCutoff, MCP_OPS_MAINTENANCE_BATCH)
       .run();
 
-    // Compact keyed terminal results past TTL into idempotency tombstones.
-    // Keep payload_hash/idempotency_key columns; clear large result bodies only.
-    await this.db
+    // Compact a bounded batch of keyed terminal results into small receipts.
+    const compactedKeyed = await this.db
       .prepare(
         `UPDATE mcp_operations
          SET status = 'tombstone',
@@ -4388,37 +4424,41 @@ export class SqlStore implements ControlPlaneStore {
              truncated = 1,
              warnings_json = '["durable_result_tombstoned"]',
              updated_at = ?
-         WHERE tenant_id = ?
-           AND status IN ('completed','failed','denied','cancelled','device_offline')
-           AND updated_at < ?
-           AND idempotency_key IS NOT NULL
-           AND idempotency_key != ''`,
+         WHERE operation_id IN (
+           SELECT operation_id FROM mcp_operations
+           WHERE tenant_id = ?
+             AND status IN ('completed','failed','denied','cancelled','device_offline')
+             AND updated_at < ?
+             AND idempotency_key IS NOT NULL
+             AND idempotency_key != ''
+           ORDER BY updated_at, operation_id LIMIT ?
+         )`,
       )
-      .bind(new Date(now).toISOString(), tenantId, resultCutoff)
+      .bind(new Date(now).toISOString(), tenantId, resultCutoff, MCP_OPS_MAINTENANCE_BATCH)
       .run();
+    if (
+      sqlChanges(expiredTombstones) > 0 ||
+      sqlChanges(expiredKeyless) > 0 ||
+      sqlChanges(compactedKeyed) > 0
+    ) {
+      // Continue draining one bounded batch on the next tenant request. Once a
+      // pass changes nothing, the five-minute quiet interval takes effect.
+      await this.db
+        .prepare(
+          `UPDATE mcp_operation_tenant_counters
+           SET maintenance_after = '1970-01-01T00:00:00.000Z'
+           WHERE tenant_id = ?`,
+        )
+        .bind(tenantId)
+        .run();
+    }
   }
 
-  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
-  private async enforceMcpOperationQuota(tenantId: string): Promise<void> {
-    await this.compactMcpOperations(tenantId);
-
-    const countRow = await this.db
-      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
-      .bind(tenantId)
-      .first<{ c: number }>();
-    const count = Number(countRow?.c ?? 0);
-    if (count < this.mcpOpsLimit) return;
-
-    // E3: never evict unexpired idempotency receipts (including <30d tombstones)
-    // under quota pressure. Ancient tombstones were already hard-deleted above;
-    // remaining overflow must fail closed rather than enable side-effect replay.
-    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${this.mcpOpsLimit}`);
-  }
-
-  /** Create-only INSERT. Conflict (existing operation_id) fails — never REPLACE. */
-  async putMcpOperation(op: McpOperationRecord): Promise<void> {
-    await this.enforceMcpOperationQuota(op.tenant_id);
-    const bounded = boundMcpOperationRecord(op);
+  /**
+   * Atomic admission: the counter predicate and INSERT are one SQLite statement;
+   * the AFTER INSERT trigger increments the same counter transactionally.
+   */
+  private async insertMcpOperationIfUnderQuota(op: McpOperationRecord): Promise<boolean> {
     const result = await this.db
       .prepare(
         `INSERT INTO mcp_operations
@@ -4426,43 +4466,66 @@ export class SqlStore implements ControlPlaneStore {
           data_json, truncated, next_cursor, approval_required, approval_url, approval_id,
           session_id, warnings_json, correlation_id, payload_hash, idempotency_key,
           workspace_id, expires_at, claim_version, action_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(operation_id) DO NOTHING`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE COALESCE((
+           SELECT operation_count FROM mcp_operation_tenant_counters WHERE tenant_id = ?
+         ), 0) < ?
+         ON CONFLICT DO NOTHING`,
       )
       .bind(
-        bounded.operation_id,
-        bounded.tenant_id,
-        bounded.principal_id,
-        bounded.device_id ?? null,
-        bounded.tool,
-        bounded.status,
-        bounded.summary,
-        JSON.stringify(bounded.data || {}),
-        bounded.truncated ? 1 : 0,
-        bounded.next_cursor ?? null,
-        bounded.approval_required ? 1 : 0,
-        bounded.approval_url ?? null,
-        bounded.approval_id ?? null,
-        bounded.session_id ?? null,
-        JSON.stringify(bounded.warnings || []),
-        bounded.correlation_id ?? null,
-        bounded.payload_hash ?? null,
-        bounded.idempotency_key ?? null,
-        bounded.workspace_id ?? null,
-        bounded.expires_at ?? null,
-        Number(bounded.claim_version ?? 0),
-        JSON.stringify(bounded.action || {}),
-        bounded.created_at,
-        bounded.updated_at,
+        op.operation_id,
+        op.tenant_id,
+        op.principal_id,
+        op.device_id ?? null,
+        op.tool,
+        op.status,
+        op.summary,
+        JSON.stringify(op.data || {}),
+        op.truncated ? 1 : 0,
+        op.next_cursor ?? null,
+        op.approval_required ? 1 : 0,
+        op.approval_url ?? null,
+        op.approval_id ?? null,
+        op.session_id ?? null,
+        JSON.stringify(op.warnings || []),
+        op.correlation_id ?? null,
+        op.payload_hash ?? null,
+        op.idempotency_key ?? null,
+        op.workspace_id ?? null,
+        op.expires_at ?? null,
+        Number(op.claim_version ?? 0),
+        JSON.stringify(op.action || {}),
+        op.created_at,
+        op.updated_at,
+        op.tenant_id,
+        this.mcpOpsLimit,
       )
       .run();
-    const changes = Number(
-      (result as { meta?: { changes?: number }; changes?: number }).meta?.changes
-        ?? (result as { changes?: number }).changes
-        ?? 0,
-    );
-    if (changes < 1) {
-      throw new Error(`mcp_operation_exists:${op.operation_id}`);
+    return sqlChanges(result) >= 1;
+  }
+
+  /** Create-only INSERT. Conflict (existing operation_id) fails — never REPLACE. */
+  async putMcpOperation(op: McpOperationRecord): Promise<void> {
+    await this.compactMcpOperations(op.tenant_id);
+    const bounded = boundMcpOperationRecord(op);
+    if (bounded.status === "tombstone" && !hasMcpIdempotencyReceipt(bounded)) return;
+    if (!(await this.insertMcpOperationIfUnderQuota(bounded))) {
+      const existing = await this.getMcpOperation(op.operation_id);
+      if (existing) throw new Error(`mcp_operation_exists:${op.operation_id}`);
+      if (op.idempotency_key) {
+        const idempotencyOwner = await this.getMcpOperationByIdempotency({
+          principalId: op.principal_id,
+          tenantId: op.tenant_id,
+          deviceId: op.device_id || "",
+          idempotencyKey: op.idempotency_key,
+        });
+        if (idempotencyOwner) {
+          throw new Error(`mcp_operation_idempotency_exists:${op.idempotency_key}`);
+        }
+      }
+      throw new Error(
+        `mcp_operation_quota_exceeded:tenant=${op.tenant_id}:max=${this.mcpOpsLimit}`,
+      );
     }
   }
 
@@ -4527,36 +4590,39 @@ export class SqlStore implements ControlPlaneStore {
     deviceId: string;
     idempotencyKey: string;
   }): Promise<McpOperationRecord | null> {
-    const row = await this.db
-      .prepare(
+    const statement = opts.deviceId
+      ? this.db.prepare(
         `SELECT * FROM mcp_operations
-         WHERE principal_id = ? AND tenant_id = ? AND IFNULL(device_id, '') = ?
-           AND IFNULL(idempotency_key, '') = ?
+         WHERE principal_id = ? AND tenant_id = ? AND device_id = ?
+           AND idempotency_key = ?
          ORDER BY created_at DESC LIMIT 1`,
-      )
-      .bind(opts.principalId, opts.tenantId, opts.deviceId, opts.idempotencyKey)
-      .first<Record<string, unknown>>();
-    return row ? rowToMcpOperation(row) : null;
-  }
-
-  /**
-   * Hard-delete tombstones whose 30-day idempotency window has closed, so an
-   * expired key becomes reusable as a fresh operation instead of blocking on a
-   * stale tombstone forever. Runs before any existing-row lookup on the claim
-   * path; `enforceMcpOperationQuota` also prunes them at capacity.
-   */
-  private async expireExpiredMcpTombstones(tenantId: string): Promise<void> {
-    const tombstoneCutoff = new Date(
-      Date.now() - MCP_OPS_TOMBSTONE_TTL_MS,
-    ).toISOString();
-    await this.db
-      .prepare(
-        `DELETE FROM mcp_operations
-         WHERE tenant_id = ? AND status = 'tombstone'
-           AND (idempotency_key IS NULL OR idempotency_key = '' OR updated_at < ?)`,
-      )
-      .bind(tenantId, tombstoneCutoff)
-      .run();
+      ).bind(opts.principalId, opts.tenantId, opts.deviceId, opts.idempotencyKey)
+      : this.db.prepare(
+        `SELECT * FROM mcp_operations
+         WHERE principal_id = ? AND tenant_id = ? AND device_id IS NULL
+           AND idempotency_key = ?
+         ORDER BY created_at DESC LIMIT 1`,
+      ).bind(opts.principalId, opts.tenantId, opts.idempotencyKey);
+    const row = await statement.first<Record<string, unknown>>();
+    if (!row) return null;
+    const operation = rowToMcpOperation(row);
+    if (
+      operation.status === "tombstone" &&
+      mcpOpAgeMs(operation) > MCP_OPS_TOMBSTONE_TTL_MS
+    ) {
+      // A point delete keeps key reuse exact at the 30-day boundary without a
+      // tenant scan; the counter trigger updates occupancy transactionally.
+      const deleted = await this.db
+        .prepare(
+          `DELETE FROM mcp_operations
+           WHERE operation_id = ? AND status = 'tombstone' AND updated_at = ?`,
+        )
+        .bind(operation.operation_id, operation.updated_at)
+        .run();
+      if (sqlChanges(deleted) >= 1) return null;
+      return this.getMcpOperation(operation.operation_id);
+    }
+    return operation;
   }
 
   async claimMcpOperationByIdempotency(
@@ -4565,11 +4631,7 @@ export class SqlStore implements ControlPlaneStore {
     | { outcome: "created"; op: McpOperationRecord }
     | { outcome: "existing"; op: McpOperationRecord }
   > {
-    // P0-B review: expire closed-window tombstones before the existing-row
-    // lookup. A tombstone older than MCP_OPS_TOMBSTONE_TTL_MS must not be
-    // returned as `existing` indefinitely — the documented lifecycle hard-
-    // deletes it and dispatches a retry as a new operation.
-    await this.expireExpiredMcpTombstones(op.tenant_id);
+    await this.compactMcpOperations(op.tenant_id);
     // Idempotent reuse must not be blocked by quota pressure on other keys.
     if (op.idempotency_key) {
       const existing = await this.getMcpOperationByIdempotency({
@@ -4580,55 +4642,9 @@ export class SqlStore implements ControlPlaneStore {
       });
       if (existing) return { outcome: "existing", op: existing };
     }
-    const byIdEarly = await this.getMcpOperation(op.operation_id);
-    if (byIdEarly) return { outcome: "existing", op: byIdEarly };
-
-    // INSERT OR IGNORE respects PK + partial unique idempotency index.
-    await this.enforceMcpOperationQuota(op.tenant_id);
+    // The counter predicate, INSERT, and trigger increment are one transaction.
     const bounded = boundMcpOperationRecord(op);
-    const result = await this.db
-      .prepare(
-        `INSERT INTO mcp_operations
-         (operation_id, tenant_id, principal_id, device_id, tool, status, summary,
-          data_json, truncated, next_cursor, approval_required, approval_url, approval_id,
-          session_id, warnings_json, correlation_id, payload_hash, idempotency_key,
-          workspace_id, expires_at, claim_version, action_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT DO NOTHING`,
-      )
-      .bind(
-        bounded.operation_id,
-        bounded.tenant_id,
-        bounded.principal_id,
-        bounded.device_id ?? null,
-        bounded.tool,
-        bounded.status,
-        bounded.summary,
-        JSON.stringify(bounded.data || {}),
-        bounded.truncated ? 1 : 0,
-        bounded.next_cursor ?? null,
-        bounded.approval_required ? 1 : 0,
-        bounded.approval_url ?? null,
-        bounded.approval_id ?? null,
-        bounded.session_id ?? null,
-        JSON.stringify(bounded.warnings || []),
-        bounded.correlation_id ?? null,
-        bounded.payload_hash ?? null,
-        bounded.idempotency_key ?? null,
-        bounded.workspace_id ?? null,
-        bounded.expires_at ?? null,
-        Number(bounded.claim_version ?? 0),
-        JSON.stringify(bounded.action || {}),
-        bounded.created_at,
-        bounded.updated_at,
-      )
-      .run();
-    const changes = Number(
-      (result as { meta?: { changes?: number }; changes?: number }).meta?.changes
-        ?? (result as { changes?: number }).changes
-        ?? 0,
-    );
-    if (changes >= 1) {
+    if (await this.insertMcpOperationIfUnderQuota(bounded)) {
       const created = await this.getMcpOperation(op.operation_id);
       if (!created) throw new Error(`mcp_operation_claim_missing:${op.operation_id}`);
       return { outcome: "created", op: created };
@@ -4645,7 +4661,11 @@ export class SqlStore implements ControlPlaneStore {
     }
     const byId = await this.getMcpOperation(op.operation_id);
     if (byId) return { outcome: "existing", op: byId };
-    throw new Error(`mcp_operation_claim_conflict:${op.operation_id}`);
+    // No uniqueness owner exists, so the atomic admission predicate refused
+    // the row. Never evict an unexpired receipt to make room.
+    throw new Error(
+      `mcp_operation_quota_exceeded:tenant=${op.tenant_id}:max=${this.mcpOpsLimit}`,
+    );
   }
 
   async updateMcpOperation(

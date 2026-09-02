@@ -18,7 +18,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, "..", "migrations");
 
 /** Adapt node:sqlite to the D1-like SqlDatabase interface. */
-function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
+function openSqliteStore(mcpOpsMaxPerTenant?: number): { db: DatabaseSync; store: SqlStore } {
   const db = new DatabaseSync(":memory:");
   const files = readdirSync(migrationsDir)
     .filter((f) => f.endsWith(".sql"))
@@ -81,7 +81,7 @@ function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
     },
   };
 
-  const store = new SqlStore(adapter, "sqlite");
+  const store = new SqlStore(adapter, "sqlite", { mcpOpsMaxPerTenant });
   return { db, store };
 }
 
@@ -109,9 +109,97 @@ test("all control-plane migrations apply cleanly on sqlite", () => {
     "device_verification_transactions",
     "revoked_refresh_families",
     "schema_migrations",
+    "mcp_operation_tenant_counters",
   ]) {
     assert.ok(names.includes(need), `missing table ${need}`);
   }
+});
+
+test("MCP admission and retention plans stay index-backed at 10k and 20k rows", async () => {
+  const plans: string[] = [];
+  for (const size of [10_000, 20_000]) {
+    const { db, store } = openSqliteStore(size);
+    try {
+      const stamp = new Date().toISOString();
+      db.prepare(
+        `WITH RECURSIVE seq(n) AS (
+           SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+         )
+         INSERT INTO mcp_operations
+           (operation_id, tenant_id, principal_id, device_id, tool, status, summary,
+            data_json, truncated, approval_required, warnings_json, correlation_id,
+            idempotency_key, created_at, updated_at)
+         SELECT printf('op_fixture_%05d', n), 'ten_fixture', 'prin_fixture', 'dev_fixture',
+                'ownmesh_fs_stat', 'completed', 'fixture', '{}', 0, 0, '[]',
+                printf('cor_fixture_%05d', n), printf('idem_fixture_%05d', n), ?, ?
+         FROM seq`,
+      ).run(size, stamp, stamp);
+
+      const quota = await store.getMcpOperationQuota("ten_fixture");
+      assert.equal(quota.rows, size);
+      assert.equal(quota.limit, size);
+
+      const detail = (
+        db.prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT * FROM mcp_operations
+           WHERE principal_id = ? AND tenant_id = ? AND device_id = ?
+             AND idempotency_key = ?
+           ORDER BY created_at DESC LIMIT 1`,
+        ).all("prin_fixture", "ten_fixture", "dev_fixture", "idem_fixture_00001") as Array<{
+          detail: string;
+        }>
+      ).map((row) => row.detail).join("\n");
+      assert.match(detail, /uq_mcp_ops_idempotency|idx_mcp_ops_idempotency/);
+      assert.doesNotMatch(detail, /SCAN mcp_operations/);
+
+      const retention = (
+        db.prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT operation_id FROM mcp_operations
+           WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?
+           ORDER BY updated_at, operation_id LIMIT ?`,
+        ).all("ten_fixture", stamp, 128) as Array<{ detail: string }>
+      ).map((row) => row.detail).join("\n");
+      assert.match(retention, /idx_mcp_ops_tombstone_expiry/);
+      assert.doesNotMatch(retention, /SCAN mcp_operations/);
+      plans.push(detail.replace(/\d+/g, "#"), retention.replace(/\d+/g, "#"));
+
+      await assert.rejects(
+        store.claimMcpOperationByIdempotency({
+          operation_id: `op_over_${size}`,
+          tenant_id: "ten_fixture",
+          principal_id: "prin_fixture",
+          device_id: "dev_fixture",
+          tool: "ownmesh_fs_stat",
+          status: "pending",
+          summary: "must fail closed at quota",
+          data: {},
+          truncated: false,
+          next_cursor: null,
+          approval_required: false,
+          warnings: [],
+          correlation_id: `op_over_${size}`,
+          idempotency_key: `idem_over_${size}`,
+          policy_authority: "ownmesh_device",
+          created_at: stamp,
+          updated_at: stamp,
+        }),
+        /mcp_operation_quota_exceeded/,
+      );
+
+      db.prepare("DELETE FROM mcp_operations WHERE operation_id = ?")
+        .run("op_fixture_00001");
+      const afterDelete = db.prepare(
+        `SELECT operation_count FROM mcp_operation_tenant_counters WHERE tenant_id = ?`,
+      ).get("ten_fixture") as { operation_count: number };
+      assert.equal(afterDelete.operation_count, size - 1);
+    } finally {
+      db.close();
+    }
+  }
+  assert.equal(plans[0], plans[2], "10k and 20k idempotency plans must match");
+  assert.equal(plans[1], plans[3], "10k and 20k retention plans must match");
 });
 
 test("SqlStore public transfer list returns the same owner-visible operation ids as status", async () => {

@@ -1,7 +1,7 @@
 {
   "name": "@ownmesh/control-plane",
   "private": true,
-  "version": "1.2.26",
+  "version": "1.2.27",
   "description": "OwnMesh Cloudflare Workers control plane",
   "license": "Apache-2.0",
   "type": "module",
@@ -42,10 +42,10 @@
     }
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260817.1",
+    "@cloudflare/workers-types": "^5.20260902.1",
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",
-    "wrangler": "^4.123.0"
+    "wrangler": "^4.128.0"
   },
   "dependencies": {
     "@simplewebauthn/server": "13.3.2"

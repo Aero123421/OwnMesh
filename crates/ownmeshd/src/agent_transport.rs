@@ -22,6 +22,7 @@ use ownmesh_protocol::{
     PROTOCOL_DEVICE_V1,
 };
 use ownmesh_transfer::TransferChunk;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -99,10 +100,29 @@ impl ReconnectBackoff {
         self.attempt = 0;
     }
 
-    fn next_delay(&mut self) -> Duration {
+    fn next_cap(&mut self) -> Duration {
         self.attempt = self.attempt.saturating_add(1).min(10);
         let shift = self.attempt.min(5);
         Duration::from_secs(1_u64 << shift).min(MAX_RECONNECT_DELAY)
+    }
+
+    fn next_delay_from_sample(&mut self, sample: u64) -> Duration {
+        let cap = self.next_cap();
+        let cap_millis = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX - 1);
+        Duration::from_millis(sample % cap_millis.saturating_add(1))
+    }
+
+    /// Full jitter prevents a Cloudflare recovery from synchronizing every
+    /// enrolled Agent on the same 2s/4s/8s reconnect boundaries.
+    fn next_delay(&mut self) -> Duration {
+        let mut bytes = [0_u8; 8];
+        let sample = if SystemRandom::new().fill(&mut bytes).is_ok() {
+            u64::from_le_bytes(bytes)
+        } else {
+            // Entropy failure must not disable reconnect or create a hot loop.
+            u64::MAX / 2
+        };
+        self.next_delay_from_sample(sample)
     }
 }
 
@@ -4397,20 +4417,35 @@ mod tests {
         let mut backoff = ReconnectBackoff::default();
 
         // Two failures before the ready handshake retain exponential backoff.
-        let first_delay = backoff.next_delay();
+        let first_delay = backoff.next_delay_from_sample(2_000);
         assert_eq!(first_delay, Duration::from_secs(2));
         paused_sleep_completes_after(first_delay).await;
 
-        let second_delay = backoff.next_delay();
+        let second_delay = backoff.next_delay_from_sample(4_000);
         assert_eq!(second_delay, Duration::from_secs(4));
         paused_sleep_completes_after(second_delay).await;
 
         // A peer disconnect after an authenticated ready session is a new
         // reconnect history, so its delay returns to the existing base delay.
         backoff.reset_after_ready();
-        let post_ready_delay = backoff.next_delay();
+        let post_ready_delay = backoff.next_delay_from_sample(2_000);
         assert_eq!(post_ready_delay, Duration::from_secs(2));
         paused_sleep_completes_after(post_ready_delay).await;
+    }
+
+    #[test]
+    fn reconnect_backoff_applies_full_jitter_inside_each_cap() {
+        let mut minimum = ReconnectBackoff::default();
+        assert_eq!(minimum.next_delay_from_sample(0), Duration::ZERO);
+
+        let mut middle = ReconnectBackoff::default();
+        assert_eq!(middle.next_delay_from_sample(1_000), Duration::from_secs(1));
+
+        let mut maximum = ReconnectBackoff::default();
+        assert_eq!(
+            maximum.next_delay_from_sample(2_000),
+            Duration::from_secs(2)
+        );
     }
 
     async fn paused_sleep_completes_after(delay: Duration) {
