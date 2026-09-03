@@ -88,10 +88,11 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
       connection_id: helloReplies[0]?.payload.connection_id,
     }),
   );
-  assert.equal(
-    (JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope).type,
-    "accepted",
-  );
+  const accepted = JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope;
+  assert.equal(accepted.type, "accepted");
+  assert.equal(accepted.payload.session_parameters &&
+    (accepted.payload.session_parameters as Record<string, unknown>).operation_commit_reconcile,
+  true);
 
   const ready = await room.send(
     agent,
@@ -123,6 +124,19 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
   });
   assert.deepEqual(ready.agent_pending_correlations, ["op_terminal_from_agent"]);
   assert.equal((JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope).type, "ready.ack");
+
+  const reconciliation = await room.send(
+    agent,
+    envFor(agent, "operation.reconcile.request", deviceId, {
+      operation_ids: ["op_terminal_from_agent", "op_missing_from_agent"],
+    }, "op_missing_from_agent"),
+  );
+  assert.deepEqual(reconciliation.operation_reconcile_request, {
+    session_id: agent,
+    operation_ids: ["op_terminal_from_agent", "op_missing_from_agent"],
+    correlation_id: "op_missing_from_agent",
+  });
+  assert.equal(room.drain(agent).length, 0);
 
   // client operation -> agent
   const corr = randomId("op_");

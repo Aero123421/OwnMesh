@@ -47,6 +47,14 @@ admission cap.
 9. Agent reconnect uses bounded full jitter. Observability persistence remains
    opt-in in the operator's Cloudflare account; OAuth query-bearing invocation
    logs are not enabled by the shipped default.
+10. From v1.2.31, `audit_events` uses the same constant-cost pattern: a
+    migration-backfilled per-tenant counter with transactional triggers,
+    atomic quota admission, a five-minute maintenance lease, and one
+    `(tenant_id, created_at, id)` indexed delete batch of at most 128 rows.
+    The default retention is 30 days, the default tenant cap is 50,000 rows,
+    deployment overrides have hard ceilings, and each stored summary is
+    bounded. Audit retention therefore cannot grow indefinitely or turn an
+    append into a table-size-dependent scan.
 
 ## Consequences
 

@@ -115,6 +115,17 @@ replay against.
    startup. Entries the runtime refuses to replay/compact/evict (unknown
    forward-version state, malformed state values, or non-object entries) are
    counted as uncertain and never reported healthy.
+5. **A completed remote receipt may be removed early only after a durable
+   control-plane commit acknowledgement.** From v1.2.31, DeviceRoom sends an
+   authenticated `operation.reconcile` acknowledgement only after the matching
+   terminal `mcp_operations` row and the room sequence are durable. On
+   reconnect the Agent offers completed operation ids in pages of at most 64;
+   DeviceRoom confirms them with point lookups bound to the same device. The
+   Agent then atomically removes only exact-id, positively completed receipts.
+   Missing, non-terminal, foreign-device, in-progress, and unknown-state
+   entries are never removed. The feature is advertised in
+   `accepted.session_parameters`, so a new Agent never sends the additive
+   request to an older control plane.
 
 ## Consequences
 
@@ -135,7 +146,9 @@ replay against.
 - Replayed payloads may include the additive `__ownmesh_completed_unix`
   field (alongside the existing `replayed` marker).
 - Long-lived daemons stay far below the hard byte cap because the durable
-  file holds receipts, not bodies.
+  file holds receipts, not bodies. A connected v1.2.31+ deployment normally
+  reclaims committed remote receipts promptly; the 30-day rule remains the
+  fallback when acknowledgement is unavailable.
 
 ## Alternatives considered
 

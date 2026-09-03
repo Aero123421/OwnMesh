@@ -31,6 +31,58 @@ export const REFRESH_TOKEN_IDLE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 /** Do not turn reconnect churn into a D1 write stream when metadata is unchanged. */
 export const DEVICE_READY_WRITE_INTERVAL_MS = 60_000;
 
+/** Default audit-event retention. Old rows are removed in bounded batches. */
+export const AUDIT_RETENTION_DAYS_DEFAULT = 30;
+/** A deployment override cannot accidentally turn retention into infinity. */
+export const AUDIT_RETENTION_DAYS_HARD_CEILING = 365;
+/** Default per-tenant audit-event row cap. */
+export const AUDIT_MAX_PER_TENANT_DEFAULT = 50_000;
+/** Absolute ceiling for an operator-provided audit row cap. */
+export const AUDIT_MAX_PER_TENANT_HARD_CEILING = 1_000_000;
+/** Constant-cost audit retention work per append. */
+export const AUDIT_MAINTENANCE_BATCH = 128;
+/** Avoid turning every audit append into a retention write when caught up. */
+export const AUDIT_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
+/** Bound each durable audit summary (including serialized metadata). */
+export const AUDIT_MAX_SUMMARY_CHARS = 4_096;
+
+export type AuditStoreOptions = {
+  auditRetentionDays?: number | string | null;
+  auditMaxPerTenant?: number | string | null;
+};
+
+function parsePositiveBoundedInteger(
+  raw: number | string | null | undefined,
+  fallback: number,
+  ceiling: number,
+): number {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (!Number.isSafeInteger(n) || n < 1) return fallback;
+  return Math.min(n, ceiling);
+}
+
+export function parseAuditRetentionDays(raw?: number | string | null): number {
+  return parsePositiveBoundedInteger(
+    raw,
+    AUDIT_RETENTION_DAYS_DEFAULT,
+    AUDIT_RETENTION_DAYS_HARD_CEILING,
+  );
+}
+
+export function parseAuditMaxPerTenant(raw?: number | string | null): number {
+  return parsePositiveBoundedInteger(
+    raw,
+    AUDIT_MAX_PER_TENANT_DEFAULT,
+    AUDIT_MAX_PER_TENANT_HARD_CEILING,
+  );
+}
+
+function boundAuditSummary(summary: string): string {
+  if (summary.length <= AUDIT_MAX_SUMMARY_CHARS) return summary;
+  return `${summary.slice(0, AUDIT_MAX_SUMMARY_CHARS - 1)}…`;
+}
+
 export type TokenRecord = {
   access_token: string;
   refresh_token: string;
@@ -394,7 +446,7 @@ export const PENDING_APPROVAL_LIST_LIMIT = 32;
 export const MCP_OPS_QUOTA_PRESSURE_RATIO = 0.6;
 export const MCP_OPS_QUOTA_PRESSURE_WARNING = "mcp_ops_quota_pressure";
 
-export type McpOpsStoreOptions = {
+export type McpOpsStoreOptions = AuditStoreOptions & {
   mcpOpsMaxPerTenant?: number | string | null;
 };
 
@@ -1052,7 +1104,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0017). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0020). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -1073,6 +1125,8 @@ export type SchemaReadiness = {
     mcp_operations: boolean;
     /** 0019 constant-cost MCP operation admission and retention lease */
     mcp_operation_tenant_counters: boolean;
+    /** 0020 bounded audit retention and constant-cost admission */
+    audit_event_tenant_counters: boolean;
     mcp_approval_transactions: boolean;
     mcp_approval_outbox: boolean;
     /** 0012 server-owned principal OAuth credential generation */
@@ -1280,6 +1334,10 @@ const SCHEMA_READINESS_OBJECTS: Record<
     table: "mcp_operation_tenant_counters",
     columns: ["tenant_id", "operation_count", "maintenance_after"],
   },
+  audit_event_tenant_counters: {
+    table: "audit_event_tenant_counters",
+    columns: ["tenant_id", "event_count", "maintenance_after"],
+  },
   mcp_approval_transactions: {
     table: "mcp_approval_transactions",
     columns: [
@@ -1365,6 +1423,8 @@ const DEFAULT_TENANT = "ten_default";
 export class MemoryStore implements ControlPlaneStore {
   readonly kind = "memory" as const;
   private readonly mcpOpsLimit: number;
+  private readonly auditRetentionMs: number;
+  private readonly auditLimit: number;
   clients = new Map<string, OAuthClientRecord>();
   ownerPasskeys = new Map<string, OwnerPasskeyRecord>();
   ownerAuthChallenges = new Map<string, OwnerAuthChallenge>();
@@ -1394,6 +1454,8 @@ export class MemoryStore implements ControlPlaneStore {
 
   constructor(opts?: McpOpsStoreOptions) {
     this.mcpOpsLimit = parseMcpOpsMaxPerTenant(opts?.mcpOpsMaxPerTenant);
+    this.auditRetentionMs = parseAuditRetentionDays(opts?.auditRetentionDays) * 24 * 60 * 60 * 1000;
+    this.auditLimit = parseAuditMaxPerTenant(opts?.auditMaxPerTenant);
   }
 
   mcpOpsMaxPerTenant(): number {
@@ -2009,7 +2071,22 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async appendAudit(event: AuditEvent): Promise<void> {
-    this.audits.push(event);
+    const cutoff = Date.now() - this.auditRetentionMs;
+    this.audits = this.audits.filter((entry) => {
+      if (entry.tenant_id !== event.tenant_id) return true;
+      const created = Date.parse(entry.created_at);
+      return !Number.isFinite(created) || created >= cutoff;
+    });
+    const tenantCount = this.audits.reduce(
+      (count, entry) => count + (entry.tenant_id === event.tenant_id ? 1 : 0),
+      0,
+    );
+    if (tenantCount >= this.auditLimit) {
+      throw new Error(
+        `audit_event_quota_exceeded:tenant=${event.tenant_id}:max=${this.auditLimit}`,
+      );
+    }
+    this.audits.push({ ...event, summary: boundAuditSummary(event.summary) });
   }
   async listAudit(tenantId: string, limit = 50): Promise<AuditEvent[]> {
     return this.audits
@@ -2767,7 +2844,7 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async schemaReadiness(): Promise<SchemaReadiness> {
-    // In-memory store always carries the full logical 0002–0017 schema.
+    // In-memory store always carries the full logical 0002–0020 schema.
     const checks = Object.fromEntries(
       Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, true]),
     ) as SchemaReadiness["checks"];
@@ -2801,6 +2878,8 @@ export class SqlStore implements ControlPlaneStore {
   readonly kind: "d1" | "sqlite";
   private db: SqlDatabase;
   private readonly mcpOpsLimit: number;
+  private readonly auditRetentionMs: number;
+  private readonly auditLimit: number;
   /** plaintext access/refresh kept only for the lifetime of this isolate when issued here.
    * Lookups always go through hash in SQL. For getAccess we need the plaintext from the
    * Authorization header — we hash it and look up. */
@@ -2808,6 +2887,8 @@ export class SqlStore implements ControlPlaneStore {
     this.db = db;
     this.kind = kind;
     this.mcpOpsLimit = parseMcpOpsMaxPerTenant(opts?.mcpOpsMaxPerTenant);
+    this.auditRetentionMs = parseAuditRetentionDays(opts?.auditRetentionDays) * 24 * 60 * 60 * 1000;
+    this.auditLimit = parseAuditMaxPerTenant(opts?.auditMaxPerTenant);
   }
 
   mcpOpsMaxPerTenant(): number {
@@ -4331,14 +4412,20 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   async appendAudit(event: AuditEvent): Promise<void> {
-    const summary =
+    await this.compactAuditEvents(event.tenant_id);
+    const summary = boundAuditSummary(
       event.meta && Object.keys(event.meta).length
         ? `${event.summary} | ${JSON.stringify(event.meta)}`
-        : event.summary;
-    await this.db
+        : event.summary,
+    );
+    const inserted = await this.db
       .prepare(
         `INSERT INTO audit_events (id, tenant_id, principal_id, device_id, kind, summary, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, ?, ?
+         WHERE COALESCE((
+           SELECT event_count FROM audit_event_tenant_counters WHERE tenant_id = ?
+         ), 0) < ?
+         ON CONFLICT DO NOTHING`,
       )
       .bind(
         event.id,
@@ -4348,8 +4435,20 @@ export class SqlStore implements ControlPlaneStore {
         event.kind,
         summary,
         event.created_at,
+        event.tenant_id,
+        this.auditLimit,
       )
       .run();
+    if (sqlChanges(inserted) < 1) {
+      const existing = await this.db
+        .prepare(`SELECT id FROM audit_events WHERE id = ? LIMIT 1`)
+        .bind(event.id)
+        .first<{ id: string }>();
+      if (existing) throw new Error(`audit_event_exists:${event.id}`);
+      throw new Error(
+        `audit_event_quota_exceeded:tenant=${event.tenant_id}:max=${this.auditLimit}`,
+      );
+    }
   }
 
   async listAudit(tenantId: string, limit = 50): Promise<AuditEvent[]> {
@@ -4361,6 +4460,48 @@ export class SqlStore implements ControlPlaneStore {
       .bind(tenantId, limit)
       .all<AuditEvent>();
     return res.results || [];
+  }
+
+  /**
+   * Acquire a per-tenant lease and delete at most one indexed batch. If work
+   * remains, reset the lease so the next append continues draining it.
+   */
+  private async compactAuditEvents(tenantId: string): Promise<void> {
+    const now = Date.now();
+    const cutoff = new Date(now - this.auditRetentionMs).toISOString();
+    const maintenanceAfter = new Date(now + AUDIT_MAINTENANCE_INTERVAL_MS).toISOString();
+    const lease = await this.db
+      .prepare(
+        `UPDATE audit_event_tenant_counters
+         SET maintenance_after = ?
+         WHERE tenant_id = ? AND maintenance_after <= ?
+         RETURNING tenant_id`,
+      )
+      .bind(maintenanceAfter, tenantId, new Date(now).toISOString())
+      .first<{ tenant_id: string }>();
+    if (!lease) return;
+
+    const deleted = await this.db
+      .prepare(
+        `DELETE FROM audit_events
+         WHERE id IN (
+           SELECT id FROM audit_events
+           WHERE tenant_id = ? AND created_at < ?
+           ORDER BY created_at, id LIMIT ?
+         )`,
+      )
+      .bind(tenantId, cutoff, AUDIT_MAINTENANCE_BATCH)
+      .run();
+    if (sqlChanges(deleted) > 0) {
+      await this.db
+        .prepare(
+          `UPDATE audit_event_tenant_counters
+           SET maintenance_after = '1970-01-01T00:00:00.000Z'
+           WHERE tenant_id = ?`,
+        )
+        .bind(tenantId)
+        .run();
+    }
   }
 
   /**
@@ -5598,7 +5739,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Probe 0002–0017 tables, required columns (SELECT projections), and indexes
+   * Probe 0002–0020 tables, required columns (SELECT projections), and indexes
    * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {
@@ -5842,10 +5983,14 @@ export class MissingD1Error extends Error {
 export function createStore(env: {
   DB?: D1Database;
   MCP_OPS_MAX_PER_TENANT?: string;
+  AUDIT_RETENTION_DAYS?: string;
+  AUDIT_MAX_PER_TENANT?: string;
 }): ControlPlaneStore {
   if (env.DB) {
     return new SqlStore(env.DB as unknown as SqlDatabase, "d1", {
       mcpOpsMaxPerTenant: env.MCP_OPS_MAX_PER_TENANT,
+      auditRetentionDays: env.AUDIT_RETENTION_DAYS,
+      auditMaxPerTenant: env.AUDIT_MAX_PER_TENANT,
     });
   }
   throw new MissingD1Error();

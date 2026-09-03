@@ -439,6 +439,12 @@ export type HandleMessageResult = {
   agent_ready_session_id?: string;
   /** Agent-local crash outbox correlations offered for authoritative cleanup. */
   agent_pending_correlations?: string[];
+  /** Bounded completed-receipt page offered by a ready authenticated Agent. */
+  operation_reconcile_request?: {
+    session_id: string;
+    operation_ids: string[];
+    correlation_id?: string;
+  };
   /** Metadata observed only after this Agent has completed proof and ready. */
   authenticated_agent?: {
     agent_version?: string;
@@ -1243,6 +1249,9 @@ export class DeviceRoomRouter {
             session_parameters: {
               heartbeat_sec: 30,
               max_payload_bytes: MAX_PAYLOAD_BYTES,
+              // Additive feature advertisement: newer Agents only send the
+              // reconciliation request when the server explicitly supports it.
+              operation_commit_reconcile: true,
             },
           },
           msg.correlation_id,
@@ -1466,6 +1475,31 @@ export class DeviceRoomRouter {
           },
         });
         return { ok: true };
+      }
+      case "operation.reconcile.request": {
+        if (att.role !== "agent" || att.phase !== "ready") {
+          return { ok: false, error: "invalid_state" };
+        }
+        if (
+          !msg.payload ||
+          typeof msg.payload !== "object" ||
+          Array.isArray(msg.payload) ||
+          Object.keys(msg.payload).length !== 1
+        ) {
+          return { ok: false, error: "invalid_operation_reconcile_request" };
+        }
+        const operationIds = readyPendingCorrelations(msg.payload.operation_ids);
+        if (!operationIds || operationIds.length === 0) {
+          return { ok: false, error: "invalid_operation_reconcile_request" };
+        }
+        return {
+          ok: true,
+          operation_reconcile_request: {
+            session_id: sessionId,
+            operation_ids: operationIds,
+            ...(msg.correlation_id ? { correlation_id: msg.correlation_id } : {}),
+          },
+        };
       }
       case "workspace.registry": {
         // #146: incremental registry refresh from a live ready agent. The
@@ -2514,6 +2548,18 @@ export class DeviceRoom {
     correlations: string[],
   ): Promise<void> {
     if (!this.env.DB || correlations.length === 0) return;
+    const terminalCorrelations = await this.authoritativeTerminalCorrelations(correlations);
+    if (terminalCorrelations.length === 0) return;
+    const envelope = this.router.nextEnvelope("operation.reconcile", {
+      terminal_correlations: terminalCorrelations,
+    });
+    // A failed send is safe: the Agent reports the still-durable correlations
+    // again on its next authenticated ready handshake.
+    this.router.sendToSession(sessionId, JSON.stringify(envelope));
+  }
+
+  private async authoritativeTerminalCorrelations(correlations: string[]): Promise<string[]> {
+    if (!this.env.DB || correlations.length === 0) return [];
     const store = createStore(this.env);
     const terminalCorrelations: string[] = [];
     for (const correlation of correlations) {
@@ -2525,13 +2571,7 @@ export class DeviceRoom {
         terminalCorrelations.push(correlation);
       }
     }
-    if (terminalCorrelations.length === 0) return;
-    const envelope = this.router.nextEnvelope("operation.reconcile", {
-      terminal_correlations: terminalCorrelations,
-    });
-    // A failed send is safe: the Agent reports the still-durable correlations
-    // again on its next authenticated ready handshake.
-    this.router.sendToSession(sessionId, JSON.stringify(envelope));
+    return terminalCorrelations;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -3231,6 +3271,7 @@ export class DeviceRoom {
         preview?.type === "operation.result" ||
         preview?.type === "operation.event" ||
         preview?.type === "operation.progress" ||
+        preview?.type === "operation.reconcile.request" ||
         preview?.type === "proof" ||
         // #146: a registry refresh mutates durable device state.
         preview?.type === "workspace.registry" ||
@@ -3278,6 +3319,12 @@ export class DeviceRoom {
     }
 
     const result = await this.router.handleMessage(sessionId, text);
+    let deferredOperationCommitAck:
+      | { session_id: string; frame: string }
+      | undefined;
+    let deferredOperationReconcileAck:
+      | { session_id: string; frame: string }
+      | undefined;
     const updatedAttachment = this.router.sessions.get(sessionId);
     if (updatedAttachment) {
       const guard = this.router.ingressGuards.get(sessionId);
@@ -3344,6 +3391,34 @@ export class DeviceRoom {
       }
     }
 
+    if (result.ok && result.operation_reconcile_request) {
+      if (!this.env.DB) {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+      try {
+        const checked = result.operation_reconcile_request.operation_ids;
+        const terminal = await this.authoritativeTerminalCorrelations(checked);
+        const ack = this.router.nextEnvelope(
+          "operation.reconcile",
+          {
+            checked_correlations: checked,
+            terminal_correlations: terminal,
+          },
+          result.operation_reconcile_request.correlation_id,
+        );
+        deferredOperationReconcileAck = {
+          session_id: result.operation_reconcile_request.session_id,
+          frame: JSON.stringify(ack),
+        };
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+    }
+
     // operation.result: bind + CAS-persist BEFORE forward/pending removal.
     if (result.ok && result.mcp_result) {
       const corr = result.mcp_result.correlation_id;
@@ -3390,6 +3465,18 @@ export class DeviceRoom {
         if (corr && result.deferred_forward) {
           this.router.finalizeOperationResult(corr, result.deferred_forward);
         }
+        if (
+          applied.record &&
+          OPERATION_DISPATCH_FENCE_STATUSES.has(applied.record.status)
+        ) {
+          const ack = this.router.nextEnvelope("operation.reconcile", {
+            terminal_correlations: [applied.record.operation_id],
+          });
+          deferredOperationCommitAck = {
+            session_id: sessionId,
+            frame: JSON.stringify(ack),
+          };
+        }
       } catch (err) {
         // Store write failure: fail closed, no success forward.
         this.storageBroken = true;
@@ -3429,6 +3516,18 @@ export class DeviceRoom {
     // durable. Every failure path before here returns without an ACK.
     if (result.ok && result.deferred_workspace_registry_ack) {
       this.router.finalizeWorkspaceRegistryAck(result.deferred_workspace_registry_ack);
+    }
+    if (deferredOperationReconcileAck) {
+      this.router.sendToSession(
+        deferredOperationReconcileAck.session_id,
+        deferredOperationReconcileAck.frame,
+      );
+    }
+    if (deferredOperationCommitAck) {
+      this.router.sendToSession(
+        deferredOperationCommitAck.session_id,
+        deferredOperationCommitAck.frame,
+      );
     }
 
     // Close decision stays in the DO; router remains pure/testable.

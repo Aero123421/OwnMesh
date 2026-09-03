@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.30 · **Last updated:** 2026-09-03
+**Baseline:** v1.2.31 · **Last updated:** 2026-09-03
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -23,6 +23,12 @@ Cloudflare request-cost hardening shipped in v1.2.27 (ADR 0019): D1 operation
 admission and retention are table-size independent, MCP waits and uncertain
 delivery retries are bounded, long-command correlation TTLs align with admitted
 timeouts, and Agent reconnect uses jitter.
+
+The v1.2.31 maintenance path lets an authenticated control plane acknowledge
+durably committed terminal results so a device can reclaim completed journal
+receipts without weakening exact-once state. D1 audit metadata is also bounded
+by TTL, per-tenant admission, bounded summaries, and indexed maintenance
+batches (ADR 0020).
 
 ChatGPT CIMD interoperability was refreshed in v1.2.29: OwnMesh negotiates the
 current plural token-auth capability list and continues to select only the

@@ -1,8 +1,8 @@
 # OwnMesh 1.x Definition of Done — release-quality audit
 
-**Release train:** v1.2.30 baseline
+**Release train:** v1.2.31 baseline
 
-**Audit date:** 2026-09-02
+**Audit date:** 2026-09-03
 
 **Authority:** `OWNMESH_SPECIFICATION.ja.md` §33 and the shipped-surface registry
 
@@ -11,7 +11,7 @@
 
 ## Conclusion
 
-OwnMesh v1.2.30 is a stable release for the product surface admitted by the
+OwnMesh v1.2.31 is a stable release for the product surface admitted by the
 machine-checked registry. The Rust unsupported registries and the manifest both
 contain zero intentionally unimplemented CLI surfaces. Parser acceptance alone
 does not count: the admitted commands have fail-closed handlers and the relevant
@@ -79,7 +79,7 @@ v1.2.16 stable product surface.
 - `scripts/check_release_quality.py` checks the publish graph, fail-closed
   workflow patterns, exact-artifact E2E dependency, toolchain/version alignment,
   release-note selection, and the registry-backed surface manifest. For the
-  v1.2.30 baseline the unsupported CLI count and surface-specific evidence
+  v1.2.31 baseline the unsupported CLI count and surface-specific evidence
   waiver count are both zero.
 - Release tags are annotated. Per
   [ADR 0001](./adr/0001-release-signing-sbom-provenance.md) they are also

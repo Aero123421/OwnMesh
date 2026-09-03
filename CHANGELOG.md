@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v1.2.31 — Acknowledged journal reclamation and bounded audit storage
+
+- Added an authenticated, feature-negotiated control-plane acknowledgement for
+  terminal results. Agents reclaim only exact completed receipts confirmed in
+  D1; in-progress, uncertain, missing, and foreign-device entries remain
+  fail-closed.
+- Added bounded reconnect reconciliation in pages of 64 so existing full
+  journals recover automatically after upgrade without manual deletion.
+- Added a 30-day default TTL, 50,000-row per-tenant cap, bounded summaries,
+  transactional counters, and indexed 128-row maintenance batches for D1
+  audit metadata.
+- Added migration, protocol, persistence, rollback, quota, and query-plan
+  regression coverage.
+
 ## v1.2.30 — ChatGPT stable CIMD refresh tokens
 
 - Recognized ChatGPT's stable CIMD client ID and callback as an exact OAuth

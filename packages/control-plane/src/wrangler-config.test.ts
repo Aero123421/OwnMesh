@@ -78,5 +78,7 @@ test("wrangler.jsonc has D1 + DeviceRoom and no R2/TURN bindings", () => {
 
   const vars = cfg.vars as Record<string, string>;
   assert.equal(vars.MCP_OPS_MAX_PER_TENANT, "20000");
+  assert.equal(vars.AUDIT_RETENTION_DAYS, "30");
+  assert.equal(vars.AUDIT_MAX_PER_TENANT, "50000");
   assert.equal(vars.MCP_MAX_TIMEOUT_MS, "300000");
 });

@@ -98,6 +98,8 @@ export interface Env {
   OWNMESH_ALLOWED_ORIGINS?: string;
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
   MCP_OPS_MAX_PER_TENANT?: string;
+  AUDIT_RETENTION_DAYS?: string;
+  AUDIT_MAX_PER_TENANT?: string;
   MCP_MAX_TIMEOUT_MS?: string;
   AUTH_RATE_LIMITER?: RateLimitBinding;
   MCP_RATE_LIMITER?: RateLimitBinding;

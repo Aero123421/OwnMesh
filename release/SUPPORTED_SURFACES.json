@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "release_train": "1.2.30",
+  "release_train": "1.2.31",
   "completeness_claim": true,
   "supported": [
     "status",
@@ -31,5 +31,5 @@
   "additional_unsupported": [],
   "release_evidence_waivers": [],
   "total_unsupported_surfaces": 0,
-  "notes": "v1.2.30 surface contract. OwnMesh exposes generic exact-program command, process, PTY, and session capabilities; it does not ship first-class coding-agent profiles or vendor-specific adapters. External CLIs may be launched only through the same exact program/args, workspace, policy, approval, replay, and audit boundaries as any other executable. A workspace or cwd binding is not an operating-system sandbox. OwnMesh authorizes the external process/session boundary and does not observe or authorize vendor-internal tool actions. Legacy Profile RPC/session fields are rejected explicitly, and persisted Profile sessions are discarded rather than guessed into generic sessions. MCP catalog v2 records this intentional removal. Cloudflare operation admission, retention, waits, uncertain-delivery retries, outage responses, and Agent reconnect are bounded under ADR 0019. ChatGPT CIMD authentication-method negotiation follows the plural capability list while the OwnMesh token endpoint remains public-client-only. ChatGPT's stable CIMD client/callback pair receives rotating refresh tokens without weakening exact client or redirect matching."
+  "notes": "v1.2.31 surface contract. OwnMesh exposes generic exact-program command, process, PTY, and session capabilities; it does not ship first-class coding-agent profiles or vendor-specific adapters. External CLIs may be launched only through the same exact program/args, workspace, policy, approval, replay, and audit boundaries as any other executable. A workspace or cwd binding is not an operating-system sandbox. OwnMesh authorizes the external process/session boundary and does not observe or authorize vendor-internal tool actions. Legacy Profile RPC/session fields are rejected explicitly, and persisted Profile sessions are discarded rather than guessed into generic sessions. MCP catalog v2 records this intentional removal. Cloudflare operation admission, retention, waits, uncertain-delivery retries, outage responses, and Agent reconnect are bounded under ADR 0019. ChatGPT CIMD authentication-method negotiation follows the plural capability list while the OwnMesh token endpoint remains public-client-only. ChatGPT's stable CIMD client/callback pair receives rotating refresh tokens without weakening exact client or redirect matching. Authenticated control-plane acknowledgements reclaim only D1-confirmed completed device receipts, while D1 audit metadata has bounded TTL, per-tenant admission, summary size, and indexed maintenance under ADR 0020."
 }

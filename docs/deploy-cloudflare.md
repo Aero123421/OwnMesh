@@ -69,6 +69,8 @@ curl http://127.0.0.1:8787/health
 | `ALLOW_DYNAMIC_CLIENT_REGISTRATION` | optional, default `true` | Enables one-URL ChatGPT setup. Exact ChatGPT public callbacks register statelessly; all other DCR requires a tenant `ownmesh.device` token. Set `false` to require manual client provisioning. |
 | `OWNMESH_ALLOWED_ORIGINS` | optional | Comma-separated additional exact origins accepted by device WebSockets. The issuer origin is accepted automatically. |
 | `MCP_OPS_MAX_PER_TENANT` | optional, default `20000` | Per-tenant cap on durable `mcp_operations` rows (live ops + unexpired keyed idempotency tombstones). Invalid values fail closed to `20000`. At 60% utilization, MCP tool responses include `mcp_ops_quota_pressure` and `ownmesh_system_diagnose` reports `control_plane.mcp_ops_quota`. Exhaustion remains fail-closed (`OWNMESH_E_MCP_OP_QUOTA`). |
+| `AUDIT_RETENTION_DAYS` | optional, default `30` | Audit metadata retention in days. Values above 365 are clamped; invalid values use 30. Cleanup is amortized in indexed batches. |
+| `AUDIT_MAX_PER_TENANT` | optional, default `50000` | Hard admission cap for retained audit rows per tenant. Values above 1,000,000 are clamped; invalid values use 50,000. At the cap, the audit append fails closed instead of growing D1 indefinitely. |
 | `MCP_MAX_TIMEOUT_MS` | optional, default `300000` | Synchronous `timeout_ms` clamp for `command_run` / `command_shell`. Invalid values fail closed to `300000`. Hard ceiling is `3600000` (1 hour). Detached commands (`detach: true`) ignore this clamp and use a 24-hour correlation TTL instead of the five-minute dispatch expiry. |
 | `SESSION_SECRET` | **required** | Signs owner sessions and internal Worker→DO contexts. `owner:init` creates it if absent. **Do not commit secrets.** |
 
