@@ -1680,7 +1680,8 @@ async fn connect_and_run(
     } else {
         None
     };
-    perform_handshake(&mut socket, config, state, workspace_registry.as_ref()).await?;
+    let operation_commit_reconcile =
+        perform_handshake(&mut socket, config, state, workspace_registry.as_ref()).await?;
     *reached_ready = true;
     // The authenticated ready session is live: this is the same condition the
     // control plane reports to MCP clients as `connection_status` (#141).
@@ -1694,7 +1695,15 @@ async fn connect_and_run(
         "Agent WebSocket authenticated and ready"
     );
     publish_orphan_completions(&mut socket, config, state).await?;
-    live_loop(&mut socket, config, runtime, state, shutdown).await
+    live_loop(
+        &mut socket,
+        config,
+        runtime,
+        state,
+        shutdown,
+        operation_commit_reconcile,
+    )
+    .await
 }
 
 async fn perform_handshake(
@@ -1702,7 +1711,7 @@ async fn perform_handshake(
     config: &AgentTransportConfig,
     state: &mut AgentTransportState,
     workspace_registry: Option<&(bool, Vec<crate::runtime::RemoteWorkspaceRegistration>)>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let remote_routing_enabled = workspace_registry.is_some();
     let resume = json!({
         "last_server_seq": state.last_server_seq,
@@ -1748,6 +1757,13 @@ async fn perform_handshake(
     {
         return Err("control plane selected an unsupported device protocol".into());
     }
+    let operation_commit_reconcile = accepted
+        .payload
+        .get("session_parameters")
+        .and_then(Value::as_object)
+        .and_then(|parameters| parameters.get("operation_commit_reconcile"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let capabilities = if remote_routing_enabled {
         json!([
             "filesystem.read",
@@ -1787,7 +1803,7 @@ async fn perform_handshake(
     }
     send_envelope(socket, config, state, "ready", ready_payload, None).await?;
     let _ = wait_for_type(socket, config, state, "ready.ack").await?;
-    Ok(())
+    Ok(operation_commit_reconcile)
 }
 
 async fn wait_for_type(
@@ -1882,17 +1898,15 @@ fn operation_expired_reply(operation_id: &ownmesh_domain::OperationId) -> Value 
     })
 }
 
-fn authoritative_terminal_correlations(payload: &Value) -> Result<Vec<String>, String> {
-    let object = payload
-        .as_object()
-        .ok_or_else(|| "operation.reconcile payload must be an object".to_owned())?;
-    if object.keys().any(|key| key != "terminal_correlations") {
-        return Err("operation.reconcile payload contains an unknown field".into());
-    }
-    let correlations = object
-        .get("terminal_correlations")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "operation.reconcile requires terminal_correlations".to_owned())?;
+struct OperationReconcileAck {
+    terminal: Vec<String>,
+    checked: Option<Vec<String>>,
+}
+
+fn validated_operation_ids(value: &Value, field: &str) -> Result<Vec<String>, String> {
+    let correlations = value
+        .as_array()
+        .ok_or_else(|| format!("operation.reconcile {field} must be an array"))?;
     if correlations.len() > MAX_PENDING_DISPATCHES {
         return Err(format!(
             "operation.reconcile exceeds {MAX_PENDING_DISPATCHES} correlations"
@@ -1913,6 +1927,41 @@ fn authoritative_terminal_correlations(payload: &Value) -> Result<Vec<String>, S
         validated.push(parsed.to_string());
     }
     Ok(validated)
+}
+
+fn authoritative_terminal_correlations(payload: &Value) -> Result<OperationReconcileAck, String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "operation.reconcile payload must be an object".to_owned())?;
+    if object
+        .keys()
+        .any(|key| key != "terminal_correlations" && key != "checked_correlations")
+    {
+        return Err("operation.reconcile payload contains an unknown field".into());
+    }
+    let terminal = validated_operation_ids(
+        object
+            .get("terminal_correlations")
+            .ok_or_else(|| "operation.reconcile requires terminal_correlations".to_owned())?,
+        "terminal_correlations",
+    )?;
+    let checked = object
+        .get("checked_correlations")
+        .map(|value| validated_operation_ids(value, "checked_correlations"))
+        .transpose()?;
+    if let Some(checked) = &checked {
+        let offered = checked.iter().map(String::as_str).collect::<HashSet<_>>();
+        if terminal.iter().any(|id| !offered.contains(id.as_str())) {
+            return Err("operation.reconcile terminal correlation was not checked".into());
+        }
+    }
+    Ok(OperationReconcileAck { terminal, checked })
+}
+
+struct OperationReconcileScan {
+    enabled: bool,
+    after: Option<String>,
+    request_correlation: Option<String>,
 }
 
 fn validate_workspace_registry_ack(payload: &Value) -> Result<(), String> {
@@ -1959,6 +2008,7 @@ async fn live_loop(
     runtime: Option<&Arc<Mutex<DaemonRuntime>>>,
     state: &mut AgentTransportState,
     shutdown: &mut watch::Receiver<bool>,
+    operation_commit_reconcile: bool,
 ) -> Result<(), String> {
     let mut heartbeat = tokio::time::interval(DEFAULT_HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1971,6 +2021,11 @@ async fn live_loop(
     let active_dispatches = Arc::clone(&config.in_process_dispatches);
     // #146: set when the device-local registry changed mid-session.
     let mut registry_dirty = false;
+    let mut reconcile_scan = OperationReconcileScan {
+        enabled: operation_commit_reconcile && runtime.is_some(),
+        after: None,
+        request_correlation: None,
+    };
 
     // Do not replay the Agent-local crash outbox on reconnect. DeviceRoom owns
     // the authoritative pending/cancel state and redelivers only after applying
@@ -1983,6 +2038,34 @@ async fn live_loop(
         // Drain before select! so a Notify wakeup dropped by a competing
         // branch cannot strand a detached completion until the next handshake.
         publish_orphan_completions(socket, config, state).await?;
+        if reconcile_scan.enabled && reconcile_scan.request_correlation.is_none() {
+            let candidates = if let Some(runtime) = runtime {
+                runtime.lock().await.op_journal_reconciliation_candidates(
+                    reconcile_scan.after.as_deref(),
+                    MAX_PENDING_DISPATCHES,
+                )
+            } else {
+                Vec::new()
+            };
+            if candidates.is_empty() {
+                reconcile_scan.enabled = false;
+            } else {
+                let correlation = candidates
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| "operation reconciliation page unexpectedly empty".to_owned())?;
+                send_envelope(
+                    socket,
+                    config,
+                    state,
+                    "operation.reconcile.request",
+                    json!({ "operation_ids": candidates }),
+                    Some(&correlation),
+                )
+                .await?;
+                reconcile_scan.request_correlation = Some(correlation);
+            }
+        }
         // #146: an incremental workspace-registry snapshot is published after
         // the select turn, mirroring the orphan-completion drain pattern.
         if registry_dirty {
@@ -2060,6 +2143,7 @@ async fn live_loop(
                         &finish_tx,
                         &in_flight,
                         &active_dispatches,
+                        &mut reconcile_scan,
                     ).await?;
                 }
             }
@@ -2219,6 +2303,7 @@ async fn handle_live_frame(
     finish_tx: &mpsc::Sender<FinishedRemoteOp>,
     in_flight: &Arc<Semaphore>,
     active_dispatches: &Arc<Mutex<HashSet<String>>>,
+    reconcile_scan: &mut OperationReconcileScan,
 ) -> Result<(), String> {
     let (raw, envelope) = match frame {
         InboundFrame::New { raw, envelope } => (Some(raw), envelope),
@@ -2239,13 +2324,35 @@ async fn handle_live_frame(
             .await
         }
         "operation.reconcile" => {
-            let correlations = authoritative_terminal_correlations(&envelope.payload)?;
+            let reconciliation = authoritative_terminal_correlations(&envelope.payload)?;
             let before = state.pending_dispatches.len();
-            for correlation in correlations {
-                state.clear_pending_by_correlation(&correlation);
+            for correlation in &reconciliation.terminal {
+                state.clear_pending_by_correlation(correlation);
             }
             if state.pending_dispatches.len() != before {
                 state.save(&config.state_path)?;
+            }
+            if let Some(runtime) = runtime {
+                runtime
+                    .lock()
+                    .await
+                    .acknowledge_control_plane_operations(&reconciliation.terminal)
+                    .map_err(|error| format!("op journal reconcile persist failed: {error}"))?;
+            }
+            if let Some(checked) = reconciliation.checked {
+                // A replayed response may arrive after its page advanced. It
+                // may safely repeat terminal pruning, but only the response
+                // bound to the outstanding page can advance the cursor.
+                if envelope.correlation_id.as_deref()
+                    != reconcile_scan.request_correlation.as_deref()
+                {
+                    return Ok(());
+                }
+                reconcile_scan.after = checked.into_iter().max();
+                reconcile_scan.request_correlation = None;
+                if reconcile_scan.after.is_none() {
+                    reconcile_scan.enabled = false;
+                }
             }
             Ok(())
         }
@@ -5059,6 +5166,7 @@ mod tests {
             Some(&runtime),
             &mut state,
             &mut shutdown_rx,
+            false,
         )
         .await
         .is_err());
@@ -5191,6 +5299,7 @@ mod tests {
             Some(&runtime),
             &mut state,
             &mut shutdown_rx,
+            false,
         )
         .await;
         drop(shutdown_tx);
@@ -5211,6 +5320,33 @@ mod tests {
         ] {
             assert!(validate_workspace_registry_ack(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn operation_reconcile_ack_requires_checked_subset_and_bounds() {
+        let old = authoritative_terminal_correlations(&json!({
+            "terminal_correlations": ["op_terminal"]
+        }))
+        .unwrap();
+        assert_eq!(old.terminal, vec!["op_terminal"]);
+        assert!(old.checked.is_none());
+
+        let page = authoritative_terminal_correlations(&json!({
+            "checked_correlations": ["op_terminal", "op_pending"],
+            "terminal_correlations": ["op_terminal"]
+        }))
+        .unwrap();
+        assert_eq!(page.checked.unwrap(), vec!["op_terminal", "op_pending"]);
+        assert!(authoritative_terminal_correlations(&json!({
+            "checked_correlations": ["op_pending"],
+            "terminal_correlations": ["op_terminal"]
+        }))
+        .is_err());
+        assert!(authoritative_terminal_correlations(&json!({
+            "terminal_correlations": ["op_terminal"],
+            "extra": true
+        }))
+        .is_err());
     }
 
     #[tokio::test]

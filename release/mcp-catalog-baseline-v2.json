@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "catalog_version": 2,
-  "release": "v1.2.30",
+  "release": "v1.2.31",
   "catalog_revision": "bedce0fc4c7f7a20",
   "tools": [
     {

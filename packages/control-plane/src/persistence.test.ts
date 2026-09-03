@@ -11,14 +11,29 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { handleMcp, OperationTracker, type OperationRouter } from "./mcp.ts";
-import { SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
+import {
+  AUDIT_MAX_PER_TENANT_DEFAULT,
+  AUDIT_MAX_PER_TENANT_HARD_CEILING,
+  AUDIT_RETENTION_DAYS_DEFAULT,
+  AUDIT_RETENTION_DAYS_HARD_CEILING,
+  MemoryStore,
+  parseAuditMaxPerTenant,
+  parseAuditRetentionDays,
+  SqlStore,
+  type SqlDatabase,
+  type SqlStatement,
+} from "./store.ts";
 import { encodeDevicePublicKey } from "./store.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, "..", "migrations");
 
 /** Adapt node:sqlite to the D1-like SqlDatabase interface. */
-function openSqliteStore(mcpOpsMaxPerTenant?: number): { db: DatabaseSync; store: SqlStore } {
+function openSqliteStore(
+  mcpOpsMaxPerTenant?: number,
+  auditMaxPerTenant?: number,
+  auditRetentionDays?: number,
+): { db: DatabaseSync; store: SqlStore } {
   const db = new DatabaseSync(":memory:");
   const files = readdirSync(migrationsDir)
     .filter((f) => f.endsWith(".sql"))
@@ -81,7 +96,11 @@ function openSqliteStore(mcpOpsMaxPerTenant?: number): { db: DatabaseSync; store
     },
   };
 
-  const store = new SqlStore(adapter, "sqlite", { mcpOpsMaxPerTenant });
+  const store = new SqlStore(adapter, "sqlite", {
+    mcpOpsMaxPerTenant,
+    auditMaxPerTenant,
+    auditRetentionDays,
+  });
   return { db, store };
 }
 
@@ -110,9 +129,101 @@ test("all control-plane migrations apply cleanly on sqlite", () => {
     "revoked_refresh_families",
     "schema_migrations",
     "mcp_operation_tenant_counters",
+    "audit_event_tenant_counters",
   ]) {
     assert.ok(names.includes(need), `missing table ${need}`);
   }
+});
+
+test("audit retention is indexed, bounded by TTL, and fails closed at tenant quota", async () => {
+  const { db, store } = openSqliteStore(undefined, 2, 1);
+  try {
+    const stale = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare(
+      `INSERT INTO audit_events
+       (id, tenant_id, principal_id, device_id, kind, summary, created_at)
+       VALUES ('aud_stale', 'ten_audit', NULL, NULL, 'test', 'stale', ?)`,
+    ).run(stale);
+    const plan = (
+      db.prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT id FROM audit_events
+         WHERE tenant_id = ? AND created_at < ?
+         ORDER BY created_at, id LIMIT ?`,
+      ).all("ten_audit", new Date().toISOString(), 128) as Array<{ detail: string }>
+    ).map((row) => row.detail).join("\n");
+    assert.match(plan, /idx_audit_events_retention/);
+    assert.doesNotMatch(plan, /SCAN audit_events/);
+
+    const append = (id: string) => store.appendAudit({
+      id,
+      tenant_id: "ten_audit",
+      kind: "test",
+      summary: id,
+      created_at: new Date().toISOString(),
+    });
+    await append("aud_1");
+    await append("aud_2");
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS c FROM audit_events WHERE tenant_id = 'ten_audit'")
+        .get() as { c: number }).c,
+      2,
+      "expired event must be pruned before admission",
+    );
+    await assert.rejects(append("aud_over"), /audit_event_quota_exceeded/);
+
+    db.prepare("DELETE FROM audit_events WHERE id = 'aud_1'").run();
+    await append("aud_3");
+    const counter = db.prepare(
+      "SELECT event_count FROM audit_event_tenant_counters WHERE tenant_id = 'ten_audit'",
+    ).get() as { event_count: number };
+    assert.equal(counter.event_count, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test("audit bounds apply to MemoryStore and invalid overrides use finite defaults", async () => {
+  assert.equal(parseAuditRetentionDays("bad"), AUDIT_RETENTION_DAYS_DEFAULT);
+  assert.equal(parseAuditRetentionDays(0), AUDIT_RETENTION_DAYS_DEFAULT);
+  assert.equal(
+    parseAuditRetentionDays(AUDIT_RETENTION_DAYS_HARD_CEILING + 1),
+    AUDIT_RETENTION_DAYS_HARD_CEILING,
+  );
+  assert.equal(parseAuditMaxPerTenant("bad"), AUDIT_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseAuditMaxPerTenant(0), AUDIT_MAX_PER_TENANT_DEFAULT);
+  assert.equal(
+    parseAuditMaxPerTenant(AUDIT_MAX_PER_TENANT_HARD_CEILING + 1),
+    AUDIT_MAX_PER_TENANT_HARD_CEILING,
+  );
+
+  const store = new MemoryStore({ auditMaxPerTenant: 1, auditRetentionDays: 1 });
+  await store.appendAudit({
+    id: "aud_old",
+    tenant_id: "ten_memory",
+    kind: "test",
+    summary: "old",
+    created_at: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  await store.appendAudit({
+    id: "aud_current",
+    tenant_id: "ten_memory",
+    kind: "test",
+    summary: "x".repeat(10_000),
+    created_at: new Date().toISOString(),
+  });
+  assert.equal((await store.listAudit("ten_memory", 10)).length, 1);
+  assert.ok((await store.listAudit("ten_memory", 1))[0]!.summary.length <= 4_096);
+  await assert.rejects(
+    store.appendAudit({
+      id: "aud_over",
+      tenant_id: "ten_memory",
+      kind: "test",
+      summary: "over",
+      created_at: new Date().toISOString(),
+    }),
+    /audit_event_quota_exceeded/,
+  );
 });
 
 test("MCP admission and retention plans stay index-backed at 10k and 20k rows", async () => {

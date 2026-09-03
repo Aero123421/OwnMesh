@@ -27,6 +27,9 @@
     "OWNMESH_ALLOWED_ORIGINS": "",
     // Per-tenant durable MCP operation row cap. Invalid values fall back to 20000.
     "MCP_OPS_MAX_PER_TENANT": "20000",
+    // Audit metadata is retained for 30 days and capped per tenant.
+    "AUDIT_RETENTION_DAYS": "30",
+    "AUDIT_MAX_PER_TENANT": "50000",
     // Synchronous command timeout clamp in milliseconds. Invalid values fall back to 300000.
     "MCP_MAX_TIMEOUT_MS": "300000"
     // SESSION_SECRET and the one-time passkey bootstrap hash OWNER_TOKEN_HASH

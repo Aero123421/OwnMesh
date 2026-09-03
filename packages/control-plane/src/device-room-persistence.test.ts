@@ -2185,6 +2185,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   const clientId = "cls_cas";
   const agentId = "ags_cas";
   const clientInbox: string[] = [];
+  const agentInbox: string[] = [];
   room.router.registerSession({
     role: "client",
     device_id: deviceId,
@@ -2204,6 +2205,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   });
   room.router.sendToSession = (sid, data) => {
     if (sid === clientId) clientInbox.push(data);
+    if (sid === agentId) agentInbox.push(data);
     return true;
   };
   const corr2 = randomId("cor_");
@@ -2288,6 +2290,28 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
     clientInbox.some((m) => (JSON.parse(m) as DeviceEnvelope).type === "operation.result"),
     "client receives result only after CAS",
   );
+  const commitAck = agentInbox.map((m) => JSON.parse(m) as DeviceEnvelope)
+    .find((message) => message.type === "operation.reconcile");
+  assert.deepEqual(commitAck?.payload.terminal_correlations, [opId2]);
+
+  agentInbox.length = 0;
+  await room.webSocketMessage(
+    sock as unknown as WebSocket,
+    JSON.stringify(
+      envFor(
+        agentId,
+        "operation.reconcile.request",
+        deviceId,
+        { operation_ids: [opId2, "op_missing_receipt"] },
+        undefined,
+        { seq: 3, message_id: "m_reconcile" },
+      ),
+    ),
+  );
+  const scanAck = agentInbox.map((m) => JSON.parse(m) as DeviceEnvelope)
+    .find((message) => message.type === "operation.reconcile");
+  assert.deepEqual(scanAck?.payload.checked_correlations, [opId2, "op_missing_receipt"]);
+  assert.deepEqual(scanAck?.payload.terminal_correlations, [opId2]);
 });
 
 test("workspace-bound result must echo the canonical workspace version", async () => {

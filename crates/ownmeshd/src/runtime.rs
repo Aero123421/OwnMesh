@@ -1454,6 +1454,69 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         Ok(evicted)
     }
 
+    /// Return a stable, bounded page of completed remote operation ids that
+    /// may be reconciled with the control plane. Unknown and in-progress
+    /// entries are never offered, so no peer response can make an uncertain
+    /// side effect retriable.
+    pub(crate) fn op_journal_reconciliation_candidates(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
+        let limit = limit.min(64);
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut operation_ids = self
+            .op_journal
+            .values()
+            .filter(|entry| op_journal_entry_state(entry) == OpJournalEntryState::Completed)
+            .filter_map(|entry| entry.get("operation_id").and_then(Value::as_str))
+            .filter_map(|raw| ownmesh_domain::OperationId::parse(raw).ok())
+            .map(|id| id.to_string())
+            .filter(|id| after.is_none_or(|cursor| id.as_str() > cursor))
+            .collect::<Vec<_>>();
+        operation_ids.sort();
+        operation_ids.dedup();
+        operation_ids.truncate(limit);
+        operation_ids
+    }
+
+    /// Remove only completed receipts whose exact operation id has been
+    /// confirmed terminal by the authenticated control plane. Persistence is
+    /// atomic and rolls back in-memory removal on failure. In-progress and
+    /// forward-version/uncertain entries are never touched.
+    pub(crate) fn acknowledge_control_plane_operations(
+        &mut self,
+        operation_ids: &[String],
+    ) -> IpcResult<usize> {
+        if operation_ids.is_empty() {
+            return Ok(0);
+        }
+        let acknowledged = operation_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let snapshot = self.op_journal.clone();
+        let before = self.op_journal.len();
+        self.op_journal.retain(|_, entry| {
+            if op_journal_entry_state(entry) != OpJournalEntryState::Completed {
+                return true;
+            }
+            let operation_id = entry.get("operation_id").and_then(Value::as_str);
+            !operation_id.is_some_and(|id| acknowledged.contains(id))
+        });
+        let removed = before - self.op_journal.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        if let Err(error) = self.persist_op_journal() {
+            self.op_journal = snapshot;
+            return Err(error);
+        }
+        Ok(removed)
+    }
+
     /// Make durable room before reserving a new idempotency key: evict only
     /// old completed receipts; if nothing is evictable the caller's capacity
     /// check fails closed (no new side effects accepted).
@@ -13822,6 +13885,69 @@ mod journal_lifecycle_tests {
             replayed.get("result").is_none(),
             "restart replay must be the compact receipt"
         );
+    }
+
+    #[test]
+    fn control_plane_ack_prunes_only_exact_completed_receipts_and_rolls_back() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.op_journal.insert(
+            "prin_a\u{1f}idem_a".into(),
+            json!({
+                "durable_receipt": true,
+                "operation_id": "op_completed_a",
+                "status": "completed",
+            }),
+        );
+        runtime.op_journal.insert(
+            "prin_b\u{1f}idem_b".into(),
+            json!({
+                "durable_receipt": true,
+                "operation_id": "op_completed_b",
+                "status": "failed",
+            }),
+        );
+        runtime.op_journal.insert(
+            "prin_c\u{1f}idem_c".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                "operation_id": "op_in_progress",
+            }),
+        );
+        runtime.op_journal.insert(
+            "prin_d\u{1f}idem_d".into(),
+            json!({ "operation_id": "op_uncertain" }),
+        );
+
+        assert_eq!(
+            runtime.op_journal_reconciliation_candidates(None, 64),
+            vec!["op_completed_a", "op_completed_b"]
+        );
+        assert_eq!(
+            runtime.op_journal_reconciliation_candidates(Some("op_completed_a"), 64),
+            vec!["op_completed_b"]
+        );
+
+        runtime.fail_op_journal_persist_on_nth_call_for_test(1);
+        assert!(runtime
+            .acknowledge_control_plane_operations(&["op_completed_a".into()])
+            .is_err());
+        assert!(runtime.op_journal.contains_key("prin_a\u{1f}idem_a"));
+
+        assert_eq!(
+            runtime
+                .acknowledge_control_plane_operations(&[
+                    "op_completed_a".into(),
+                    "op_in_progress".into(),
+                    "op_uncertain".into(),
+                ])
+                .unwrap(),
+            1
+        );
+        assert!(!runtime.op_journal.contains_key("prin_a\u{1f}idem_a"));
+        assert!(runtime.op_journal.contains_key("prin_c\u{1f}idem_c"));
+        assert!(runtime.op_journal.contains_key("prin_d\u{1f}idem_d"));
     }
 
     /// P0-B / control-plane retention-window synchronization: a completed
