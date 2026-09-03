@@ -72,6 +72,22 @@ test("refresh rotation reuse detection remains enforced", async () => {
     }),
   );
   assert.equal(res1.status, 200);
+  const tokenSet1 = (await res1.json()) as { refresh_token: string };
+
+  // Advance the refresh family past the duplicate-retry grace period.
+  const res2 = await __test.handleOAuthToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: tokenSet1.refresh_token,
+      }),
+    }),
+  );
+  assert.equal(res2.status, 200);
+
+  // Replaying the original refresh token after the family has advanced is reuse.
   const resReuse = await __test.handleOAuthToken(
     new Request("https://cp.test/oauth/token", {
       method: "POST",

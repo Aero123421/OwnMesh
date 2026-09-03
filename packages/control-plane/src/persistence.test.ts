@@ -572,6 +572,17 @@ test("sql store refresh rotation + reuse detection persists", async () => {
   const rotated = await store.rotateRefresh(first.refresh_token);
   assert.equal(rotated.ok, true);
   if (!rotated.ok) return;
+
+  // Exact duplicate retry within the receipt TTL returns the same token set.
+  const replay = await store.rotateRefresh(first.refresh_token);
+  assert.equal(replay.ok, true);
+  if (replay.ok) assert.equal(replay.token.access_token, rotated.token.access_token);
+
+  // After the family advances, replaying the original refresh is real reuse and
+  // revokes the whole family.
+  const advanced = await store.rotateRefresh(rotated.token.refresh_token);
+  assert.equal(advanced.ok, true);
+  if (!advanced.ok) return;
   const reuse = await store.rotateRefresh(first.refresh_token);
   assert.equal(reuse.ok, false);
   if (!reuse.ok) assert.equal(reuse.error, "reuse");

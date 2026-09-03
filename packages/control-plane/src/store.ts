@@ -12,6 +12,8 @@ import {
   randomToken,
   sha256Hex,
   generateUserCode,
+  bytesToBase64Url,
+  base64UrlToBytes,
 } from "./util.ts";
 import {
   applyObservedGeneration,
@@ -28,6 +30,15 @@ export type { WorkspaceOperableGate } from "./workspace-activation.ts";
 export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
 /** Rolling inactivity limit for a rotated refresh-token family. */
 export const REFRESH_TOKEN_IDLE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+/**
+ * Bounded idempotency window for exact duplicate refresh retries.
+ * A concurrent rotation or a response-loss retransmission presenting the same
+ * old refresh token within this grace period converges to the same successor
+ * token set instead of being treated as a reuse attack.
+ */
+export const REFRESH_ROTATION_RECEIPT_TTL_MS = 60_000;
+/** Bounded cleanup batch for expired refresh-rotation receipts. */
+export const REFRESH_ROTATION_RECEIPT_CLEANUP_BATCH = 64;
 /** Do not turn reconnect churn into a D1 write stream when metadata is unchanged. */
 export const DEVICE_READY_WRITE_INTERVAL_MS = 60_000;
 
@@ -565,6 +576,66 @@ const MCP_OPS_TERMINAL = new Set([
   "device_offline",
   "tombstone",
 ]);
+
+/** Encrypted refresh-rotation receipt payload stored in D1. */
+type EncryptedRefreshReceipt = {
+  ciphertext: string;
+  iv: string;
+};
+
+async function deriveRefreshReceiptKey(refreshToken: string): Promise<CryptoKey> {
+  const data = new TextEncoder().encode(refreshToken);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return crypto.subtle.importKey(
+    "raw",
+    digest,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+async function encryptRefreshReceipt(
+  successor: { access_token: string; refresh_token: string },
+  refreshToken: string,
+): Promise<EncryptedRefreshReceipt> {
+  const key = await deriveRefreshReceiptKey(refreshToken);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(successor));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  return {
+    ciphertext: bytesToBase64Url(new Uint8Array(ciphertext)),
+    iv: bytesToBase64Url(iv),
+  };
+}
+
+async function decryptRefreshReceipt(
+  receipt: EncryptedRefreshReceipt,
+  refreshToken: string,
+): Promise<{ access_token: string; refresh_token: string } | null> {
+  const key = await deriveRefreshReceiptKey(refreshToken);
+  const iv = base64UrlToBytes(receipt.iv);
+  const ciphertext = base64UrlToBytes(receipt.ciphertext);
+  if (!iv || !ciphertext) return null;
+  try {
+    const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+    const decoded = JSON.parse(new TextDecoder().decode(plaintext));
+    if (
+      typeof decoded === "object" &&
+      decoded !== null &&
+      typeof (decoded as Record<string, unknown>).access_token === "string" &&
+      typeof (decoded as Record<string, unknown>).refresh_token === "string"
+    ) {
+      return {
+        access_token: (decoded as Record<string, unknown>).access_token as string,
+        refresh_token: (decoded as Record<string, unknown>).refresh_token as string,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
@@ -1432,6 +1503,7 @@ export class MemoryStore implements ControlPlaneStore {
   tokensByAccess = new Map<string, TokenRecord>();
   accessByRefresh = new Map<string, string>();
   usedRefresh = new Map<string, string>(); // refresh -> family
+  rotationReceipts = new Map<string, { token: TokenRecord; expiresAt: number }>();
   compromisedRefreshFamilies = new Set<string>();
   authCodes = new Map<string, AuthCodeRecord>();
   deviceCodes = new Map<string, DeviceCodeRecord>();
@@ -1725,6 +1797,12 @@ export class MemoryStore implements ControlPlaneStore {
     | { ok: false; error: "invalid_grant" | "reuse"; description?: string }
   > {
     const now = Date.now();
+
+    // Cleanup expired rotation receipts.
+    for (const [k, v] of this.rotationReceipts) {
+      if (now > v.expiresAt) this.rotationReceipts.delete(k);
+    }
+
     // Locate the token row that still carries this refresh value (including used/revoked).
     let prior: TokenRecord | undefined;
     for (const candidate of this.tokensByAccess.values()) {
@@ -1733,9 +1811,26 @@ export class MemoryStore implements ControlPlaneStore {
         break;
       }
     }
+
     // Expired refresh is always invalid_grant (reuse detection is in-window only).
     if (prior && now > prior.refresh_expires_at) {
       return { ok: false, error: "invalid_grant" };
+    }
+
+    // Exact duplicate retry or response-loss retransmission within the bounded
+    // grace period converges to the same successor token set.
+    const receipt = this.rotationReceipts.get(refreshToken);
+    if (receipt && now <= receipt.expiresAt) {
+      const successor = this.tokensByAccess.get(receipt.token.access_token);
+      if (
+        successor &&
+        !successor.revoked &&
+        !successor.refresh_used &&
+        !this.compromisedRefreshFamilies.has(successor.refresh_family) &&
+        Date.now() <= successor.refresh_expires_at
+      ) {
+        return { ok: true, token: successor };
+      }
     }
 
     const usedFamily = this.usedRefresh.get(refreshToken);
@@ -1780,22 +1875,46 @@ export class MemoryStore implements ControlPlaneStore {
         description: "refresh token reuse detected",
       };
     }
+
+    // Rotate synchronously before the first await. This makes the update
+    // (old token marked used, successor published, and receipt stored) appear
+    // atomic to concurrent callers on the same isolate.
     old.refresh_used = true;
     old.revoked = true;
     this.tokensByAccess.set(access, old);
     this.accessByRefresh.delete(refreshToken);
     this.usedRefresh.set(refreshToken, old.refresh_family);
+
+    const principalRecord = this.principals.get(old.principal);
+    const nextAccess = randomToken("atk_");
+    const nextRefresh = randomToken("rtk_");
+    const expiresAt = now + ACCESS_TOKEN_TTL_MS;
+    const refreshExpiresAt = now + REFRESH_TOKEN_IDLE_TTL_MS;
+    const next: TokenRecord = {
+      access_token: nextAccess,
+      refresh_token: nextRefresh,
+      client_id: old.client_id,
+      scope: old.scope,
+      principal: old.principal,
+      expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAt,
+      revoked: this.compromisedRefreshFamilies.has(old.refresh_family),
+      refresh_family: old.refresh_family,
+      refresh_used: false,
+      tenant_id: principalRecord?.tenant_id ?? DEFAULT_TENANT,
+    };
+    this.tokensByAccess.set(nextAccess, next);
+    if (!next.revoked) this.accessByRefresh.set(nextRefresh, nextAccess);
+    this.rotationReceipts.set(refreshToken, {
+      token: next,
+      expiresAt: now + REFRESH_ROTATION_RECEIPT_TTL_MS,
+    });
+
     // #162: a healthy rotation advances the issuance generation for
     // observability only. It deliberately does NOT advance the revocation
     // epoch, so operations already authorized by this same healthy refresh
     // family stay deliverable across the 15-minute access-token boundary.
     await this.advancePrincipalCredentialGeneration(old.principal);
-    const next = await this.issueTokens(
-      old.client_id,
-      old.principal,
-      old.scope,
-      old.refresh_family,
-    );
     return { ok: true, token: next };
   }
 
@@ -3478,7 +3597,7 @@ export class SqlStore implements ControlPlaneStore {
     | { ok: true; token: TokenRecord }
     | { ok: false; error: "invalid_grant" | "reuse"; description?: string }
   > {
-    // Atomic CAS + ledger + successor in one batch. Fail closed without batch.
+    // Atomic CAS + ledger + successor + receipt in one batch. Fail closed without batch.
     if (!this.db.batch) {
       throw new Error("SqlStore.rotateRefresh requires db.batch");
     }
@@ -3486,12 +3605,24 @@ export class SqlStore implements ControlPlaneStore {
     const nowMs = Date.now();
     const now = nowIso(nowMs);
 
-    // Authoritative pre-read for metadata + expiry. CAS in the batch is the claim.
+    // Cleanup expired rotation receipts in a bounded batch.
+    await this.db.prepare(
+      `DELETE FROM refresh_rotation_receipts
+       WHERE rowid IN (
+         SELECT rowid FROM refresh_rotation_receipts
+         WHERE expires_at <= ?
+         ORDER BY expires_at ASC
+         LIMIT ?
+       )`,
+    ).bind(now, REFRESH_ROTATION_RECEIPT_CLEANUP_BATCH).run();
+
+    // Authoritative pre-read for metadata + expiry + tenant. CAS in the batch is the claim.
     const row = await this.db.prepare(
-      `SELECT client_id, principal_id, scope, refresh_family, revoked, refresh_used, refresh_expires_at
-       FROM oauth_tokens WHERE refresh_token_hash = ?`,
+      `SELECT t.client_id, t.principal_id, p.tenant_id AS tenant_id, t.scope, t.refresh_family, t.revoked, t.refresh_used, t.refresh_expires_at
+       FROM oauth_tokens t JOIN principals p ON p.id = t.principal_id
+       WHERE t.refresh_token_hash = ?`,
     ).bind(refreshHash).first<{
-      client_id: string; principal_id: string; scope: string;
+      client_id: string; principal_id: string; tenant_id: string; scope: string;
       refresh_family: string; revoked: number; refresh_used: number; refresh_expires_at: string;
     }>();
 
@@ -3504,6 +3635,13 @@ export class SqlStore implements ControlPlaneStore {
     // Expired refresh is always invalid_grant; reuse detection is in-window only.
     if (!Number.isFinite(exp) || nowMs > exp) {
       return { ok: false, error: "invalid_grant" };
+    }
+
+    // Exact duplicate retry or response-loss retransmission within the bounded
+    // grace period converges to the same successor token set.
+    const duplicate = await this.#lookupRefreshReceipt(refreshToken, refreshHash, nowMs);
+    if (duplicate) {
+      return { ok: true, token: duplicate };
     }
 
     const used = await this.db
@@ -3520,6 +3658,8 @@ export class SqlStore implements ControlPlaneStore {
     }
 
     // Real reuse: ledger hit and/or refresh_used=1 within the refresh inactivity window.
+    // A recent valid receipt was already checked above, so this path is only for
+    // replays outside the bounded grace window.
     if (used || row.refresh_used) {
       const fam = used?.refresh_family || row.refresh_family;
       await this.db.batch([
@@ -3562,13 +3702,30 @@ export class SqlStore implements ControlPlaneStore {
     const expiresAtIso = nowIso(expiresAt);
     const refreshExpiresAtIso = nowIso(refreshExpiresAt);
     const fam = row.refresh_family;
+    const encrypted = await encryptRefreshReceipt(
+      { access_token: access, refresh_token: refresh },
+      refreshToken,
+    );
+    const receiptExpiresAtIso = nowIso(nowMs + REFRESH_ROTATION_RECEIPT_TTL_MS);
 
     type BatchResult = { meta?: { changes?: number }; success?: boolean };
     // Single atomic batch. Each statement is self-gated via WHERE/EXISTS - no SQL changes() cross-statement dependency.
+    // 0) Cleanup expired receipts (same as before, idempotent inside the batch).
     // 1) Ledger INSERT OR IGNORE SELECT is the CAS claim (unique PK).
     // 2) Mark old token used only if ledger claim exists.
     // 3) Insert successor only if old token claimed and no other live unused token in family.
+    // 4) Advance issuance generation for observability only.
+    // 5) Store a rotation receipt keyed by the old refresh hash for duplicate convergence.
     const batchResults = await this.db.batch<BatchResult>([
+      this.db.prepare(
+        `DELETE FROM refresh_rotation_receipts
+         WHERE rowid IN (
+           SELECT rowid FROM refresh_rotation_receipts
+           WHERE expires_at <= ?
+           ORDER BY expires_at ASC
+           LIMIT ?
+         )`,
+      ).bind(now, REFRESH_ROTATION_RECEIPT_CLEANUP_BATCH),
       this.db.prepare(
         `INSERT OR IGNORE INTO used_refresh_tokens (refresh_token_hash, refresh_family, used_at)
          SELECT refresh_token_hash, refresh_family, ?
@@ -3618,13 +3775,41 @@ export class SqlStore implements ControlPlaneStore {
          WHERE id = ? AND credential_generation >= 1
            AND EXISTS (SELECT 1 FROM oauth_tokens WHERE access_token_hash = ? AND revoked = 0)`,
       ).bind(row.principal_id, accessHash),
+      this.db.prepare(
+        `INSERT OR IGNORE INTO refresh_rotation_receipts
+         (old_refresh_token_hash, refresh_family, client_id, principal_id, tenant_id, scope,
+          successor_access_token_hash, successor_refresh_token_hash, encrypted_successor, iv, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        refreshHash,
+        fam,
+        row.client_id,
+        row.principal_id,
+        row.tenant_id,
+        row.scope,
+        accessHash,
+        newRefreshHash,
+        encrypted.ciphertext,
+        encrypted.iv,
+        ts,
+        receiptExpiresAtIso,
+      ),
     ]);
 
-    // Winner is determined from this statement's own meta.changes (not SQL changes()).
-    const casWon = Number(batchResults[0]?.meta?.changes ?? 0) > 0;
-    const successorInserted = Number(batchResults[2]?.meta?.changes ?? 0) > 0;
-    const generationAdvanced = Number(batchResults[3]?.meta?.changes ?? 0) > 0;
-    if (!casWon || !successorInserted || !generationAdvanced) {
+    // Result indices skip the cleanup DELETE at position 0.
+    const casWon = Number(batchResults[1]?.meta?.changes ?? 0) > 0;
+    const oldUpdated = Number(batchResults[2]?.meta?.changes ?? 0) > 0;
+    const successorInserted = Number(batchResults[3]?.meta?.changes ?? 0) > 0;
+    const generationAdvanced = Number(batchResults[4]?.meta?.changes ?? 0) > 0;
+    const receiptInserted = Number(batchResults[5]?.meta?.changes ?? 0) > 0;
+    if (!casWon || !oldUpdated || !successorInserted || !generationAdvanced || !receiptInserted) {
+      // A concurrent rotation already claimed the CAS. Return the winner's
+      // successor token set if a receipt was produced, otherwise fail closed.
+      const winner = await this.#lookupRefreshReceipt(refreshToken, refreshHash, nowMs);
+      if (winner) {
+        return { ok: true, token: winner };
+      }
+
       const raced = await this.db.prepare(
         `SELECT refresh_family FROM oauth_tokens WHERE refresh_token_hash = ? AND refresh_used = 1`,
       ).bind(refreshHash).first<{ refresh_family: string }>();
@@ -3695,7 +3880,6 @@ export class SqlStore implements ControlPlaneStore {
       return { ok: false, error: "reuse", description: "refresh token reuse detected" };
     }
 
-    const principalRecord = await this.getPrincipal(row.principal_id);
     return {
       ok: true,
       token: {
@@ -3709,8 +3893,86 @@ export class SqlStore implements ControlPlaneStore {
         revoked: false,
         refresh_family: fam,
         refresh_used: false,
-        tenant_id: principalRecord?.tenant_id ?? DEFAULT_TENANT,
+        tenant_id: row.tenant_id,
       },
+    };
+  }
+
+  async #lookupRefreshReceipt(
+    refreshToken: string,
+    refreshHash: string,
+    nowMs: number,
+  ): Promise<TokenRecord | null> {
+    const receipt = await this.db.prepare(
+      `SELECT old_refresh_token_hash, refresh_family, client_id, principal_id, tenant_id, scope,
+              successor_access_token_hash, successor_refresh_token_hash, encrypted_successor, iv, expires_at
+       FROM refresh_rotation_receipts
+       WHERE old_refresh_token_hash = ?`,
+    ).bind(refreshHash).first<{
+      refresh_family: string;
+      client_id: string;
+      principal_id: string;
+      tenant_id: string;
+      scope: string;
+      successor_access_token_hash: string;
+      successor_refresh_token_hash: string;
+      encrypted_successor: string;
+      iv: string;
+      expires_at: string;
+    }>();
+    if (!receipt) return null;
+
+    const receiptExp = Date.parse(receipt.expires_at);
+    if (!Number.isFinite(receiptExp) || nowMs > receiptExp) return null;
+
+    const successor = await this.db.prepare(
+      `SELECT access_token_hash, revoked, refresh_used, refresh_expires_at, expires_at
+       FROM oauth_tokens
+       WHERE access_token_hash = ?`,
+    ).bind(receipt.successor_access_token_hash).first<{
+      access_token_hash: string;
+      revoked: number;
+      refresh_used: number;
+      refresh_expires_at: string;
+      expires_at: string;
+    }>();
+    if (!successor || successor.revoked || successor.refresh_used) return null;
+
+    const refreshExpiresAt = Date.parse(successor.refresh_expires_at);
+    if (!Number.isFinite(refreshExpiresAt) || nowMs > refreshExpiresAt) return null;
+
+    const familyRevoked = await this.db.prepare(
+      `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
+    ).bind(receipt.refresh_family).first("revoked");
+    if (familyRevoked) return null;
+
+    const decrypted = await decryptRefreshReceipt(
+      { ciphertext: receipt.encrypted_successor, iv: receipt.iv },
+      refreshToken,
+    );
+    if (!decrypted) return null;
+
+    const accessHash = await sha256Hex(decrypted.access_token);
+    const newRefreshHash = await sha256Hex(decrypted.refresh_token);
+    if (
+      accessHash !== receipt.successor_access_token_hash ||
+      newRefreshHash !== receipt.successor_refresh_token_hash
+    ) {
+      return null;
+    }
+
+    return {
+      access_token: decrypted.access_token,
+      refresh_token: decrypted.refresh_token,
+      client_id: receipt.client_id,
+      scope: receipt.scope,
+      principal: receipt.principal_id,
+      expires_at: Date.parse(successor.expires_at),
+      refresh_expires_at: refreshExpiresAt,
+      revoked: false,
+      refresh_family: receipt.refresh_family,
+      refresh_used: false,
+      tenant_id: receipt.tenant_id,
     };
   }
 

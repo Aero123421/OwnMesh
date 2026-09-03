@@ -1619,6 +1619,14 @@ test("a routine refresh keeps a queued operation deliverable; revocation still k
     const token = await store.issueTokens("client_mcp", "prin_dev", "ownmesh.read");
     const rotated = await store.rotateRefresh(token.refresh_token);
     assert.equal(rotated.ok, true);
+    if (!rotated.ok) throw new Error("unexpected rotation failure");
+
+    // Advance the family past the duplicate-retry grace period so that the
+    // original refresh token is now a genuine replay, not a response-loss retry.
+    const rotated2 = await store.rotateRefresh(rotated.token.refresh_token);
+    assert.equal(rotated2.ok, true);
+    if (!rotated2.ok) throw new Error("unexpected second rotation failure");
+
     const operationId = "op_refresh_reuse_01";
     const boundAction = await pendingOperation(store, deviceId, operationId);
     const armed = armRoom(adapter, deviceId, operationId, boundAction);

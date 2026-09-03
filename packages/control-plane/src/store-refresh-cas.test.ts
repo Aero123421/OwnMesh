@@ -97,7 +97,7 @@ test("Memory rotateRefresh: expired access still rotates a live refresh token", 
   if (result.ok) assert.ok(result.token.refresh_expires_at > row.refresh_expires_at);
 });
 
-test("Memory rotateRefresh: reuse only within refresh lifetime", async () => {
+test("Memory rotateRefresh: duplicate converges and real reuse still revokes family", async () => {
   const s = new MemoryStore();
   await s.ensureBootstrap();
   await s.putClient({
@@ -110,8 +110,20 @@ test("Memory rotateRefresh: reuse only within refresh lifetime", async () => {
   const tok = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
   const rotated = await s.rotateRefresh(tok.refresh_token);
   assert.equal(rotated.ok, true);
+  if (!rotated.ok) return;
 
-  // In-window reuse → reuse.
+  // Duplicate retry within the receipt TTL converges to the same successor.
+  const dup = await s.rotateRefresh(tok.refresh_token);
+  assert.equal(dup.ok, true);
+  if (dup.ok) {
+    assert.equal(dup.token.access_token, rotated.token.access_token);
+    assert.equal(dup.token.refresh_token, rotated.token.refresh_token);
+  }
+
+  // After the family advances, replaying the original refresh is real reuse.
+  const advanced = await s.rotateRefresh(rotated.token.refresh_token);
+  assert.equal(advanced.ok, true);
+  if (!advanced.ok) return;
   const reuse = await s.rotateRefresh(tok.refresh_token);
   assert.equal(reuse.ok, false);
   if (!reuse.ok) assert.equal(reuse.error, "reuse");
@@ -174,7 +186,7 @@ test("SQL rotateRefresh: expired access still rotates a live refresh token", asy
   if (result.ok) assert.ok(result.token.refresh_expires_at > shortRefreshDeadline);
 });
 
-test("SQL rotateRefresh: refresh expiry CAS allows only one concurrent winner", async () => {
+test("SQL rotateRefresh: duplicate rotations converge to one successor", async () => {
   const { store: s, db } = openSql();
   await s.ensureBootstrap();
   const initial = await s.issueTokens(
@@ -186,8 +198,11 @@ test("SQL rotateRefresh: refresh expiry CAS allows only one concurrent winner", 
     s.rotateRefresh(initial.refresh_token),
     s.rotateRefresh(initial.refresh_token),
   ]);
-  assert.equal(results.filter((r) => r.ok).length, 1);
-  assert.equal(results.filter((r) => !r.ok && r.error === "reuse").length, 1);
+  assert.equal(results.every((r) => r.ok), true, "both duplicate rotations converge");
+  const [a, b] = results;
+  if (!a?.ok || !b?.ok) return;
+  assert.equal(a.token.access_token, b.token.access_token);
+  assert.equal(a.token.refresh_token, b.token.refresh_token);
 
   const familyRows = db
     .prepare(
@@ -201,6 +216,11 @@ test("SQL rotateRefresh: refresh expiry CAS allows only one concurrent winner", 
   };
   assert.equal(Number(familyRows.total), 2, "old + exactly one successor");
   assert.equal(Number(familyRows.successors), 1);
+
+  // Response-loss retry within the receipt TTL returns the same token set.
+  const replay = await s.rotateRefresh(initial.refresh_token);
+  assert.equal(replay.ok, true);
+  if (replay.ok) assert.equal(replay.token.access_token, a.token.access_token);
 });
 
 test("SQL rotateRefresh: expired used refresh is invalid_grant not reuse", async () => {
@@ -301,7 +321,14 @@ test("SQL rotateRefresh: real reuse still revokes family after successful rotati
   const tok = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
   const rotated = await s.rotateRefresh(tok.refresh_token);
   assert.equal(rotated.ok, true);
+  if (!rotated.ok) return;
 
+  // Advance the family past the duplicate-retry grace period.
+  const advanced = await s.rotateRefresh(rotated.token.refresh_token);
+  assert.equal(advanced.ok, true);
+  if (!advanced.ok) return;
+
+  // Replaying the original refresh after the family has advanced is real reuse.
   const reuse = await s.rotateRefresh(tok.refresh_token);
   assert.equal(reuse.ok, false);
   if (!reuse.ok) assert.equal(reuse.error, "reuse");
