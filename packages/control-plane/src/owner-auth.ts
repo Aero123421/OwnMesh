@@ -1109,6 +1109,15 @@ export function chatGptOAuthClientId(redirectUri: string): string | null {
 }
 
 export function chatGptOAuthPair(clientId: string, redirectUri: string): boolean {
+  // Current ChatGPT CIMD clients use one stable identity/callback pair when
+  // RFC 9207 issuer identification is available. Keep this exact so the
+  // refresh-token exception cannot be claimed by lookalike client metadata.
+  if (
+    clientId === "https://chatgpt.com/oauth/client.json" &&
+    redirectUri === "https://chatgpt.com/connector_platform_oauth_redirect"
+  ) {
+    return true;
+  }
   return chatGptOAuthClientId(redirectUri) === clientId;
 }
 
