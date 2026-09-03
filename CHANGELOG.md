@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.2.30 — ChatGPT stable CIMD refresh tokens
+
+- Recognized ChatGPT's stable CIMD client ID and callback as an exact OAuth
+  pair when deciding whether to issue a rotating refresh token.
+- Fixed repeated ChatGPT sign-in after the 15-minute access token expires when
+  the authorization request omits `offline_access`.
+- Kept legacy dynamic registration compatibility and added negative coverage
+  for lookalike client IDs and non-exact callback URLs.
+
 ## v1.2.29 — Cloudflare CIMD fetch compatibility
 
 - Replaced the unsupported Workers `fetch` redirect mode used for ChatGPT

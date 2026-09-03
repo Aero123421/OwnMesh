@@ -8,6 +8,7 @@ import {
   isAllowedCimdClientId,
   oauthMetadata,
 } from "./oauth.ts";
+import { chatGptOAuthPair } from "./owner-auth.ts";
 import { MemoryStore } from "./store.ts";
 import { pkceS256Challenge, verifyPkceS256 } from "./util.ts";
 
@@ -255,53 +256,86 @@ test("device authorization retries user-code collisions without overwriting", as
   assert.equal((await store.getDeviceCodeByUserCode("JKLM-NPQR"))?.device_code, body.device_code);
 });
 
-test("ChatGPT authorization receives a rotating refresh token without offline_access", async () => {
+test("ChatGPT DCR and stable CIMD authorization receive refresh tokens without offline_access", async () => {
   const store = new MemoryStore();
   await store.ensureBootstrap();
-  const verifier = "chatgpt-pkce-verifier-012345678901234567890123456789";
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-  let binary = "";
-  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
-  const challenge = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  const clientId = "client_chatgpt_b6nceskp3dnc";
-  const redirectUri = "https://chatgpt.com/connector/oauth/b6NcEskp3DnC";
-  await store.putClient({
-    client_id: clientId,
-    tenant_id: "ten_default",
-    client_name: "ChatGPT",
-    redirect_uris: [redirectUri],
-    created_at: new Date().toISOString(),
-  });
-  await store.putAuthCode({
-    code: "code_chatgpt_refresh",
-    client_id: clientId,
-    principal_id: "prin_dev",
-    redirect_uri: redirectUri,
-    scope: "ownmesh.read",
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-    expires_at: Date.now() + 60_000,
-    used: false,
-  });
+  const cases = [
+    {
+      name: "dcr",
+      clientId: "client_chatgpt_b6nceskp3dnc",
+      redirectUri: "https://chatgpt.com/connector/oauth/b6NcEskp3DnC",
+    },
+    {
+      name: "cimd",
+      clientId: "https://chatgpt.com/oauth/client.json",
+      redirectUri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    },
+  ];
+  for (const { name, clientId, redirectUri } of cases) {
+    const verifier = `chatgpt-${name}-verifier-012345678901234567890123456789`;
+    const code = `code_chatgpt_${name}_refresh`;
+    await store.putClient({
+      client_id: clientId,
+      tenant_id: "ten_default",
+      client_name: "ChatGPT",
+      redirect_uris: [redirectUri],
+      created_at: new Date().toISOString(),
+    });
+    await store.putAuthCode({
+      code,
+      client_id: clientId,
+      principal_id: "prin_dev",
+      redirect_uri: redirectUri,
+      scope: "ownmesh.read",
+      code_challenge: await pkceS256Challenge(verifier),
+      code_challenge_method: "S256",
+      expires_at: Date.now() + 60_000,
+      used: false,
+    });
 
-  const response = await handleToken(
-    new Request("https://cp.test/oauth/token", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code: "code_chatgpt_refresh",
-        redirect_uri: redirectUri,
-        client_id: clientId,
-        code_verifier: verifier,
+    const response = await handleToken(
+      new Request("https://cp.test/oauth/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+          code_verifier: verifier,
+        }),
       }),
-    }),
-    store,
+      store,
+    );
+    assert.equal(response.status, 200);
+    const token = (await response.json()) as { access_token: string; refresh_token?: string };
+    assert.ok(token.access_token.startsWith("atk_"));
+    assert.ok(token.refresh_token?.startsWith("rtk_"));
+  }
+});
+
+test("ChatGPT refresh-token exception requires an exact client and redirect pair", async () => {
+  assert.equal(
+    chatGptOAuthPair(
+      "https://chatgpt.com/oauth/client.json",
+      "https://chatgpt.com/connector_platform_oauth_redirect",
+    ),
+    true,
   );
-  assert.equal(response.status, 200);
-  const token = (await response.json()) as { access_token: string; refresh_token?: string };
-  assert.ok(token.access_token.startsWith("atk_"));
-  assert.ok(token.refresh_token?.startsWith("rtk_"));
+  assert.equal(
+    chatGptOAuthPair(
+      "https://attacker.example/oauth/client.json",
+      "https://chatgpt.com/connector_platform_oauth_redirect",
+    ),
+    false,
+  );
+  assert.equal(
+    chatGptOAuthPair(
+      "https://chatgpt.com/oauth/client.json",
+      "https://chatgpt.com/connector_platform_oauth_redirect/",
+    ),
+    false,
+  );
 });
 
 test("device authorization grant end-to-end", async () => {
