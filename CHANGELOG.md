@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v1.2.32 — Bounded OAuth refresh retry convergence
+
+- Added an encrypted, 60-second rotation receipt so concurrent exact refresh
+  retries and response-loss retransmissions converge to the same successor
+  token set instead of revoking the successful result.
+- Kept fail-closed refresh reuse detection for expired receipts, binding
+  mismatches, and ancestors whose token family has already advanced.
+- Added an atomic D1 migration and MemoryStore/SqlStore race, response-loss,
+  binding, expiry, and successor-generation regression coverage.
+
 ## v1.2.31 — Acknowledged journal reclamation and bounded audit storage
 
 - Added an authenticated, feature-negotiated control-plane acknowledgement for
