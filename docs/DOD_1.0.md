@@ -1,8 +1,8 @@
 # OwnMesh 1.x Definition of Done — release-quality audit
 
-**Release train:** v1.2.31 baseline
+**Release train:** v1.2.32 baseline
 
-**Audit date:** 2026-09-03
+**Audit date:** 2026-09-04
 
 **Authority:** `OWNMESH_SPECIFICATION.ja.md` §33 and the shipped-surface registry
 
@@ -11,7 +11,7 @@
 
 ## Conclusion
 
-OwnMesh v1.2.31 is a stable release for the product surface admitted by the
+OwnMesh v1.2.32 is a stable release for the product surface admitted by the
 machine-checked registry. The Rust unsupported registries and the manifest both
 contain zero intentionally unimplemented CLI surfaces. Parser acceptance alone
 does not count: the admitted commands have fail-closed handlers and the relevant
@@ -45,7 +45,7 @@ v1.2.16 stable product surface.
 | 1 | Signed release Win/macOS/Linux | **partial** | Five portable archives (Windows x64, macOS arm64/x64, Linux musl arm64/x64) are gated with LICENSE/NOTICE/README/notes, non-empty CycloneDX SBOMs, SHA-256 checksums, mandatory minisign signature, and GitHub provenance. Authenticode, Apple notarization, universal/native installers remain out of scope. |
 | 2 | Deploy to own Cloudflare | **done** | Guided deployment creates/reuses account resources, applies D1 migrations, deploys the Worker, provisions required secrets, and reports connection URLs. |
 | 3 | D1/DO/Worker auto provision | **done** | Wrangler configuration, migrations, Durable Object binding, and guided resource provisioning are shipped; the user still supplies and owns the Cloudflare account. |
-| 4 | OAuth ChatGPT Personal Plugin | **partial** | DCR, bounded CIMD validation, authorization-code/PKCE, RFC 9207 issuer responses, rotating refresh, passkey owner login, and exact callbacks are implemented. A manual live ChatGPT compatibility receipt exists; reproducible automated external E10 evidence remains open. |
+| 4 | OAuth ChatGPT Personal Plugin | **partial** | DCR, bounded CIMD validation, authorization-code/PKCE, RFC 9207 issuer responses, rotating refresh, encrypted 60-second exact-retry convergence receipts, passkey owner login, and exact callbacks are implemented. Expired, mismatched, and advanced-family refresh reuse remains fail-closed. A manual live ChatGPT compatibility receipt exists; reproducible automated external E10 evidence remains open. |
 | 5 | Normal Chat read/write/command/session tools | **done** | Public MCP routing serves legacy `2025-03-26` and stateless modern `2026-07-28` from one authorization core with catalog-v2 compatibility. Catalog v1 is retained only as historical release evidence. Bounded `ownmesh mcp serve --stdio` is implemented with authenticated issuer binding, bounded messages, and no local-routing fallback. |
 | 6 | CLI/TUI set Full User / Full Access | **done** | No-argument TUI launch, setup policy selection, typed presets, and structured policy mutation are supported. Sensitive mutation uses fresh passkey approval. |
 | 7 | Privileged Broker per OS | **partial** | Networkless native lifecycle is implemented on Linux, macOS, and Windows while `ownmeshd` remains unprivileged. Linux has a native root receipt; macOS/Windows native release receipts and the full public E8 route remain open evidence. |
@@ -79,7 +79,7 @@ v1.2.16 stable product surface.
 - `scripts/check_release_quality.py` checks the publish graph, fail-closed
   workflow patterns, exact-artifact E2E dependency, toolchain/version alignment,
   release-note selection, and the registry-backed surface manifest. For the
-  v1.2.31 baseline the unsupported CLI count and surface-specific evidence
+  v1.2.32 baseline the unsupported CLI count and surface-specific evidence
   waiver count are both zero.
 - Release tags are annotated. Per
   [ADR 0001](./adr/0001-release-signing-sbom-provenance.md) they are also

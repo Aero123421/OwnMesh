@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.31 · **Last updated:** 2026-09-03
+**Baseline:** v1.2.32 · **Last updated:** 2026-09-04
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -29,6 +29,12 @@ durably committed terminal results so a device can reclaim completed journal
 receipts without weakening exact-once state. D1 audit metadata is also bounded
 by TTL, per-tenant admission, bounded summaries, and indexed maintenance
 batches (ADR 0020).
+
+The v1.2.32 OAuth refresh path records a single encrypted, 60-second rotation
+receipt so exact duplicate retries and response-loss retransmissions converge
+to the same successor token set. Reuse outside that bounded window, binding
+mismatches, and replay after the family advances still revoke the family
+fail-closed.
 
 ChatGPT CIMD interoperability was refreshed in v1.2.29: OwnMesh negotiates the
 current plural token-auth capability list and continues to select only the
