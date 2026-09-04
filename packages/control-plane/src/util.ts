@@ -480,13 +480,13 @@ export function internalContextHeaderName(): string {
   return INTERNAL_CONTEXT_HEADER;
 }
 
-function bytesToBase64Url(bytes: Uint8Array): string {
+export function bytesToBase64Url(bytes: Uint8Array): string {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function base64UrlToBytes(s: string): Uint8Array | null {
+export function base64UrlToBytes(s: string): Uint8Array | null {
   if (!s || /[^A-Za-z0-9_-]/.test(s)) return null;
   const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
   const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + pad;

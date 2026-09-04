@@ -29,6 +29,35 @@ test("refresh token reuse is detected and family revoked", async () => {
   assert.equal(res1.status, 200);
   const rotated = (await res1.json()) as { refresh_token: string; access_token: string };
 
+  // A duplicate retry within the receipt TTL converges to the same token set.
+  const resDup = await __test.handleOAuthToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: first.refresh_token,
+      }),
+    }),
+  );
+  assert.equal(resDup.status, 200);
+  const dup = (await resDup.json()) as { refresh_token: string; access_token: string };
+  assert.equal(dup.access_token, rotated.access_token);
+  assert.equal(dup.refresh_token, rotated.refresh_token);
+
+  // Advance the family so the original refresh is no longer a benign retry.
+  const res2 = await __test.handleOAuthToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: rotated.refresh_token,
+      }),
+    }),
+  );
+  assert.equal(res2.status, 200);
+
   const resReuse = await __test.handleOAuthToken(
     new Request("https://cp.test/oauth/token", {
       method: "POST",

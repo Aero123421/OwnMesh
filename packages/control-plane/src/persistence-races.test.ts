@@ -111,21 +111,29 @@ test("SQL auth code binding mismatch does not consume the code", async () => {
   assert.equal(correct.status, "redeemed");
 });
 
-test("SQL refresh CAS permits one rotation and treats the race as reuse", async () => {
+test("SQL refresh CAS converges duplicate rotations to the same successor token set", async () => {
   const s = store(); await s.ensureBootstrap();
   const initial = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read");
   const results = await Promise.all([s.rotateRefresh(initial.refresh_token), s.rotateRefresh(initial.refresh_token)]);
-  assert.equal(results.filter((r) => r.ok).length, 1);
-  assert.equal(results.filter((r) => !r.ok && r.error === "reuse").length, 1);
-  const winner = results.find((r) => r.ok);
-  const loser = results.find((r) => !r.ok);
-  // Winner returned ok; loser's family revocation then invalidates the successor.
-  if (winner?.ok) assert.equal(await s.getAccess(winner.token.access_token), null);
-  assert.ok(loser && !loser.ok && loser.error === "reuse");
-  // Replaying the original refresh remains reuse (ledger + revoked family).
+  assert.equal(results.every((r) => r.ok), true, "both duplicate rotations converge");
+  const [a, b] = results;
+  if (!a?.ok || !b?.ok) return;
+  assert.equal(a.token.access_token, b.token.access_token);
+  assert.equal(a.token.refresh_token, b.token.refresh_token);
+  assert.notEqual(await s.getAccess(a.token.access_token), null);
+
+  // Response-loss retry within the receipt TTL returns the same token set.
   const replay = await s.rotateRefresh(initial.refresh_token);
-  assert.equal(replay.ok, false);
-  if (!replay.ok) assert.equal(replay.error, "reuse");
+  assert.equal(replay.ok, true);
+  if (replay.ok) assert.equal(replay.token.access_token, a.token.access_token);
+
+  // After the family advances, replaying the original refresh is real reuse.
+  const advanced = await s.rotateRefresh(a.token.refresh_token);
+  assert.equal(advanced.ok, true);
+  if (!advanced.ok) return;
+  const reuse = await s.rotateRefresh(initial.refresh_token);
+  assert.equal(reuse.ok, false);
+  if (!reuse.ok) assert.equal(reuse.error, "reuse");
 });
 
 test("SQL refresh rotation never returns an already-revoked successor", async () => {
@@ -323,17 +331,17 @@ test("SQL expired refresh is invalid_grant and never reuse", async () => {
   if (!replay.ok) assert.equal(replay.error, "invalid_grant");
 });
 
-test("SQL refresh rotation batch is atomic: CAS winner only, single successor", async () => {
+test("SQL refresh rotation batch is atomic: duplicate retries converge and only one successor is persisted", async () => {
   const { store: s, db } = openStore(); await s.ensureBootstrap();
   const initial = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
   const [a, b] = await Promise.all([
     s.rotateRefresh(initial.refresh_token),
     s.rotateRefresh(initial.refresh_token),
   ]);
-  const oks = [a, b].filter((r) => r.ok);
-  const reuses = [a, b].filter((r) => !r.ok && r.error === "reuse");
-  assert.equal(oks.length, 1, "exactly one concurrent rotation wins");
-  assert.equal(reuses.length, 1, "loser observes reuse");
+  assert.equal(a.ok && b.ok, true, "both duplicate rotations converge");
+  if (!a.ok || !b.ok) return;
+  assert.equal(a.token.access_token, b.token.access_token);
+  assert.equal(a.token.refresh_token, b.token.refresh_token);
   const familyRows = db.prepare(
     `SELECT COUNT(*) AS total,
             SUM(CASE WHEN refresh_token_hash <> ? THEN 1 ELSE 0 END) AS successors
@@ -343,13 +351,19 @@ test("SQL refresh rotation batch is atomic: CAS winner only, single successor", 
     successors: number;
   };
   assert.equal(Number(familyRows.total), 2, "old token plus exactly one successor");
-  assert.equal(Number(familyRows.successors), 1, "CAS loser must not insert a successor");
-  if (!oks[0]!.ok) return;
-  // Winner's plaintext successor was returned only while unrevoked at return time;
-  // after loser family-revocation it must not authorize.
-  assert.equal(await s.getAccess(oks[0]!.token.access_token), null);
-  // Original refresh cannot be rotated again.
-  const again = await s.rotateRefresh(initial.refresh_token);
-  assert.equal(again.ok, false);
-  if (!again.ok) assert.equal(again.error, "reuse");
+  assert.equal(Number(familyRows.successors), 1, "CAS loser must not insert a second successor");
+  assert.notEqual(await s.getAccess(a.token.access_token), null);
+
+  // Response-loss retry within the receipt TTL returns the same token set.
+  const replay = await s.rotateRefresh(initial.refresh_token);
+  assert.equal(replay.ok, true);
+  if (replay.ok) assert.equal(replay.token.access_token, a.token.access_token);
+
+  // After the family advances, replaying the original refresh is real reuse.
+  const advanced = await s.rotateRefresh(a.token.refresh_token);
+  assert.equal(advanced.ok, true);
+  if (!advanced.ok) return;
+  const reuse = await s.rotateRefresh(initial.refresh_token);
+  assert.equal(reuse.ok, false);
+  if (!reuse.ok) assert.equal(reuse.error, "reuse");
 });
