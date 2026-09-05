@@ -20,6 +20,7 @@ import {
   type SqlStatement,
 } from "./store.ts";
 import { applyMcpOperationResult } from "./device-room.ts";
+import { D1OperationStore } from "./operation-store.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, "..", "migrations");
@@ -218,7 +219,7 @@ test("fast DO terminal result is not overwritten by late route persist (CAS loss
       const opId = String(payload.operation_id || "");
       const corr = operation.correlation_id ? String(operation.correlation_id) : undefined;
       // Simulate DO finishing (and CAS-updating store) before route handler finalizes.
-      const applied = await applyMcpOperationResult(store, {
+      const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
         operationId: opId,
         correlationId: corr,
         deviceId: deviceIdArg,

@@ -48,6 +48,7 @@ import {
 } from "./store.ts";
 import { hashCanonicalAction, nowIso } from "./util.ts";
 import { applyMcpOperationResult } from "./device-room.ts";
+import { D1OperationStore } from "./operation-store.ts";
 import { __test } from "./index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1275,7 +1276,7 @@ test("dispatch_uncertain: timeout keeps pending outbox; delayed result finalizes
   assert.equal(needsDispatchRedelivery(storedPending!), true);
 
   // Delayed agent completion must still CAS-finalize the pending operation.
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId: storedPending!.correlation_id,
     deviceId,

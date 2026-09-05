@@ -28,7 +28,16 @@ import {
   verifyEd25519Hex,
   verifyInternalContext,
 } from "./util.ts";
-import { createStore, type ControlPlaneStore, type McpOperationRecord, type WorkspaceRecord } from "./store.ts";
+import { createStore, boundMcpOperationRecord, type ControlPlaneStore, type McpOperationRecord, type McpOperationTransition, type WorkspaceRecord } from "./store.ts";
+import { DeviceOperationLog, type DeviceOpStorage } from "./device-op-store.ts";
+import {
+  D1OperationStore,
+  HybridOperationStore,
+  OperationRoomStore,
+  operationRoomOpsLimit,
+  resolveOperationStoreMode,
+  type OperationStore,
+} from "./operation-store.ts";
 import {
   authorityInvalidationError,
   authorityInvalidationSummary,
@@ -2027,6 +2036,22 @@ export type DeviceRoomStorage = {
   delete(key: string): Promise<boolean | void>;
   setAlarm?(scheduledTime: number): Promise<void>;
   deleteAlarm?(): Promise<boolean | void>;
+  /** Prefix scan for bounded TTL maintenance (Issue #224 P2). */
+  list?(prefix: string, limit?: number): Promise<string[]>;
+};
+
+/** Worker/DO env surface needed for operation authority routing (Issue #224 P2). */
+export type OperationAuthorityEnv = {
+  DB?: D1Database;
+  SESSION_SECRET?: string;
+  OWNMESH_OPERATION_STORE?: string;
+  MCP_OPS_MAX_PER_TENANT?: string;
+  OPERATION_ROOM?: {
+    idFromName(name: string): unknown;
+    get(id: unknown): {
+      fetch(request: Request): Promise<Response>;
+    };
+  };
 };
 
 /**
@@ -2035,7 +2060,15 @@ export type DeviceRoomStorage = {
  */
 export class DeviceRoom {
   state: DurableObjectState;
-  env: { DB?: D1Database; OAUTH_ISSUER?: string; OWNMESH_ALLOWED_ORIGINS?: string; SESSION_SECRET?: string };
+  env: {
+    DB?: D1Database;
+    OAUTH_ISSUER?: string;
+    OWNMESH_ALLOWED_ORIGINS?: string;
+    SESSION_SECRET?: string;
+    OWNMESH_OPERATION_STORE?: string;
+    MCP_OPS_MAX_PER_TENANT?: string;
+    OPERATION_ROOM?: OperationAuthorityEnv["OPERATION_ROOM"];
+  };
   router: DeviceRoomRouter;
   /** ws -> session_id */
   wsSessions = new Map<WebSocket, string>();
@@ -2050,7 +2083,15 @@ export class DeviceRoom {
    */
   private storageBroken = false;
 
-  constructor(state: DurableObjectState, env: { DB?: D1Database; OAUTH_ISSUER?: string; OWNMESH_ALLOWED_ORIGINS?: string; SESSION_SECRET?: string }) {
+  constructor(state: DurableObjectState, env: {
+    DB?: D1Database;
+    OAUTH_ISSUER?: string;
+    OWNMESH_ALLOWED_ORIGINS?: string;
+    SESSION_SECRET?: string;
+    OWNMESH_OPERATION_STORE?: string;
+    MCP_OPS_MAX_PER_TENANT?: string;
+    OPERATION_ROOM?: OperationAuthorityEnv["OPERATION_ROOM"];
+  }) {
     this.state = state;
     this.env = env;
     this.deviceId = "unknown";
@@ -2153,6 +2194,68 @@ export class DeviceRoom {
     return this.state.storage as unknown as DeviceRoomStorage;
   }
 
+  /**
+   * Issue #224 (P2): operation authority for one tenant.
+   * device_do + cutover -> Hybrid over the tenant OperationRoom with D1
+   * fallback for pre-cutover rows; otherwise the D1 adapter (unchanged).
+   * Throws storage_unavailable when the device record cannot be read, so
+   * callers fail closed instead of routing to the wrong authority.
+   */
+  private async deviceOpStore(): Promise<{ ops: OperationStore; tenantId: string }> {
+    const d1 = new D1OperationStore(createStore(this.env));
+    if (resolveOperationStoreMode(this.env) !== "device_do") {
+      return { ops: d1, tenantId: "" };
+    }
+    const store = createStore(this.env);
+    const device = await store.getDevice(this.deviceId);
+    if (!device) throw new Error("storage_unavailable:unknown_device");
+    // Same cutover gate as the Worker side: without a cursor this tenant
+    // stays D1-authoritative, so room paths can never fork authority.
+    let cutover: string | null = null;
+    try {
+      cutover = await store.getOperationStoreCutover(device.tenant_id);
+    } catch {
+      return { ops: d1, tenantId: device.tenant_id };
+    }
+    if (!cutover || cutover === "d1") return { ops: d1, tenantId: device.tenant_id };
+    const roomEnv = {
+      OPERATION_ROOM: this.env.OPERATION_ROOM,
+      SESSION_SECRET: this.env.SESSION_SECRET,
+    };
+    if (!roomEnv.OPERATION_ROOM || !roomEnv.SESSION_SECRET) return { ops: d1, tenantId: device.tenant_id };
+    return {
+      ops: new HybridOperationStore(
+        new OperationRoomStore(roomEnv, device.tenant_id, device.principal_id),
+        d1,
+      ),
+      tenantId: device.tenant_id,
+    };
+  }
+
+  /**
+   * Same as deviceOpStore but with an already-known tenant (no device read).
+   * Used on authenticated request paths carrying tenant claims.
+   */
+  private async tenantOpStore(tenantId: string, principalId: string): Promise<OperationStore> {
+    const d1 = new D1OperationStore(createStore(this.env));
+    if (resolveOperationStoreMode(this.env) !== "device_do" || !tenantId) return d1;
+    try {
+      const cutover = await createStore(this.env).getOperationStoreCutover(tenantId);
+      if (!cutover || cutover === "d1") return d1;
+    } catch {
+      return d1;
+    }
+    const roomEnv = {
+      OPERATION_ROOM: this.env.OPERATION_ROOM,
+      SESSION_SECRET: this.env.SESSION_SECRET,
+    };
+    if (!roomEnv.OPERATION_ROOM || !roomEnv.SESSION_SECRET) return d1;
+    return new HybridOperationStore(
+      new OperationRoomStore(roomEnv, tenantId, principalId),
+      d1,
+    );
+  }
+
   private async restoreFromStorage(): Promise<void> {
     try {
       const snap = await this.storage().get<PersistedRoomState>(ROOM_STATE_STORAGE_KEY);
@@ -2223,6 +2326,12 @@ export class DeviceRoom {
     if (expired.length === 0) return;
     if (!this.env.DB) throw new Error("storage_unavailable");
     const store = createStore(this.env);
+    let ops: OperationStore;
+    try {
+      ops = (await this.deviceOpStore()).ops;
+    } catch {
+      throw new Error("storage_unavailable");
+    }
     for (const pending of expired) {
       const operationId =
         typeof pending.payload?.operation_id === "string"
@@ -2252,7 +2361,7 @@ export class DeviceRoom {
       // applyMcpOperationResult is the single binding/CAS implementation. It
       // checks operation, correlation, device and terminal-status races before
       // writing; a stale snapshot can therefore never overwrite a completion.
-      const applied = await applyMcpOperationResult(store, {
+      const applied = await applyMcpOperationResult(ops, store, {
         operationId,
         correlationId: pending.correlation_id,
         deviceId: this.deviceId,
@@ -2469,6 +2578,10 @@ export class DeviceRoom {
   ): Promise<void> {
     if (!this.env.DB) throw new Error("storage_unavailable");
     const store = createStore(this.env);
+    // Issue #224 (P2): terminal fences read operation authority (room or D1).
+    const { ops } = await this.deviceOpStore().catch(() => {
+      throw new Error("storage_unavailable");
+    });
     let removed = false;
     for (const pending of [...this.router.pending.values()]) {
       if (pending.live_only) continue;
@@ -2481,7 +2594,7 @@ export class DeviceRoom {
       // particular, cancel_requested is a durable fence written before the
       // cancel signal is routed; never resurrect that original request from a
       // DeviceRoom pending snapshot.
-      const operation = await store.getMcpOperation(operationId);
+      const operation = await ops.get(operationId);
       if (operation && OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)) {
         this.router.pending.delete(pending.correlation_id);
         removed = true;
@@ -2493,7 +2606,7 @@ export class DeviceRoom {
       if (workspaceCheck !== "ok") {
         this.router.pending.delete(pending.correlation_id);
         removed = true;
-        await store.updateMcpOperation(
+        await ops.transition(
           operationId,
           {
             status: "failed",
@@ -2519,7 +2632,7 @@ export class DeviceRoom {
       const reason = await boundAuthorityInvalidationReason(store, pending.payload);
       this.router.pending.delete(pending.correlation_id);
       removed = true;
-      await store.updateMcpOperation(
+      await ops.transition(
         operationId,
         {
           status: "failed",
@@ -2560,10 +2673,13 @@ export class DeviceRoom {
 
   private async authoritativeTerminalCorrelations(correlations: string[]): Promise<string[]> {
     if (!this.env.DB || correlations.length === 0) return [];
-    const store = createStore(this.env);
+    // Tenant-resolved operation authority (room or D1) for the fence check.
+    const { ops } = await this.deviceOpStore().catch(() => {
+      throw new Error("storage_unavailable");
+    });
     const terminalCorrelations: string[] = [];
     for (const correlation of correlations) {
-      const operation = await store.getMcpOperation(correlation);
+      const operation = await ops.get(correlation);
       if (
         operation?.device_id === this.deviceId &&
         OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)
@@ -2749,6 +2865,8 @@ export class DeviceRoom {
           : correlationId;
       try {
         const store = createStore(this.env);
+        // Issue #224 (P2): dispatch-fence reads use operation authority.
+        const ops = await this.tenantOpStore(opCtx.claims.tenant_id, opCtx.claims.principal_id);
         // approval.decision uses a fresh notification operation id that is not
         // stored in D1. Its authorization, however, is deliberately bound to
         // the original approval_required operation. Revalidate that target at
@@ -2756,7 +2874,7 @@ export class DeviceRoom {
         // approval execute against a new local root.
         const approvalDecision = approvalDecisionBindingFromPayload(body.payload);
         const authorityOperationId = approvalDecision?.target_operation_id || operationId;
-        const operation = await store.getMcpOperation(authorityOperationId);
+        const operation = await ops.get(authorityOperationId);
         if (approvalDecision && !operation) {
           return json({ error: "binding_mismatch" }, { status: 403 });
         }
@@ -2793,7 +2911,7 @@ export class DeviceRoom {
           const workspaceCheck = await this.workspaceAuthorityCurrent(store, body.payload || {}, operation);
           if (workspaceCheck === "storage_unavailable") throw new Error("storage_unavailable");
           if (workspaceCheck !== "ok") {
-            await store.updateMcpOperation(
+            await ops.transition(
               authorityOperationId,
               {
                 status: "failed",
@@ -3429,9 +3547,13 @@ export class DeviceRoom {
       }
       try {
         const store = createStore(this.env);
+        // Issue #224 (P2): device results CAS into operation authority.
+        const { ops } = await this.deviceOpStore().catch(() => {
+          throw new Error("storage_unavailable");
+        });
         const pending = corr ? this.router.pending.get(corr) : undefined;
         const expectedApprovalDecision = approvalDecisionBindingFromPayload(pending?.payload);
-        const applied = await applyMcpOperationResult(store, {
+        const applied = await applyMcpOperationResult(ops, store, {
           operationId: result.mcp_result.operation_id,
           correlationId: corr,
           payload: result.mcp_result.payload,
@@ -3998,6 +4120,7 @@ async function applyWorkspaceActivationSideEffects(
  * (caller fail-closes). Room-only pending (no store row, no operation_id) is allowed.
  */
 export async function applyMcpOperationResult(
+  ops: OperationStore,
   store: ControlPlaneStore,
   opts: {
     operationId?: string;
@@ -4013,13 +4136,13 @@ export async function applyMcpOperationResult(
 
   let op: McpOperationRecord | null = null;
   if (wantOpId) {
-    op = await store.getMcpOperation(wantOpId);
+    op = await ops.get(wantOpId);
   }
   if (!op && opts.correlationId) {
-    op = await store.getMcpOperationByCorrelation(opts.correlationId);
+    op = await ops.getByCorrelation(opts.correlationId);
   }
   if (!op && payloadOpId && payloadOpId !== wantOpId) {
-    op = await store.getMcpOperation(payloadOpId);
+    op = await ops.get(payloadOpId);
   }
 
   // No store row: allow room-only routing when no operation_id was claimed, or when
@@ -4065,7 +4188,7 @@ export async function applyMcpOperationResult(
             return { ok: false, error: "approval_decision_binding_mismatch" };
           }
           const targetId = String(resultObj.target_operation_id);
-          const target = await store.getMcpOperation(targetId);
+          const target = await ops.get(targetId);
           if (!target) {
             return { ok: false, error: "unknown_operation" };
           }
@@ -4096,7 +4219,7 @@ export async function applyMcpOperationResult(
             : resultObj.result && typeof resultObj.result === "object"
               ? (resultObj.result as Record<string, unknown>)
               : { ...(resultObj as Record<string, unknown>) };
-          const updatedTarget = await store.updateMcpOperation(
+          const updatedTarget = await ops.update(
             target.operation_id,
             {
               status: targetStatus,
@@ -4129,7 +4252,7 @@ export async function applyMcpOperationResult(
           );
           if (!updatedTarget) {
             // Target may already be terminal (deny finalize raced) — accept as room-only.
-            const cur = await store.getMcpOperation(targetId);
+            const cur = await ops.get(targetId);
             if (cur && ["completed", "failed", "denied", "cancelled"].includes(cur.status)) {
               return { ok: true, record: cur };
             }
@@ -4162,7 +4285,7 @@ export async function applyMcpOperationResult(
   }
   // When both operationId and correlationId provided, they must resolve to the same row.
   if (opts.operationId && opts.correlationId) {
-    const byCorr = await store.getMcpOperationByCorrelation(opts.correlationId);
+    const byCorr = await ops.getByCorrelation(opts.correlationId);
     if (byCorr && byCorr.operation_id !== op.operation_id) {
       return { ok: false, error: "correlation_mismatch" };
     }
@@ -4384,7 +4507,7 @@ export async function applyMcpOperationResult(
   const truncatedFlag =
     data.truncated === true || data.durable_truncated === true || op.truncated === true;
 
-  const updated = await store.updateMcpOperation(
+  const updated = await ops.update(
     op.operation_id,
     {
       status,
@@ -4413,4 +4536,323 @@ export async function applyMcpOperationResult(
     return { ok: false, error: "cas_conflict" };
   }
   return { ok: true, record: updated };
+}
+
+/** Tenant key for the ops-room prune alarm. */
+const OP_ROOM_TENANT_KEY = "dxmeta:v1:tenant";
+/** Prune cadence after mutating writes (alarm coalesces; bounded work). */
+const OP_ROOM_PRUNE_ALARM_DELAY_MS = 5 * 60 * 1000;
+
+const OP_STORE_ACTIONS = new Set([
+  "claim",
+  "put",
+  "get",
+  "get_by_idempotency",
+  "get_by_correlation",
+  "transition",
+  "update",
+]);
+
+/**
+ * Tenant-sharded durable operation authority (Issue #224 plan F P2).
+ *
+ * One OperationRoom per tenant holds MCP operation rows, idempotency and
+ * correlation indexes, and the admission counter. DeviceRoom and Worker
+ * reach it over the same HMAC internal-context channel as /operation
+ * (op "op_store", tenant-bound, body-pinned). Storage failures fail closed
+ * with 503 and never invent operation state.
+ */
+export class OperationRoom {
+  state: DurableObjectState;
+  env: { SESSION_SECRET?: string; MCP_OPS_MAX_PER_TENANT?: string };
+  private readonly ready: Promise<void>;
+  private tenantId = "";
+
+  constructor(
+    state: DurableObjectState,
+    env: { SESSION_SECRET?: string; MCP_OPS_MAX_PER_TENANT?: string },
+  ) {
+    this.state = state;
+    this.env = env;
+    this.ready = this.state.blockConcurrencyWhile(async () => {
+      try {
+        const tenant = await this.state.storage.get<string>(OP_ROOM_TENANT_KEY);
+        if (typeof tenant === "string" && tenant) this.tenantId = tenant;
+      } catch {
+        // Fail closed per request below, never with a half-loaded room.
+      }
+    });
+  }
+
+  private storage(): DeviceOpStorage {
+    const backing = this.state.storage;
+    return {
+      get: <T = unknown>(key: string) => backing.get<T>(key) as Promise<T | undefined>,
+      put: (key: string, value: unknown) => backing.put(key, value).then(() => undefined),
+      delete: (key: string) => backing.delete(key),
+      list: async (prefix: string, limit = 128) => {
+        if (typeof backing.list !== "function") return [];
+        const entries = await backing.list({ prefix, limit });
+        return [...entries.keys()];
+      },
+    };
+  }
+
+  private log(): DeviceOperationLog {
+    return new DeviceOperationLog(this.storage(), operationRoomOpsLimit(this.env));
+  }
+
+  private async rememberTenant(tenantId: string): Promise<void> {
+    if (this.tenantId === tenantId) return;
+    this.tenantId = tenantId;
+    await this.storage().put(OP_ROOM_TENANT_KEY, tenantId);
+  }
+
+  private schedulePrune(delayMs = OP_ROOM_PRUNE_ALARM_DELAY_MS): void {
+    try {
+      const storage = this.state.storage as unknown as {
+        setAlarm?: (t: number) => Promise<void>;
+        getAlarm?: () => Promise<number | null>;
+      };
+      if (typeof storage.setAlarm !== "function") return;
+      const setAlarm = storage.setAlarm.bind(storage);
+      const getAlarm = typeof storage.getAlarm === "function"
+        ? storage.getAlarm.bind(storage)
+        : null;
+      const schedule = async () => {
+        // Do not postpone an already-pending earlier alarm under write load.
+        if (getAlarm) {
+          const current = await getAlarm().catch(() => null);
+          if (current !== null && current <= Date.now() + delayMs) return;
+        }
+        await setAlarm(Date.now() + delayMs);
+      };
+      void schedule().catch(() => undefined);
+    } catch {
+      // Alarm is best-effort hygiene; TTL rows stay readable until pruned.
+    }
+  }
+
+  async alarm(): Promise<void> {
+    await this.ready;
+    if (!this.tenantId) return;
+    try {
+      const stats = await this.log().prune(this.tenantId);
+      // Backlog remains: follow up soon instead of waiting a full interval.
+      if (stats.deleted + stats.compacted + stats.indexesReaped > 0) {
+        this.schedulePrune(60_000);
+      }
+    } catch {
+      // Next alarm retries; alarms must never throw operation state away.
+    }
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    await this.ready;
+    const url = new URL(request.url);
+    if (url.pathname !== "/op-store" || request.method !== "POST") {
+      return json({ error: "not_found" }, { status: 404 });
+    }
+    const tenantId = url.searchParams.get("tenant_id") || "";
+    if (!tenantId) return json({ error: "tenant_required" }, { status: 400 });
+    const rawBody = await readTextLimited(request, MAX_PAYLOAD_BYTES);
+    if (rawBody === null) {
+      return json({ error: "payload_too_large", max_bytes: MAX_PAYLOAD_BYTES }, { status: 413 });
+    }
+    const bodySha256 = await sha256Hex(rawBody);
+    const opCtx = await verifyInternalContext(
+      this.env.SESSION_SECRET,
+      request.headers.get(internalContextHeaderName()),
+      {
+        op: "op_store",
+        device_id: "",
+        method: "POST",
+        path: "/op-store",
+        body_sha256: bodySha256,
+        replayGuard: null,
+      },
+    );
+    if (!opCtx.ok) return json({ error: opCtx.error }, { status: opCtx.status });
+    if (opCtx.claims.tenant_id !== tenantId) {
+      return json({ error: "binding_mismatch" }, { status: 403 });
+    }
+    let body: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(rawBody);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return json({ error: "bad_json" }, { status: 400 });
+      }
+      body = parsed as Record<string, unknown>;
+    } catch {
+      return json({ error: "bad_json" }, { status: 400 });
+    }
+    if (typeof body.action !== "string" || !OP_STORE_ACTIONS.has(body.action)) {
+      return json({ error: "unknown_action" }, { status: 400 });
+    }
+    try {
+      await this.rememberTenant(tenantId);
+      const log = this.log();
+      switch (body.action) {
+        case "claim":
+        case "put": {
+          const op = readOpRecord(body.op, tenantId);
+          if (!op) return json({ error: "invalid_operation" }, { status: 400 });
+          if (body.action === "claim") {
+            const claimed = await log.claim(op);
+            this.schedulePrune();
+            return json({ outcome: claimed.outcome, op: claimed.op });
+          }
+          await log.put(op);
+          this.schedulePrune();
+          return json({});
+        }
+        case "get": {
+          if (typeof body.operation_id !== "string" || !body.operation_id) {
+            return json({ error: "operation_id_required" }, { status: 400 });
+          }
+          return json({ op: await log.get(body.operation_id, tenantId) });
+        }
+        case "get_by_idempotency": {
+          if (
+            typeof body.principal_id !== "string" ||
+            typeof body.device_id !== "string" ||
+            typeof body.idempotency_key !== "string" ||
+            !body.idempotency_key
+          ) {
+            return json({ error: "idempotency_required" }, { status: 400 });
+          }
+          return json({
+            op: await log.getByIdempotency({
+              principalId: body.principal_id,
+              tenantId,
+              deviceId: body.device_id,
+              idempotencyKey: body.idempotency_key,
+            }),
+          });
+        }
+        case "get_by_correlation": {
+          if (typeof body.correlation_id !== "string" || !body.correlation_id) {
+            return json({ error: "correlation_required" }, { status: 400 });
+          }
+          return json({ op: await log.getByCorrelation(body.correlation_id, tenantId) });
+        }
+        case "transition": {
+          if (typeof body.operation_id !== "string" || !body.operation_id) {
+            return json({ error: "operation_id_required" }, { status: 400 });
+          }
+          const transition = readTransition(body.transition);
+          if (!transition) return json({ error: "invalid_transition" }, { status: 400 });
+          const from = readStatuses(body.from_statuses);
+          if (from === null) return json({ error: "invalid_from_statuses" }, { status: 400 });
+          return json({ op: await log.transition(body.operation_id, tenantId, transition, from) });
+        }
+        case "update": {
+          if (typeof body.operation_id !== "string" || !body.operation_id) {
+            return json({ error: "operation_id_required" }, { status: 400 });
+          }
+          if (!isRecord(body.patch)) return json({ error: "invalid_patch" }, { status: 400 });
+          const from = readStatuses(body.from_statuses);
+          if (from === null) return json({ error: "invalid_from_statuses" }, { status: 400 });
+          const expected = body.expected_data === null || body.expected_data === undefined
+            ? undefined
+            : isRecord(body.expected_data)
+              ? (body.expected_data as Record<string, unknown>)
+              : null;
+          if (expected === null) return json({ error: "invalid_expected_data" }, { status: 400 });
+          return json({
+            op: await log.update(
+              body.operation_id,
+              tenantId,
+              body.patch as Partial<McpOperationRecord>,
+              from,
+              expected,
+            ),
+          });
+        }
+        default:
+          return json({ error: "unknown_action" }, { status: 400 });
+      }
+    } catch (error) {
+      // Internal channel: ids are safe to echo, never tokens or payloads.
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("mcp_operation_quota_exceeded")) {
+        return json({ error: message }, { status: 429 });
+      }
+      if (
+        message.startsWith("mcp_operation_exists") ||
+        message.startsWith("mcp_operation_idempotency_exists")
+      ) {
+        return json({ error: message }, { status: 409 });
+      }
+      return json({ error: "storage_unavailable" }, { status: 503 });
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Validate an inbound op record without trusting client content. */
+function readOpRecord(value: unknown, tenantId: string): McpOperationRecord | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.operation_id !== "string" || !value.operation_id) return null;
+  if (value.tenant_id !== tenantId) return null;
+  if (typeof value.principal_id !== "string" || !value.principal_id) return null;
+  if (typeof value.tool !== "string" || !value.tool) return null;
+  if (typeof value.status !== "string" || !value.status) return null;
+  try {
+    return boundMcpOperationRecord(value as unknown as McpOperationRecord);
+  } catch {
+    return null;
+  }
+}
+
+function readTransition(value: unknown): McpOperationTransition | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.status !== "string" || !value.status) return null;
+  const transition: McpOperationTransition = { status: value.status };
+  if (value.summary !== undefined) {
+    if (typeof value.summary !== "string") return null;
+    transition.summary = value.summary;
+  }
+  if (value.data !== undefined) {
+    if (!isRecord(value.data)) return null;
+    transition.data = value.data as Record<string, unknown>;
+  }
+  if (value.truncated !== undefined) {
+    if (typeof value.truncated !== "boolean") return null;
+    transition.truncated = value.truncated;
+  }
+  if (value.next_cursor !== undefined) {
+    if (value.next_cursor !== null && typeof value.next_cursor !== "string") return null;
+    transition.next_cursor = value.next_cursor as string | null;
+  }
+  if (value.approval_required !== undefined) {
+    if (typeof value.approval_required !== "boolean") return null;
+    transition.approval_required = value.approval_required;
+  }
+  for (const key of ["approval_url", "approval_id", "session_id"] as const) {
+    if (value[key] !== undefined) {
+      if (value[key] !== null && typeof value[key] !== "string") return null;
+      (transition as Record<string, unknown>)[key] = value[key];
+    }
+  }
+  if (value.warnings !== undefined) {
+    if (!Array.isArray(value.warnings) || !value.warnings.every((w) => typeof w === "string")) {
+      return null;
+    }
+    transition.warnings = [...(value.warnings as string[])];
+  }
+  if (value.updated_at !== undefined) {
+    if (typeof value.updated_at !== "string") return null;
+    transition.updated_at = value.updated_at;
+  }
+  return transition;
+}
+
+function readStatuses(value: unknown): string[] | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || !value.every((s) => typeof s === "string")) return null;
+  return [...(value as string[])];
 }

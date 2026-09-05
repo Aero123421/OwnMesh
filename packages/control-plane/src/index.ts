@@ -45,6 +45,8 @@ import {
   PUBLISHED_MCP_TOOLS,
 } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
+import { createOperationStoreResolver } from "./operation-store.ts";
+import { checkBudget } from "./quota-guard.ts";
 import {
   handleChatGptConnector,
   handleOwnerLogin,
@@ -98,6 +100,14 @@ export interface Env {
   OWNMESH_ALLOWED_ORIGINS?: string;
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
   MCP_OPS_MAX_PER_TENANT?: string;
+  /**
+   * Issue #224 (P2): operation authority. "d1" (default) keeps D1 authority;
+   * "device_do" routes device-routed operation rows to the tenant
+   * OperationRoom once a per-tenant cutover cursor exists. Unknown values
+   * fail safe to "d1".
+   */
+  OWNMESH_OPERATION_STORE?: string;
+  OPERATION_ROOM?: DurableObjectNamespace;
   AUDIT_RETENTION_DAYS?: string;
   AUDIT_MAX_PER_TENANT?: string;
   MCP_MAX_TIMEOUT_MS?: string;
@@ -196,6 +206,7 @@ async function enforceRateLimit(
 }
 
 export { DeviceRoom, TransferRoom, MCP_TOOLS };
+export { OperationRoom } from "./device-room.ts";
 export type { ControlPlaneStore };
 
 /** Optional injected store for unit tests (avoids global mutable singleton). */
@@ -630,9 +641,14 @@ async function handleFetch(
         const store = storeFor(env);
         const readiness = await schemaReadinessFor(env, store);
         const storage = env.DB ? "d1" : store.kind;
+        // Issue #224 (P4): write-budget awareness. A schema-readable store
+        // whose writes are quota-exhausted must not report ready: OAuth and
+        // MCP both need durable writes to serve traffic.
+        const budget = await checkBudget(store, env);
+        const authWriteReady = budget.mode !== "auth_only";
         // Browser OAuth must be usable before the instance is declared ready.
         const ready =
-          readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound && browserAuthBound;
+          readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound && browserAuthBound && authWriteReady;
         return json({
           ...base,
           status: ready ? "ok" : "not_ready",
@@ -642,6 +658,10 @@ async function handleFetch(
           session_secret_bound: sessionSecretBound,
           browser_auth_bound: browserAuthBound,
           durable_objects: Boolean(env.DEVICE_ROOM),
+          auth_write_ready: authWriteReady,
+          budget_mode: budget.mode,
+          budget_reset_at: budget.resetAt,
+          budget_probe_category: budget.probeCategory ?? null,
         }, { status: ready ? 200 : 503, noStore: true });
       } catch (error) {
         if (error instanceof MissingD1Error) {
@@ -767,16 +787,16 @@ async function handleFetch(
       if (!principal && !env.AUTH_PROVIDER && !ownerAuthConfigured(env) && !bypass) {
         return json({ error: "auth_provider_unavailable" }, { status: 503 });
       }
-      return handleAuthorize(authRequest, store, issuer, { principal: principal || undefined, allowDevBypass: bypass });
+      return handleAuthorize(authRequest, store, issuer, { principal: principal || undefined, allowDevBypass: bypass }, { budget: await checkBudget(store, env) });
     }
     if (url.pathname === "/oauth/token" && request.method === "POST") {
-      return handleToken(request, store);
+      return handleToken(request, store, { budget: await checkBudget(store, env) });
     }
     if (url.pathname === "/oauth/revoke" && request.method === "POST") {
       return handleRevoke(request, store);
     }
     if (url.pathname === "/oauth/device_authorization" && request.method === "POST") {
-      return handleDeviceAuthorization(request, store, issuer);
+      return handleDeviceAuthorization(request, store, issuer, undefined, { budget: await checkBudget(store, env) });
     }
     if (url.pathname === "/oauth/device") {
       if (request.method === "POST" && !sameOriginBrowserPost(request, issuer)) {
@@ -790,7 +810,7 @@ async function handleFetch(
       if (!principal && !env.AUTH_PROVIDER && !ownerAuthConfigured(env) && !bypass) {
         return json({ error: "auth_provider_unavailable" }, { status: 503 });
       }
-      return handleDeviceVerification(request, store, { principal: principal || undefined, allowDevBypass: bypass });
+      return handleDeviceVerification(request, store, { principal: principal || undefined, allowDevBypass: bypass }, { budget: await checkBudget(store, env) });
     }
 
     // Human approval for MCP approval_required ops: independent human auth +
@@ -917,6 +937,8 @@ async function handleFetch(
           // Short fixed fast path only; command timeout remains device-side.
           waitForDeviceMs: MCP_SYNC_WAIT_MS,
           maxTimeoutMs: parseMcpMaxTimeoutMs(env.MCP_MAX_TIMEOUT_MS),
+          operationStores: createOperationStoreResolver(env, store),
+          budgetState: await checkBudget(store, env),
           transferTicketSecret: env.SESSION_SECRET,
           terminalizeTransferRoom: env.TRANSFER_ROOM && env.SESSION_SECRET ? async (control) => {
             const signed = await issueTransferTerminalControl(env.SESSION_SECRET!, { v: 1, ...control });
@@ -1106,6 +1128,17 @@ export default {
       if (!isD1UnavailableError(error)) throw error;
       return storageUnavailableResponse(request);
     }
+  },
+  /**
+   * Issue #224 (P1/P4): scheduled retention drain so request traffic stops
+   * inheriting TTL catch-up bursts. Request-path leases stay as the fallback
+   * for deployments without a cron trigger. Enable with a `triggers.crons`
+   * entry (e.g. every 5 minutes); every batch stays indexed and capped.
+   */
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    if (!env.DB) return;
+    const store = storeFor(env);
+    await store.runRetentionSweep({ tenantLimit: 64 });
   },
 };
 

@@ -10,6 +10,7 @@
  */
 
 import type { ControlPlaneStore } from "./store.ts";
+import { secondsUntilUtcReset, type BudgetState } from "./quota-guard.ts";
 import {
   AUTH_PAGE_CSP,
   authLocale,
@@ -388,6 +389,27 @@ async function fetchClientMetadataDocument(
 }
 
 /**
+ * Issue #224 (P4): degraded-mode 503 for OAuth write endpoints.
+ * fail fast with temporarily_unavailable + Retry-After (UTC-midnight reset)
+ * instead of attempting D1 writes an exhausted budget cannot serve.
+ * Returns null when the budget allows the request.
+ */
+export function budgetUnavailable(budget?: BudgetState): Response | null {
+  if (!budget || budget.mode !== "auth_only") return null;
+  return jsonBase(
+    {
+      error: "temporarily_unavailable",
+      error_description: `authorization service degraded until ${budget.resetAt}`,
+    },
+    {
+      status: 503,
+      noStore: true,
+      headers: { "retry-after": String(secondsUntilUtcReset()) },
+    },
+  );
+}
+
+/**
  * RFC 7591 Dynamic Client Registration.
  *
  * Security contract:
@@ -500,7 +522,7 @@ export async function handleRegister(
   }
   const clientId = randomToken("client_").slice(0, 24);
   const clientName = body.client_name || "ownmesh-client";
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   await store.putClient({
     client_id: clientId,
     tenant_id: rec.tenant_id,
@@ -536,7 +558,12 @@ export async function handleAuthorize(
   store: ControlPlaneStore,
   issuer: string,
   security: OAuthRequestSecurity = {},
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
+  // Issue #224 (P4): fail fast in auth_only instead of burning reserved
+  // budget on authorize transactions that cannot complete.
+  const degraded = budgetUnavailable(opts?.budget);
+  if (degraded) return degraded;
   // The Worker records GET receipt before form parsing/authentication. Direct
   // internal callers have no forged-clock seam and fall back to handler entry.
   const requestReceivedAt = authorizeRequestReceipts.get(req) ?? Date.now();
@@ -548,7 +575,7 @@ export async function handleAuthorize(
   // solely from the stored snapshot (ignore any resubmitted/altered OAuth params).
   // index.ts merges form fields into url.searchParams before calling us.
   if (req.method === "POST" && url.searchParams.has("decision")) {
-    await store.ensureBootstrap();
+    await store.ensureBootstrapSeeded();
     let postPrincipal = security.principal;
     if (!postPrincipal && security.allowDevBypass) {
       postPrincipal = { id: "prin_dev", tenant_id: DEFAULT_TENANT, display_name: "prin_dev" };
@@ -647,7 +674,7 @@ export async function handleAuthorize(
     );
   }
 
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   let client = await store.getClient(clientId);
   // For a known client, reject an altered redirect before authentication.
   if (client && !isAllowedCimdClientId(clientId) && !client.redirect_uris.includes(redirect)) {
@@ -837,12 +864,17 @@ function escapeHtml(s: string): string {
 export async function handleToken(
   req: Request,
   store: ControlPlaneStore,
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
+  // Issue #224 (P4): RFC 6750-style fail-fast; token issuance (including
+  // refresh rotation) needs D1 writes that an exhausted budget cannot serve.
+  const degraded = budgetUnavailable(opts?.budget);
+  if (degraded) return degraded;
   const parsedBody = await readOAuthBody(req);
   if (parsedBody instanceof Response) return parsedBody;
   const body = parsedBody;
   const grant = body.grant_type;
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
 
   // Reject confidential-client auth. We only support public clients + PKCE (none).
   // Presence of client_secret (including empty string) is client_secret_post — fail closed.
@@ -967,7 +999,9 @@ export async function handleToken(
       return json({ error: "access_denied" }, { status: 400 });
     }
     if (rec.status === "pending") {
-      await store.markDeviceCodePolled(deviceCode);
+      // Throttle the last_polled_at write stream to the device-flow interval
+      // (Issue #224 P1); slow_down semantics below are unchanged.
+      await store.markDeviceCodePolled(deviceCode, Math.max(1_000, rec.interval_sec * 1000));
       // slow_down if polled too fast
       if (
         rec.last_polled_at &&
@@ -1042,13 +1076,19 @@ export async function handleDeviceAuthorization(
   store: ControlPlaneStore,
   issuer: string,
   userCodeGenerator: () => string = generateUserCode,
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
+  // Issue #224 (P4): code issuance is a durable write; fail fast when the
+  // budget cannot serve it. (Device polls go through the token endpoint,
+  // which answers 503 + Retry-After in the same mode.)
+  const degraded = budgetUnavailable(opts?.budget);
+  if (degraded) return degraded;
   const parsedBody = await readOAuthBody(req);
   if (parsedBody instanceof Response) return parsedBody;
   const body = parsedBody;
   const clientId = body.client_id || "";
   const scope = body.scope || DEFAULT_SCOPE;
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   if (!clientId || !(await store.getClient(clientId))) {
     return json({ error: "unauthorized_client" }, { status: 401 });
   }
@@ -1097,8 +1137,9 @@ export async function handleDeviceVerification(
   req: Request,
   store: ControlPlaneStore,
   security: OAuthRequestSecurity = {},
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   const locale = authLocale(req);
   let principal = security.principal;
   if (!principal && security.allowDevBypass) principal = { id: "prin_dev", tenant_id: DEFAULT_TENANT };
@@ -1166,6 +1207,9 @@ export async function handleDeviceVerification(
     const parsedBody = await readOAuthBody(req);
     if (parsedBody instanceof Response) return parsedBody;
     const body = parsedBody;
+    // Issue #224 (P4): decisions are durable writes; polls stay available.
+    const degraded = budgetUnavailable(opts?.budget);
+    if (degraded) return degraded;
     if ((body.decision !== "approve" && body.decision !== "deny") || !body.transaction_id || !body.csrf_token) {
       return json({ error: "invalid_request" }, { status: 400 });
     }

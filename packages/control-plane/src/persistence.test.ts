@@ -255,13 +255,13 @@ test("MCP admission and retention plans stay index-backed at 10k and 20k rows", 
           `EXPLAIN QUERY PLAN
            SELECT * FROM mcp_operations
            WHERE principal_id = ? AND tenant_id = ? AND device_id = ?
-             AND idempotency_key = ?
+             AND idempotency_key = ? AND length(idempotency_key) > 0
            ORDER BY created_at DESC LIMIT 1`,
         ).all("prin_fixture", "ten_fixture", "dev_fixture", "idem_fixture_00001") as Array<{
           detail: string;
         }>
       ).map((row) => row.detail).join("\n");
-      assert.match(detail, /uq_mcp_ops_idempotency|idx_mcp_ops_idempotency/);
+      assert.match(detail, /uq_mcp_ops_idempotency/);
       assert.doesNotMatch(detail, /SCAN mcp_operations/);
 
       const retention = (
