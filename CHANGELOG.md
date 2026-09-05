@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v1.2.33 — D1 write-amplification resolution (Issue #224 plan F)
+
+- Narrow status-transition CAS, seeded OAuth bootstrap, single receipt
+  cleanup, throttled device polls, scheduled retention sweep, and five
+  redundant hot-index drops (migration 0022, EXPLAIN-proven).
+- Opt-in tenant OperationRoom durable operation authority with hybrid D1
+  fallback (`OWNMESH_OPERATION_STORE=device_do` + cutover cursor).
+- Budget admission with read_only/auth_only degraded modes, quota-aware
+  readiness, and structured 503 + Retry-After semantics for MCP/OAuth.
+- CI-testable half of the Issue #227 connector recovery contract, plus
+  operator recovery documentation.
+
 ## v1.2.32 — Bounded OAuth refresh retry convergence
 
 - Added an encrypted, 60-second rotation receipt so concurrent exact refresh
