@@ -312,10 +312,17 @@ export class HybridOperationStore implements OperationStore {
   }
 
   async getByCorrelation(correlationId: string) {
+    // Post-cutover rows live only in the room; pre-cutover rows only in D1.
+    const primary = await this.primary.getByCorrelation(correlationId);
+    if (primary) return primary;
     return this.fallback.getByCorrelation(correlationId);
   }
 
-  put(op: McpOperationRecord) {
+  async put(op: McpOperationRecord) {
+    // Create-only across both authorities: a D1-owned id keeps the hybrid
+    // from shadowing it with a room duplicate.
+    const existing = await this.fallback.get(op.operation_id);
+    if (existing) throw new Error(`mcp_operation_exists:${op.operation_id}`);
     return this.primary.put(op);
   }
 
@@ -325,13 +332,16 @@ export class HybridOperationStore implements OperationStore {
     return this.fallback.transition(operationId, transition, fromStatuses);
   }
 
-  update(
+  async update(
     operationId: string,
     patch: Partial<McpOperationRecord>,
     fromStatuses?: string[],
     expectedData?: Record<string, unknown>,
   ) {
-    return this.primary.update(operationId, patch, fromStatuses, expectedData);
+    // Like transition: in-flight pre-cutover rows still terminalize on D1.
+    const primary = await this.primary.update(operationId, patch, fromStatuses, expectedData);
+    if (primary) return primary;
+    return this.fallback.update(operationId, patch, fromStatuses, expectedData);
   }
 }
 

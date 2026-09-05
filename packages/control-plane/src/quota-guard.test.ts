@@ -193,3 +193,45 @@ test("/health/ready reports budget state and fails on auth_only", async () => {
     __setTestStore(null);
   }
 });
+
+test("/health/ready surfaces a failing write probe with its category", async () => {
+  const store = new MemoryStore();
+  store.probeWriteReadiness = async () => ({ ok: false, category: "quota_exceeded" });
+  __setTestStore(store);
+  try {
+    const res = await worker.fetch(new Request("https://cp.test/health/ready"), readyEnv(), ctx);
+    assert.equal(res.status, 503);
+    const body = (await res.json()) as {
+      status: string;
+      auth_write_ready: boolean;
+      budget_mode: string;
+      budget_probe_category: string;
+    };
+    assert.equal(body.status, "not_ready");
+    assert.equal(body.auth_write_ready, false);
+    assert.equal(body.budget_mode, "auth_only");
+    assert.equal(body.budget_probe_category, "quota_exceeded");
+  } finally {
+    __setTestStore(null);
+  }
+});
+
+test("scheduled() drains retention through the injected store", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  __setTestStore(store);
+  try {
+    // No DB binding -> no-op, never throws.
+    await worker.scheduled(
+      {} as ScheduledEvent,
+      {} as unknown as Parameters<typeof worker.scheduled>[1],
+    );
+    // DB present -> sweep runs against the injected store.
+    await worker.scheduled(
+      {} as ScheduledEvent,
+      { ...readyEnv(), DB: {} } as unknown as Parameters<typeof worker.scheduled>[1],
+    );
+  } finally {
+    __setTestStore(null);
+  }
+});

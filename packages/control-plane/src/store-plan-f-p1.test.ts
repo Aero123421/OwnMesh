@@ -14,7 +14,7 @@ import type { D1Fingerprint } from "./d1-telemetry.ts";
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, "..", "migrations");
 
-function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
+function openSqliteStore(onPrepare?: (sql: string) => void): { db: DatabaseSync; store: SqlStore } {
   const db = new DatabaseSync(":memory:");
   for (const file of readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(migrationsDir, file), "utf8"));
@@ -23,6 +23,7 @@ function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
   let batchTail: Promise<void> = Promise.resolve();
   const adapter: SqlDatabase = {
     prepare(query: string): SqlStatement {
+      onPrepare?.(query);
       const stmt = db.prepare(query);
       let bound: SqlVal[] = [];
       const api: SqlStatement = {
@@ -246,9 +247,52 @@ test("markDeviceCodePolled throttles sub-interval polls without a write", async 
 });
 
 test("0022 index drops keep every hot lookup indexed (no SCAN)", async () => {
-  const { db, store } = openSqliteStore();
+  const issuedSql: string[] = [];
+  const { db, store } = openSqliteStore((sql) => {
+    issuedSql.push(sql);
+  });
   try {
     await store.ensureBootstrap();
+    // Prove the planner against the statements the store REALLY issues, not
+    // hand-written copies: EXPLAIN the captured lookup verbatim.
+    await store.putMcpOperation({
+      operation_id: "op_idx_1",
+      tenant_id: "ten_idx",
+      principal_id: "prin_idx",
+      device_id: "dev_idx",
+      tool: "ownmesh_fs_stat",
+      status: "completed",
+      summary: "index probe",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      correlation_id: "op_idx_1",
+      payload_hash: "ph_idx",
+      idempotency_key: "idem_idx_1",
+      policy_authority: "ownmesh_device",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    const found = await store.getMcpOperationByIdempotency({
+      principalId: "prin_idx",
+      tenantId: "ten_idx",
+      deviceId: "dev_idx",
+      idempotencyKey: "idem_idx_1",
+    });
+    assert.equal(found?.operation_id, "op_idx_1");
+    const lookupSql = issuedSql.find((sql) => sql.includes("FROM mcp_operations") && sql.includes("idempotency_key = ?"));
+    assert.ok(lookupSql, "idempotency lookup must be issued");
+    const livePlan = (
+      db.prepare(`EXPLAIN QUERY PLAN ${lookupSql}`).all("prin_idx", "ten_idx", "dev_idx", "k") as Array<{
+        detail: string;
+      }>
+    )
+      .map((row) => row.detail)
+      .join("\n");
+    assert.match(livePlan, /uq_mcp_ops_idempotency/);
+    assert.doesNotMatch(livePlan, /SCAN mcp_operations/);
     const plan = (sql: string, ...params: Array<string | number>) =>
       (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{ detail: string }>)
         .map((row) => row.detail)

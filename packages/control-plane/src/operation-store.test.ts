@@ -317,8 +317,7 @@ test("OperationRoom endpoint round-trips claims with tenant-bound auth", async (
   }).status, "completed");
 });
 
-test("OperationRoomStore client surfaces room errors without inventing state", async () => {
-  const calls: Array<{ tenant: string; action: string }> = [];
+test("OperationRoomStore client surfaces room errors without inventing state", async () => {  const calls: Array<{ tenant: string; action: string }> = [];
   const env = {
     SESSION_SECRET: OP_SECRET,
     OPERATION_ROOM: {
@@ -338,4 +337,58 @@ test("OperationRoomStore client surfaces room errors without inventing state", a
   assert.equal(await client.get("op_missing"), null);
   await assert.rejects(client.claim(makeOp("op_x")), /operation_room_500/);
   assert.deepEqual(calls[0], { tenant: "ten_ops", action: "get" });
+});
+
+test("Hybrid over a real OperationRoom covers claim, poll, and terminal flows", async () => {
+  const state = fakeDoState();
+  const room = new OperationRoom(
+    state as unknown as DurableObjectState,
+    { SESSION_SECRET: OP_SECRET, MCP_OPS_MAX_PER_TENANT: "100" },
+  );
+  // In-process DO wiring: the namespace stub calls room.fetch directly, so
+  // auth, validation, and storage all run for real.
+  const namespace = {
+    idFromName: (name: string) => ({ name }),
+    get: (_id: unknown) => ({
+      fetch: (request: Request) => room.fetch(request),
+    }),
+  };
+  const base = new MemoryStore();
+  await base.ensureBootstrap();
+  const d1 = new D1OperationStore(base);
+  const hybrid = new HybridOperationStore(
+    new OperationRoomStore(
+      { OPERATION_ROOM: namespace, SESSION_SECRET: OP_SECRET },
+      "ten_ops",
+      "prin_ops",
+    ),
+    d1,
+  );
+
+  // Claim a new key: D1 has no owner, the room creates it.
+  const created = await hybrid.claim(makeOp("op_e2e_1"));
+  assert.equal(created.outcome, "created");
+  assert.equal(created.op.operation_id, "op_e2e_1");
+
+  // Poll by id and by correlation through the hybrid.
+  assert.equal((await hybrid.get("op_e2e_1"))?.status, "pending");
+  assert.equal((await hybrid.getByCorrelation("op_e2e_1"))?.operation_id, "op_e2e_1");
+
+  // Terminalize through the hybrid (room primary).
+  const terminal = await hybrid.transition("op_e2e_1", { status: "completed", summary: "done" }, ["pending"]);
+  assert.equal(terminal?.status, "completed");
+  assert.equal(terminal?.summary, "done");
+
+  // Wide update falls back correctly and stays visible.
+  const wide = await hybrid.update("op_e2e_1", { summary: "wide-write" }, ["completed"]);
+  assert.equal(wide?.summary, "wide-write");
+
+  // A pre-cutover D1 row stays readable and terminalizable through the same handle.
+  await base.putMcpOperation(makeOp("op_legacy_e2e"));
+  assert.equal((await hybrid.get("op_legacy_e2e"))?.status, "pending");
+  const legacyTerminal = await hybrid.transition("op_legacy_e2e", { status: "failed", summary: "late result" }, ["pending"]);
+  assert.equal(legacyTerminal?.status, "failed");
+
+  // Duplicate put across authorities is refused instead of shadowing.
+  await assert.rejects(hybrid.put(makeOp("op_legacy_e2e")), /mcp_operation_exists/);
 });

@@ -796,7 +796,7 @@ async function handleFetch(
       return handleRevoke(request, store);
     }
     if (url.pathname === "/oauth/device_authorization" && request.method === "POST") {
-      return handleDeviceAuthorization(request, store, issuer);
+      return handleDeviceAuthorization(request, store, issuer, undefined, { budget: await checkBudget(store, env) });
     }
     if (url.pathname === "/oauth/device") {
       if (request.method === "POST" && !sameOriginBrowserPost(request, issuer)) {

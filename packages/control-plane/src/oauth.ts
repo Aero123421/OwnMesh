@@ -1076,7 +1076,13 @@ export async function handleDeviceAuthorization(
   store: ControlPlaneStore,
   issuer: string,
   userCodeGenerator: () => string = generateUserCode,
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
+  // Issue #224 (P4): code issuance is a durable write; fail fast when the
+  // budget cannot serve it. (Device polls go through the token endpoint,
+  // which answers 503 + Retry-After in the same mode.)
+  const degraded = budgetUnavailable(opts?.budget);
+  if (degraded) return degraded;
   const parsedBody = await readOAuthBody(req);
   if (parsedBody instanceof Response) return parsedBody;
   const body = parsedBody;

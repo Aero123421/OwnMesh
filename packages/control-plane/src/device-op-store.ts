@@ -260,12 +260,18 @@ export class DeviceOperationLog {
   }
 
   private async deleteRow(op: McpOperationRecord): Promise<void> {
-    await this.storage.delete(opKey(op.tenant_id, op.operation_id));
+    // Index-first ordering: a crash between steps leaves an orphan row
+    // (healed by TTL prune) rather than a dangling index that would block
+    // key reuse past its window.
     if (op.idempotency_key) {
       await this.storage.delete(
         idemKey(op.tenant_id, op.principal_id, op.device_id || "", op.idempotency_key),
       );
     }
+    if (op.correlation_id) {
+      await this.storage.delete(corrKey(op.tenant_id, op.correlation_id));
+    }
+    await this.storage.delete(opKey(op.tenant_id, op.operation_id));
     const occupancy = await this.count(op.tenant_id);
     await this.storage.put(countKey(op.tenant_id), Math.max(0, occupancy - 1));
   }
@@ -273,14 +279,15 @@ export class DeviceOperationLog {
   /**
    * Bounded TTL prune for the room alarm. Mirrors D1 retention semantics:
    * expired tombstones and keyless terminals are deleted, expired keyed
-   * terminals compact to small idempotency receipts.
+   * terminals compact to small idempotency receipts. A final bounded pass
+   * reaps dangling index entries from interrupted writes.
    */
   async prune(
     tenantId: string,
     now = Date.now(),
     limit = MCP_OPS_MAINTENANCE_BATCH,
-  ): Promise<{ deleted: number; compacted: number }> {
-    const stats = { deleted: 0, compacted: 0 };
+  ): Promise<{ deleted: number; compacted: number; indexesReaped: number }> {
+    const stats = { deleted: 0, compacted: 0, indexesReaped: 0 };
     if (!this.storage.list) return stats;
     const keys = await this.storage.list(`${OP_PREFIX}${tenantId}:`, Math.max(1, Math.min(512, limit * 2)));
     let examined = 0;
@@ -315,6 +322,27 @@ export class DeviceOperationLog {
           }),
         );
         stats.compacted += 1;
+      }
+    }
+    // Reap dangling index entries left by interrupted multi-key writes.
+    // Bounded: at most 64 index checks per prune pass.
+    let indexBudget = 64;
+    for (const prefix of [`${IDEM_PREFIX}${tenantId}${SEP}`, `${CORR_PREFIX}${tenantId}:`]) {
+      if (indexBudget <= 0) break;
+      const indexKeys = await this.storage.list(prefix, Math.min(64, indexBudget));
+      for (const indexKey of indexKeys) {
+        if (indexBudget-- <= 0) break;
+        const operationId = await this.storage.get<string>(indexKey);
+        if (typeof operationId !== "string" || !operationId) {
+          await this.storage.delete(indexKey);
+          stats.indexesReaped += 1;
+          continue;
+        }
+        const row = await this.storage.get<McpOperationRecord>(opKey(tenantId, operationId));
+        if (!row) {
+          await this.storage.delete(indexKey);
+          stats.indexesReaped += 1;
+        }
       }
     }
     return stats;

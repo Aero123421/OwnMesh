@@ -3961,13 +3961,12 @@ function d1ops(store: ControlPlaneStore): OperationStore {
 }
 
 /**
- * Issue #224 (P2): tools whose calls never create a device-routed operation
- * row, so the per-call audit row is always kept for them (no op receipt to
- * double as the trail).
+ * Issue #224 (P2): transfer tools always keep the D1 audit row — their
+ * multi-operation orchestration stays D1-authoritative, so no room receipt
+ * can double as their trail. (Polls and cancel resolve authority by tenant
+ * and are covered like other device-routed calls.)
  */
-const AUDIT_ALWAYS_TOOLS = new Set([
-  "ownmesh_get_operation",
-  "ownmesh_cancel_operation",
+const TRANSFER_AUDIT_TOOLS = new Set([
   "ownmesh_transfer_plan",
   "ownmesh_transfer_status",
   "ownmesh_transfer_get",
@@ -5859,7 +5858,11 @@ async function handleMcpCore(
     // attempts and meta tools always keep the D1 audit row (fail-closed trail).
     const opStores = opts.operationStores;
     let resolvedOps: { ops: OperationStore; auditCovered: boolean } | null = null;
-    if (opStores && deviceId && !injectionAttempt && !AUDIT_ALWAYS_TOOLS.has(name)) {
+    // Polls and cancel carry no device_id but resolve authority by tenant.
+    const needsAuthority = Boolean(deviceId) ||
+      name === "ownmesh_get_operation" ||
+      name === "ownmesh_cancel_operation";
+    if (opStores && needsAuthority && !injectionAttempt && !TRANSFER_AUDIT_TOOLS.has(name)) {
       resolvedOps = await opStores.forTenant(rec.tenant_id, rec.principal);
     }
     if (!resolvedOps?.auditCovered) {

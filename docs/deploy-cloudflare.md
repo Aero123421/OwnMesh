@@ -176,7 +176,10 @@ tenant operation room so operation rows leave the D1 budget:
    (tenant_id, cutover_at) VALUES ('<tenant>', '<iso>') ON CONFLICT(tenant_id)
    DO UPDATE SET cutover_at = excluded.cutover_at"`.
    Pre-cutover rows stay readable via hybrid fallback; in-flight operations
-   converge on retry. Roll back with `cutover_at = 'd1'`.
+   converge on retry. Roll back with `cutover_at = 'd1'`. Note: the Worker
+   caches cutover cursors for up to 60s per isolate, so a rollback (or
+   cutover) propagates within about a minute; rows written to the room in
+   that window keep their room receipts as the trail.
 5. Watch `/health/ready` (`auth_write_ready`, `budget_mode`,
    `budget_reset_at`) and the MCP `OWNMESH_QUOTA_*` errors. `auth_only`
    means D1 writes are exhausted: MCP fails fast and OAuth answers 503
@@ -184,7 +187,7 @@ tenant operation room so operation rows leave the D1 budget:
    Force a mode manually with `"OWNMESH_DEGRADED_MODE":
    "read_only" | "auth_only"` (unset = probe-driven).
 
-Expected structure (30% auth reserve): D1-default ~3,700–5,800 calls/day,
+Expected structure (30% auth reserve; projections pending Gate-1 baseline): D1-default ~3,700–5,800 calls/day,
 `device_do` ~30,000+/day with D1 holding auth only. Past ~100k calls/day
 (Workers request budget) move to Paid. See ADR 0021 for the full matrix.
 

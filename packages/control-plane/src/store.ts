@@ -2481,6 +2481,9 @@ export class MemoryStore implements ControlPlaneStore {
     deviceId: string;
     idempotencyKey: string;
   }): Promise<McpOperationRecord | null> {
+    // Parity with the SQL length(idempotency_key) > 0 predicate: empty keys
+    // never own a row on either backend.
+    if (!opts.idempotencyKey) return null;
     let best: McpOperationRecord | null = null;
     for (const op of this.mcpOperations.values()) {
       if (

@@ -2206,8 +2206,18 @@ export class DeviceRoom {
     if (resolveOperationStoreMode(this.env) !== "device_do") {
       return { ops: d1, tenantId: "" };
     }
-    const device = await createStore(this.env).getDevice(this.deviceId);
+    const store = createStore(this.env);
+    const device = await store.getDevice(this.deviceId);
     if (!device) throw new Error("storage_unavailable:unknown_device");
+    // Same cutover gate as the Worker side: without a cursor this tenant
+    // stays D1-authoritative, so room paths can never fork authority.
+    let cutover: string | null = null;
+    try {
+      cutover = await store.getOperationStoreCutover(device.tenant_id);
+    } catch {
+      return { ops: d1, tenantId: device.tenant_id };
+    }
+    if (!cutover || cutover === "d1") return { ops: d1, tenantId: device.tenant_id };
     const roomEnv = {
       OPERATION_ROOM: this.env.OPERATION_ROOM,
       SESSION_SECRET: this.env.SESSION_SECRET,
@@ -2226,9 +2236,15 @@ export class DeviceRoom {
    * Same as deviceOpStore but with an already-known tenant (no device read).
    * Used on authenticated request paths carrying tenant claims.
    */
-  private tenantOpStore(tenantId: string, principalId: string): OperationStore {
+  private async tenantOpStore(tenantId: string, principalId: string): Promise<OperationStore> {
     const d1 = new D1OperationStore(createStore(this.env));
     if (resolveOperationStoreMode(this.env) !== "device_do" || !tenantId) return d1;
+    try {
+      const cutover = await createStore(this.env).getOperationStoreCutover(tenantId);
+      if (!cutover || cutover === "d1") return d1;
+    } catch {
+      return d1;
+    }
     const roomEnv = {
       OPERATION_ROOM: this.env.OPERATION_ROOM,
       SESSION_SECRET: this.env.SESSION_SECRET,
@@ -2850,7 +2866,7 @@ export class DeviceRoom {
       try {
         const store = createStore(this.env);
         // Issue #224 (P2): dispatch-fence reads use operation authority.
-        const ops = this.tenantOpStore(opCtx.claims.tenant_id, opCtx.claims.principal_id);
+        const ops = await this.tenantOpStore(opCtx.claims.tenant_id, opCtx.claims.principal_id);
         // approval.decision uses a fresh notification operation id that is not
         // stored in D1. Its authorization, however, is deliberately bound to
         // the original approval_required operation. Revalidate that target at
@@ -4575,6 +4591,7 @@ export class OperationRoom {
       put: (key: string, value: unknown) => backing.put(key, value).then(() => undefined),
       delete: (key: string) => backing.delete(key),
       list: async (prefix: string, limit = 128) => {
+        if (typeof backing.list !== "function") return [];
         const entries = await backing.list({ prefix, limit });
         return [...entries.keys()];
       },
@@ -4591,18 +4608,26 @@ export class OperationRoom {
     await this.storage().put(OP_ROOM_TENANT_KEY, tenantId);
   }
 
-  private schedulePrune(): void {
+  private schedulePrune(delayMs = OP_ROOM_PRUNE_ALARM_DELAY_MS): void {
     try {
-      const maybeAlarm = (
-        this.state.storage as unknown as {
-          setAlarm?: (t: number) => Promise<void>;
+      const storage = this.state.storage as unknown as {
+        setAlarm?: (t: number) => Promise<void>;
+        getAlarm?: () => Promise<number | null>;
+      };
+      if (typeof storage.setAlarm !== "function") return;
+      const setAlarm = storage.setAlarm.bind(storage);
+      const getAlarm = typeof storage.getAlarm === "function"
+        ? storage.getAlarm.bind(storage)
+        : null;
+      const schedule = async () => {
+        // Do not postpone an already-pending earlier alarm under write load.
+        if (getAlarm) {
+          const current = await getAlarm().catch(() => null);
+          if (current !== null && current <= Date.now() + delayMs) return;
         }
-      ).setAlarm;
-      if (typeof maybeAlarm === "function") {
-        void maybeAlarm
-          .call(this.state.storage, Date.now() + OP_ROOM_PRUNE_ALARM_DELAY_MS)
-          .catch(() => undefined);
-      }
+        await setAlarm(Date.now() + delayMs);
+      };
+      void schedule().catch(() => undefined);
     } catch {
       // Alarm is best-effort hygiene; TTL rows stay readable until pruned.
     }
@@ -4612,7 +4637,11 @@ export class OperationRoom {
     await this.ready;
     if (!this.tenantId) return;
     try {
-      await this.log().prune(this.tenantId);
+      const stats = await this.log().prune(this.tenantId);
+      // Backlog remains: follow up soon instead of waiting a full interval.
+      if (stats.deleted + stats.compacted + stats.indexesReaped > 0) {
+        this.schedulePrune(60_000);
+      }
     } catch {
       // Next alarm retries; alarms must never throw operation state away.
     }

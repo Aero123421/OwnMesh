@@ -102,9 +102,12 @@ opt-in.
   `temporarily_unavailable` + `Retry-After` (UTC-midnight reset) in
   `auth_only`. Status polls stay available.
 
-### Capacity after this change
+### Capacity projection after this change (confirm via Gate-1 baseline)
 
-Measured structure (Free 100,000 rows/day, 30% auth reserve):
+Projected structure (Free 100,000 rows/day, 30% auth reserve) — the
+rows/call figures are model estimates from the #224 statement ledger, not
+production measurements yet. The 24h P0 baseline must confirm them before
+any capacity claim is advertised:
 
 | mode | rows/call | calls/day @30% reserve |
 | --- | --- | --- |
