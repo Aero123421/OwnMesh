@@ -19,6 +19,11 @@
  */
 
 import type { ControlPlaneStore, DeviceRecord, McpOperationRecord, McpOperationQuotaSnapshot, McpOperationTransition } from "./store.ts";
+import {
+  D1OperationStore,
+  type OperationStore,
+  type ResolvedOperationStores,
+} from "./operation-store.ts";
 import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   approvalSelectionReturnTo,
@@ -2645,7 +2650,7 @@ async function persistOp(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.startsWith("mcp_operation_exists:") || /unique|constraint/i.test(msg)) {
-      const existing = await loadOp(store, tracker, stamped.operation_id);
+      const existing = await loadOp(d1ops(store), tracker, stamped.operation_id);
       if (existing) return existing;
     }
     throw err;
@@ -2659,11 +2664,11 @@ async function persistOp(
  * No tracker fallback / resurrection of missing store rows.
  */
 async function loadOp(
-  store: ControlPlaneStore,
+  ops: OperationStore,
   tracker: OperationTracker,
   operationId: string,
 ): Promise<TrackedOperation | undefined> {
-  const rec = await store.getMcpOperation(operationId);
+  const rec = await ops.get(operationId);
   if (!rec) return undefined;
   const tracked = trackedFromRecord(rec);
   tracker.put(tracked);
@@ -2715,7 +2720,7 @@ function clampGetOperationWaitMs(raw: unknown): number {
  * old 100ms poll loop. The number of D1 reads never scales with wait_ms.
  */
 async function waitForAuthoritativeCompletion(
-  store: ControlPlaneStore,
+  ops: OperationStore,
   tracker: OperationTracker,
   initial: TrackedOperation,
   requestedMs: number | undefined,
@@ -2742,9 +2747,9 @@ async function waitForAuthoritativeCompletion(
       setTimeout(resolve, delayMs),
     );
     try {
-      const fresh = await loadOp(store, tracker, current.operation_id);
+      const fresh = await loadOp(ops, tracker, current.operation_id);
       if (fresh) {
-        const reconciled = await reconcileExpiredOperationOnPoll(store, tracker, fresh);
+        const reconciled = await reconcileExpiredOperationOnPoll(ops, tracker, fresh);
         current = reconciled || fresh;
       }
     } catch {
@@ -2770,7 +2775,7 @@ const EXPIRABLE_OPERATION_STATUSES = [
  * hard cap elapses they terminalize here the same way as ordinary ops.
  */
 async function reconcileExpiredOperationOnPoll(
-  store: ControlPlaneStore,
+  ops: OperationStore,
   tracker: OperationTracker,
   tracked: TrackedOperation,
 ): Promise<TrackedOperation | undefined> {
@@ -2782,7 +2787,7 @@ async function reconcileExpiredOperationOnPoll(
     expiresMs > Date.now()
   ) return tracked;
 
-  const updated = await store.updateMcpOperation(
+  const updated = await ops.update(
     tracked.operation_id,
     {
       status: "failed",
@@ -2810,7 +2815,7 @@ async function reconcileExpiredOperationOnPoll(
   }
   // A result/cancel may have won the race. Reload the authoritative row rather
   // than returning a stale pending view or overwriting the terminal winner.
-  return loadOp(store, tracker, tracked.operation_id);
+  return loadOp(ops, tracker, tracked.operation_id);
 }
 
 /**
@@ -2818,7 +2823,7 @@ async function reconcileExpiredOperationOnPoll(
  * No tracker-only path, write-back, or resurrection of missing rows.
  */
 async function patchOp(
-  store: ControlPlaneStore,
+  ops: OperationStore,
   tracker: OperationTracker,
   operationId: string,
   patch: Partial<TrackedOperation>,
@@ -2864,13 +2869,13 @@ async function patchOp(
     if (storePatch.approval_id !== undefined) transition.approval_id = storePatch.approval_id;
     if (storePatch.session_id !== undefined) transition.session_id = storePatch.session_id;
     if (storePatch.warnings !== undefined) transition.warnings = storePatch.warnings;
-    const transitioned = await store.transitionMcpOperation(operationId, transition, fromStatuses);
+    const transitioned = await ops.transition(operationId, transition, fromStatuses);
     if (!transitioned) return undefined;
     const tracked = trackedFromRecord(transitioned);
     tracker.put(tracked);
     return tracked;
   }
-  const updated = await store.updateMcpOperation(operationId, storePatch, fromStatuses, expectedData);
+  const updated = await ops.update(operationId, storePatch, fromStatuses, expectedData);
   if (!updated) return undefined;
   const tracked = trackedFromRecord(updated);
   tracker.put(tracked);
@@ -2883,15 +2888,15 @@ async function patchOp(
  * return the authoritative current record (e.g. a fast DO terminal result).
  */
 async function finalizeRoutedOp(
-  store: ControlPlaneStore,
+  ops: OperationStore,
   tracker: OperationTracker,
   operationId: string,
   patch: Partial<TrackedOperation>,
   fromStatuses: string[] = ["pending", "running"],
 ): Promise<TrackedOperation> {
-  const updated = await patchOp(store, tracker, operationId, patch, fromStatuses);
+  const updated = await patchOp(ops, tracker, operationId, patch, fromStatuses);
   if (updated) return updated;
-  const current = await loadOp(store, tracker, operationId);
+  const current = await loadOp(ops, tracker, operationId);
   if (current) return current;
   // Fail closed: create succeeded earlier; missing row is a hard fault.
   throw new Error(`mcp_operation_missing_after_cas:${operationId}`);
@@ -3464,6 +3469,7 @@ function dispatchRetryDelayMs(attempt: number): number {
  * correlation fences at the final socket boundary.
  */
 async function retryPendingDispatchOnPoll(
+  ops: OperationStore,
   store: ControlPlaneStore,
   tracker: OperationTracker,
   tracked: TrackedOperation,
@@ -3487,7 +3493,7 @@ async function retryPendingDispatchOnPoll(
   if (!(await boundCredentialGenerationCurrent(store, box.body))) {
     const reason = await boundAuthorityInvalidationReason(store, box.body.payload);
     return (await patchOp(
-      store,
+      d1ops(store),
       tracker,
       tracked.operation_id,
       {
@@ -3513,18 +3519,18 @@ async function retryPendingDispatchOnPoll(
   };
   const leasedData = withDispatchOutbox(tracked.data || {}, leasedBox);
   const leased = await patchOp(
-    store,
+    d1ops(store),
     tracker,
     tracked.operation_id,
     { data: leasedData, summary: "dispatch_retry_leased" },
     ["pending", "running"],
     tracked.data || {},
   );
-  if (!leased) return (await loadOp(store, tracker, tracked.operation_id)) || tracked;
+  if (!leased) return (await loadOp(ops, tracker, tracked.operation_id)) || tracked;
 
   // Cancellation can win immediately after the retry lease. Observe its fence
   // once more; DeviceRoom performs the same authoritative check after receipt.
-  const beforeRoute = await loadOp(store, tracker, tracked.operation_id);
+  const beforeRoute = await loadOp(ops, tracker, tracked.operation_id);
   if (!beforeRoute || beforeRoute.status === "cancel_requested") return beforeRoute || leased;
 
   let routed: Awaited<ReturnType<OperationRouter["routeToDevice"]>>;
@@ -3543,7 +3549,7 @@ async function retryPendingDispatchOnPoll(
     routed.status === "device_offline"
   ) {
     return (await patchOp(
-      store,
+      d1ops(store),
       tracker,
       tracked.operation_id,
       {
@@ -3566,7 +3572,7 @@ async function retryPendingDispatchOnPoll(
   }
 
   return (await patchOp(
-    store,
+    d1ops(store),
     tracker,
     tracked.operation_id,
     {
@@ -3928,7 +3934,40 @@ export type McpHandleOptions = {
     maxTimeoutMs?: number;
     /** Best-effort live DeviceRoom observation; never used for authorization. */
     presenceForDevice?: (device: DeviceRecord) => Promise<"online" | "offline" | "unknown">;
+    /**
+     * Issue #224 (P2): operation authority resolver. Device-routed flows use
+     * `forTenant` (room or D1); transfers and local tools stay on D1.
+     * Absent in unit-only callers, where every path stays D1-backed.
+     */
+    operationStores?: ResolvedOperationStores;
   };
+
+/** D1-backed OperationStore adapter, memoized per base store. */
+const d1AdapterCache = new WeakMap<ControlPlaneStore, OperationStore>();
+function d1ops(store: ControlPlaneStore): OperationStore {
+  let ops = d1AdapterCache.get(store);
+  if (!ops) {
+    ops = new D1OperationStore(store);
+    d1AdapterCache.set(store, ops);
+  }
+  return ops;
+}
+
+/**
+ * Issue #224 (P2): tools whose calls never create a device-routed operation
+ * row, so the per-call audit row is always kept for them (no op receipt to
+ * double as the trail).
+ */
+const AUDIT_ALWAYS_TOOLS = new Set([
+  "ownmesh_get_operation",
+  "ownmesh_cancel_operation",
+  "ownmesh_transfer_plan",
+  "ownmesh_transfer_status",
+  "ownmesh_transfer_get",
+  "ownmesh_transfer_send",
+  "ownmesh_transfer_cancel",
+  "ownmesh_transfer_list",
+]);
 
 function mintApprovalUrl(issuer: string | undefined, operationId: string): string | undefined {
   const base = (issuer || "").replace(/\/$/, "");
@@ -5011,7 +5050,7 @@ async function patchPublishedCleanupPlan(
     cleanup_generation: (meta.cleanup_generation || 0) + 1,
   };
   const updated = await patchOp(
-    store,
+    d1ops(store),
     tracker,
     plan.operation_id,
     { ...patch, data: { [TRANSFER_META_KEY]: next } },
@@ -5020,7 +5059,7 @@ async function patchPublishedCleanupPlan(
   );
   if (updated) return { plan: updated, meta: next, won: true };
 
-  const reloaded = await loadOp(store, tracker, plan.operation_id);
+  const reloaded = await loadOp(d1ops(store), tracker, plan.operation_id);
   const reloadedMeta = transferMeta(reloaded?.data);
   // A missing/invalid parent is fail-closed; do not manufacture tracker data.
   return reloaded && reloadedMeta
@@ -5147,7 +5186,7 @@ async function reconcileTransferExpiry(
   const expiresMs = Date.parse(meta.expires_at);
   if (!Number.isFinite(expiresMs) || expiresMs > Date.now()) return { plan, meta };
   const next: TransferPlanMeta = { ...meta, state: "expired", failure_phase: meta.state };
-  const updated = await patchOp(store, tracker, plan.operation_id, {
+  const updated = await patchOp(d1ops(store), tracker, plan.operation_id, {
     status: "failed",
     summary: "transfer expired before a terminal result",
     data: {
@@ -5161,7 +5200,7 @@ async function reconcileTransferExpiry(
     },
   }, ["pending", "running", "cancel_requested"]);
   if (updated) return { plan: updated, meta: next };
-  const reloaded = await loadOp(store, tracker, plan.operation_id);
+  const reloaded = await loadOp(d1ops(store), tracker, plan.operation_id);
   const reloadedMeta = reloaded ? transferMeta(reloaded.data) : null;
   return reloaded && reloadedMeta ? { plan: reloaded, meta: reloadedMeta } : { plan, meta };
 }
@@ -5190,7 +5229,7 @@ async function reconcileTransferStart(
     if (!destinationPlanId) { nextState = "failed"; status = "failed"; summary = "destination publication omitted immutable plan id"; }
     else {
       const cleanup: TransferPlanMeta = { ...meta, state: "source_cleanup", destination_plan_id: destinationPlanId };
-      const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "destination publication confirmed; source cleanup required", data: { [TRANSFER_META_KEY]: cleanup } }, ["pending", "running"]);
+      const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "running", summary: "destination publication confirmed; source cleanup required", data: { [TRANSFER_META_KEY]: cleanup } }, ["pending", "running"]);
       return updated
         ? reconcilePublishedSourceCleanup(store, tracker, updated, cleanup, cleanupContext)
         : { plan, meta };
@@ -5208,7 +5247,7 @@ async function reconcileTransferStart(
   const destinationPlanId = destination?.data?.plan_id;
   const completedPlanId = transferText(destinationPlanId);
   const next: TransferPlanMeta = { ...meta, state: nextState, ...(nextState === "completed" && completedPlanId ? { destination_plan_id: completedPlanId } : {}) };
-  const updated = await patchOp(store, tracker, plan.operation_id, { status, summary, data: { [TRANSFER_META_KEY]: next } }, ["pending", "running", "cancel_requested"]);
+  const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status, summary, data: { [TRANSFER_META_KEY]: next } }, ["pending", "running", "cancel_requested"]);
   return updated ? { plan: updated, meta: next } : { plan, meta };
 }
 
@@ -5242,13 +5281,13 @@ export async function claimTransferStartDispatch(
     live_ticket_deadline_ms: Date.now() + TRANSFER_TICKET_TTL_MS,
     pair_generation: (meta.pair_generation || 0) + 1,
   };
-  const claimed = await patchOp(store, tracker, operationId, {
+  const claimed = await patchOp(d1ops(store), tracker, operationId, {
     status: "running",
     summary: "ticket-bound transfer dispatch claimed",
     data: { [TRANSFER_META_KEY]: claimedMeta },
   }, ["pending"]);
   if (claimed) return { claimed: true, plan: claimed, meta: claimedMeta };
-  const current = await loadOp(store, tracker, operationId);
+  const current = await loadOp(d1ops(store), tracker, operationId);
   const currentMeta = current ? transferMeta(current.data) : null;
   if (!current || !currentMeta) throw new Error("transfer_start_claim_lost");
   return { claimed: false, plan: current, meta: currentMeta };
@@ -5270,7 +5309,7 @@ async function reconcileTransferCancellation(
   const controls = await Promise.all(ids.map((operationId) => store.getMcpOperation(operationId)));
   if (controls.some((op) => op?.status === "failed" || op?.status === "denied" || op?.status === "device_offline")) {
     const failed = { ...meta, state: "failed" as const };
-    const updated = await patchOp(store, tracker, plan.operation_id, { status: "failed", summary: "transfer cancellation cleanup failed", data: { [TRANSFER_META_KEY]: failed } }, ["cancel_requested", "running", "pending"]);
+    const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "failed", summary: "transfer cancellation cleanup failed", data: { [TRANSFER_META_KEY]: failed } }, ["cancel_requested", "running", "pending"]);
     return updated ? { plan: updated, meta: failed } : { plan, meta };
   }
   if (!controls.every((op) => op?.status === "completed" || op?.status === "cancelled")) return { plan, meta };
@@ -5296,7 +5335,7 @@ async function reconcileTransferCancellation(
     return { plan, meta };
   }
   const cancelled = { ...meta, state: "cancelled" as const };
-  const updated = await patchOp(store, tracker, plan.operation_id, { status: "cancelled", summary: "transfer cancellation confirmed by both Agents", data: { [TRANSFER_META_KEY]: cancelled } }, ["cancel_requested", "running", "pending"]);
+  const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "cancelled", summary: "transfer cancellation confirmed by both Agents", data: { [TRANSFER_META_KEY]: cancelled } }, ["cancel_requested", "running", "pending"]);
   return updated ? { plan: updated, meta: cancelled } : { plan, meta };
 }
 
@@ -5807,21 +5846,32 @@ async function handleMcpCore(
       ...(mcpOpsQuota.status !== "ok" ? [MCP_OPS_QUOTA_PRESSURE_WARNING] : []),
     ];
 
-    await store.appendAudit({
-      id: randomId("aud_"),
-      tenant_id: rec.tenant_id,
-      principal_id: rec.principal,
-      device_id: deviceId || undefined,
-      kind: "mcp.tool_call",
-      summary: name,
-      created_at: nowIso(),
-      meta: {
-        op: name,
-        correlation_id: correlation,
-        operation_id: operationId,
-        injection_attempt: injectionAttempt,
-      },
-    });
+    // Issue #224 (P2/P3): in device_do mode the operation receipt doubles as
+    // the audit trail for device-routed calls, so the per-call D1 audit row
+    // is skipped only when authority + trail both live in the room. Injection
+    // attempts and meta tools always keep the D1 audit row (fail-closed trail).
+    const opStores = opts.operationStores;
+    let resolvedOps: { ops: OperationStore; auditCovered: boolean } | null = null;
+    if (opStores && deviceId && !injectionAttempt && !AUDIT_ALWAYS_TOOLS.has(name)) {
+      resolvedOps = await opStores.forTenant(rec.tenant_id, rec.principal);
+    }
+    if (!resolvedOps?.auditCovered) {
+      await store.appendAudit({
+        id: randomId("aud_"),
+        tenant_id: rec.tenant_id,
+        principal_id: rec.principal,
+        device_id: deviceId || undefined,
+        kind: "mcp.tool_call",
+        summary: name,
+        created_at: nowIso(),
+        meta: {
+          op: name,
+          correlation_id: correlation,
+          operation_id: operationId,
+          injection_attempt: injectionAttempt,
+        },
+      });
+    }
 
     // ---- local control-plane tools (no device) ----
     if (name === "ownmesh_list_devices") {
@@ -5964,7 +6014,7 @@ async function handleMcpCore(
     if (name === "ownmesh_transfer_status" || name === "ownmesh_transfer_get" || name === "ownmesh_transfer_send" || name === "ownmesh_transfer_cancel") {
       const transferId = transferText(args.transfer_id);
       if (!transferId) return mcpError(id, -32602, "transfer_id required");
-      let plan = await loadOp(store, tracker, transferId);
+      let plan = await loadOp(d1ops(store), tracker, transferId);
       let meta = plan && plan.tool === "ownmesh_transfer_plan" ? transferMeta(plan.data) : null;
       if (!plan || !meta) return mcpError(id, -32004, "transfer_not_available");
       // Ownership is the first transfer boundary.  In particular, status is
@@ -6008,7 +6058,7 @@ async function handleMcpCore(
         await store.putMcpOperation({ operation_id: artifactId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_artifact_get", status: "pending", summary: "transfer artifact page requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, offset, max_bytes: maxBytes, expected_sha256: meta.source_sha256, expected_total_bytes: meta.source_size_bytes }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: artifactId, payload_hash: deviceOp.payload_hash, idempotency_key: artifactId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
         if (!["routed_to_device", "pending", "dispatch_uncertain"].includes(routed.status)) return mcpError(id, -32009, "artifact route failed");
-        const artifact = await loadOp(store, tracker, artifactId);
+        const artifact = await loadOp(d1ops(store), tracker, artifactId);
         return mcpResult(id, toolContent(artifact || { ...makeEnvelope({ operation_id: artifactId, status: "pending", device_id: meta.destination_device_id, summary: "transfer artifact page routed", data: { transfer: publicTransferMeta(meta), offset, max_bytes: maxBytes } }), tool: "__transfer_artifact_get", principal: rec.principal, tenant_id: rec.tenant_id, created_at: nowIso(), updated_at: nowIso() }));
       }
       if (name === "ownmesh_transfer_cancel") {
@@ -6024,7 +6074,7 @@ async function handleMcpCore(
         const activeTargets = targets.filter(([target]) => Boolean(target)) as Array<readonly [string, string, string, number, "source" | "destination"]>;
         if (activeTargets.length === 0) {
           const cancelled: TransferPlanMeta = { ...meta, state: "cancelled", epoch: meta.epoch + 1, fence: meta.fence + 1, cancellation_idempotency_key: key };
-          const updated = await patchOp(store, tracker, plan.operation_id, { status: "cancelled", summary: "transfer cancellation fenced before start", data: { [TRANSFER_META_KEY]: cancelled } }, ["pending", "running", "cancel_requested"]);
+          const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "cancelled", summary: "transfer cancellation fenced before start", data: { [TRANSFER_META_KEY]: cancelled } }, ["pending", "running", "cancel_requested"]);
           if (!updated) return mcpError(id, -32009, "transfer cancellation race");
           return mcpResult(id, toolContent({ ...updated, data: { transfer: publicTransferMeta(cancelled) } }));
         }
@@ -6038,7 +6088,7 @@ async function handleMcpCore(
           return { operationId, deviceId, deviceOp, role };
         }));
         const cancelling: TransferPlanMeta = { ...cancellationMeta, state: "cancelling", epoch: cancellationMeta.epoch + 1, fence: cancellationMeta.fence + 1, cancellation_idempotency_key: key, source_cancel_operation_id: cancelOps.find((entry) => entry.role === "source")?.operationId, destination_cancel_operation_id: cancelOps.find((entry) => entry.role === "destination")?.operationId };
-        const updated = await patchOp(store, tracker, plan.operation_id, { status: "cancel_requested", summary: "transfer cancellation controls prepared", data: { [TRANSFER_META_KEY]: cancelling } }, ["pending", "running", "cancel_requested"]);
+        const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "cancel_requested", summary: "transfer cancellation controls prepared", data: { [TRANSFER_META_KEY]: cancelling } }, ["pending", "running", "cancel_requested"]);
         if (!updated) return mcpError(id, -32009, "transfer cancellation race");
         await Promise.all(cancelOps.map(async ({ deviceId, deviceOp, operationId }) => {
           try { await router.routeToDevice(deviceId, deviceOp); } catch { await store.updateMcpOperation(operationId, { status: "failed", summary: "transfer cancellation route failed" }, ["pending"]); }
@@ -6071,7 +6121,7 @@ async function handleMcpCore(
               source_cancel_operation_id: undefined, destination_cancel_operation_id: undefined,
               source_send_revalidate_operation_id: undefined, destination_plan_id: undefined,
             };
-            const advanced = await patchOp(store, tracker, plan.operation_id, { status: "pending", summary: "retryable transfer disconnect; fresh preflight generation", data: { [TRANSFER_META_KEY]: fresh } }, ["running", "pending"]);
+            const advanced = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "pending", summary: "retryable transfer disconnect; fresh preflight generation", data: { [TRANSFER_META_KEY]: fresh } }, ["running", "pending"]);
             if (!advanced) return mcpError(id, -32009, "transfer recovery race");
             plan = advanced; meta = fresh;
             continue;
@@ -6089,7 +6139,7 @@ async function handleMcpCore(
           const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
           if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source preflight dispatch failed");
           const next: TransferPlanMeta = { ...meta, state: "source_preflight", source_preflight_operation_id: preflightId, send_idempotency_key: sendKey };
-          const updated = await patchOp(store, tracker, plan.operation_id, { status: "pending", summary: "source preflight dispatched", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
+          const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "pending", summary: "source preflight dispatched", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
           if (!updated) return mcpError(id, -32009, "transfer plan race");
           plan = updated; meta = next;
           sendEnvelope = updated;
@@ -6108,7 +6158,7 @@ async function handleMcpCore(
           const sourceDigest = sourcePlanObject?.sha256;
           if (source && ["failed", "denied", "device_offline", "cancelled"].includes(source.status)) {
             const terminal: TransferPlanMeta = { ...meta, state: source.status === "cancelled" ? "cancelled" : "failed", failure_phase: meta.state };
-            const updated = await patchOp(store, tracker, plan.operation_id, { status: source.status === "cancelled" ? "cancelled" : "failed", summary: "source preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
+            const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: source.status === "cancelled" ? "cancelled" : "failed", summary: "source preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
             plan = updated || plan; meta = terminal;
             sendEnvelope = plan; sendTransfer = publicTransferMeta(terminal);
             break;
@@ -6132,7 +6182,7 @@ async function handleMcpCore(
           const routed = await router.routeToDevice(bound.source_device_id, deviceOp);
           if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source final preflight dispatch failed");
           const next: TransferPlanMeta = { ...bound, state: "source_final_preflight", source_preflight_operation_id: finalSourceId };
-          const updated = await patchOp(store, tracker, plan.operation_id, { status: "pending", summary: "source final preflight dispatched", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
+          const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "pending", summary: "source final preflight dispatched", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
           if (!updated) return mcpError(id, -32009, "transfer plan race");
           plan = updated; meta = next;
           sendEnvelope = updated;
@@ -6146,7 +6196,7 @@ async function handleMcpCore(
           const finalHash = proof && typeof proof === "object" && !Array.isArray(proof) ? (proof as Record<string, unknown>).plan_sha256 : null;
           if (source && ["failed", "denied", "device_offline", "cancelled"].includes(source.status)) {
             const terminal: TransferPlanMeta = { ...meta, state: source.status === "cancelled" ? "cancelled" : "failed", failure_phase: meta.state };
-            const updated = await patchOp(store, tracker, plan.operation_id, { status: source.status === "cancelled" ? "cancelled" : "failed", summary: "final source preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
+            const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: source.status === "cancelled" ? "cancelled" : "failed", summary: "final source preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
             plan = updated || plan; meta = terminal;
             sendEnvelope = plan; sendTransfer = publicTransferMeta(terminal);
             break;
@@ -6163,7 +6213,7 @@ async function handleMcpCore(
           const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
           if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "destination preflight dispatch failed");
           const next: TransferPlanMeta = { ...meta, state: "destination_preflight", destination_preflight_operation_id: destinationId };
-          const updated = await patchOp(store, tracker, plan.operation_id, { status: "pending", summary: "destination preflight dispatched", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
+          const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "pending", summary: "destination preflight dispatched", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
           if (!updated) return mcpError(id, -32009, "transfer plan race");
           plan = updated; meta = next;
           sendEnvelope = updated;
@@ -6175,7 +6225,7 @@ async function handleMcpCore(
           const destination = destinationId ? await store.getMcpOperation(destinationId) : null;
           if (destination && ["failed", "denied", "device_offline", "cancelled"].includes(destination.status)) {
             const terminal: TransferPlanMeta = { ...meta, state: destination.status === "cancelled" ? "cancelled" : "failed", failure_phase: meta.state };
-            const updated = await patchOp(store, tracker, plan.operation_id, { status: destination.status === "cancelled" ? "cancelled" : "failed", summary: "destination preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
+            const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: destination.status === "cancelled" ? "cancelled" : "failed", summary: "destination preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
             plan = updated || plan; meta = terminal;
             sendEnvelope = plan; sendTransfer = publicTransferMeta(terminal);
             break;
@@ -6194,9 +6244,9 @@ async function handleMcpCore(
             const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
             if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source send-boundary revalidation dispatch failed");
             const claimed: TransferPlanMeta = { ...meta, source_send_revalidate_operation_id: revalidateId };
-            const updated = await patchOp(store, tracker, plan.operation_id, { status: "pending", summary: "source send-boundary revalidation dispatched", data: { [TRANSFER_META_KEY]: claimed } }, ["pending", "running"]);
+            const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "pending", summary: "source send-boundary revalidation dispatched", data: { [TRANSFER_META_KEY]: claimed } }, ["pending", "running"]);
             if (!updated) {
-              const current = await loadOp(store, tracker, plan.operation_id);
+              const current = await loadOp(d1ops(store), tracker, plan.operation_id);
               const currentMeta = current ? transferMeta(current.data) : null;
               if (!current || !currentMeta) return mcpError(id, -32009, "transfer plan race");
               plan = current; meta = currentMeta;
@@ -6210,7 +6260,7 @@ async function handleMcpCore(
           const revalidate = await store.getMcpOperation(meta.source_send_revalidate_operation_id);
           if (revalidate && ["failed", "denied", "device_offline", "cancelled"].includes(revalidate.status)) {
             const terminal: TransferPlanMeta = { ...meta, state: revalidate.status === "cancelled" ? "cancelled" : "failed", failure_phase: "destination_preflight" };
-            const updated = await patchOp(store, tracker, plan.operation_id, { status: revalidate.status === "cancelled" ? "cancelled" : "failed", summary: "source changed or send-boundary revalidation failed", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
+            const updated = await patchOp(d1ops(store), tracker, plan.operation_id, { status: revalidate.status === "cancelled" ? "cancelled" : "failed", summary: "source changed or send-boundary revalidation failed", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
             plan = updated || plan; meta = terminal;
             sendEnvelope = plan; sendTransfer = publicTransferMeta(terminal);
             break;
@@ -6278,7 +6328,7 @@ async function handleMcpCore(
           }
           if (sourceRouted.status !== "routed_to_device") return mcpError(id, -32009, "source transfer start dispatch failed");
           const sourceAckMeta: TransferPlanMeta = { ...meta, source_start_routed: true };
-          const sourceAck = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "source transfer start routed", data: { [TRANSFER_META_KEY]: sourceAckMeta } }, ["running"]);
+          const sourceAck = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "running", summary: "source transfer start routed", data: { [TRANSFER_META_KEY]: sourceAckMeta } }, ["running"]);
           if (!sourceAck) return mcpError(id, -32009, "transfer start route receipt race");
           let destinationRouted: { status: string };
           try { destinationRouted = await router.routeLiveToDevice(meta.destination_device_id, destinationStart); } catch { destinationRouted = { status: "dispatch_uncertain" }; }
@@ -6289,7 +6339,7 @@ async function handleMcpCore(
           }
           if (destinationRouted.status !== "routed_to_device") return mcpError(id, -32009, "destination transfer start dispatch failed");
           const completeAckMeta: TransferPlanMeta = { ...sourceAckMeta, destination_start_routed: true, live_ticket_deadline_ms: undefined };
-          const completeAck = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "ticket-bound transfer started", data: { [TRANSFER_META_KEY]: completeAckMeta } }, ["running"]);
+          const completeAck = await patchOp(d1ops(store), tracker, plan.operation_id, { status: "running", summary: "ticket-bound transfer started", data: { [TRANSFER_META_KEY]: completeAckMeta } }, ["running"]);
           if (!completeAck) return mcpError(id, -32009, "transfer start route receipt race");
           plan = completeAck; meta = completeAckMeta;
           sendEnvelope = completeAck;
@@ -6312,7 +6362,7 @@ async function handleMcpCore(
       });
       const transfers: Array<Record<string, unknown>> = [];
       for (const stored of candidates) {
-        let candidate = await loadOp(store, tracker, stored.operation_id);
+        let candidate = await loadOp(d1ops(store), tracker, stored.operation_id);
         let transfer = candidate?.tool === "ownmesh_transfer_plan" ? transferMeta(candidate.data) : null;
         if (!candidate || !transfer || candidate.principal !== rec.principal || candidate.tenant_id !== rec.tenant_id) continue;
         ({ plan: candidate, meta: transfer } = await reconcileTransferStart(store, tracker, candidate, transfer, router ? {
@@ -6331,8 +6381,13 @@ async function handleMcpCore(
     }
 
     if (name === "ownmesh_get_operation") {
+      // Issue #224 (P2): polls observe operation authority (room or D1).
+      const getStores: { ops: OperationStore; auditCovered: boolean } | null = resolvedOps
+        ?? (opStores ? await opStores.forTenant(rec.tenant_id, rec.principal) : null)
+        ?? { ops: d1ops(store), auditCovered: false };
+      const getOps = getStores.ops;
       const oid = String(args.operation_id || "");
-      let tracked = await loadOp(store, tracker, oid);
+      let tracked = await loadOp(getOps, tracker, oid);
       // Owner check: principal + tenant; never leak foreign ops.
       if (!tracked || tracked.principal !== rec.principal || tracked.tenant_id !== rec.tenant_id) {
         const env = makeEnvelope({
@@ -6350,7 +6405,7 @@ async function handleMcpCore(
         });
         return mcpResult(id, toolContent(env));
       }
-      tracked = await reconcileExpiredOperationOnPoll(store, tracker, tracked);
+      tracked = await reconcileExpiredOperationOnPoll(getOps, tracker, tracked);
       if (!tracked) {
         return mcpError(id, -32004, "operation disappeared during reconciliation", { operation_id: oid });
       }
@@ -6366,7 +6421,7 @@ async function handleMcpCore(
         }
       }
       if (router && tracked.device_id && readDispatchOutbox(tracked.data)?.state === "pending") {
-        tracked = await retryPendingDispatchOnPoll(store, tracker, tracked, router, {
+        tracked = await retryPendingDispatchOnPoll(getOps, store, tracker, tracked, router, {
           clientId: rec.client_id,
           scope: rec.scope,
         });
@@ -6377,7 +6432,7 @@ async function handleMcpCore(
         if (tryAcquireGetOperationWaiter(rec.tenant_id)) {
           try {
             tracked = await waitForAuthoritativeCompletion(
-              store,
+              getOps,
               tracker,
               tracked,
               waitMs,
@@ -6397,8 +6452,13 @@ async function handleMcpCore(
     }
 
     if (name === "ownmesh_cancel_operation") {
+      // Issue #224 (P2): cancel observes operation authority (room or D1).
+      const pollStores: { ops: OperationStore; auditCovered: boolean } | null = resolvedOps
+        ?? (opStores ? await opStores.forTenant(rec.tenant_id, rec.principal) : null)
+        ?? { ops: d1ops(store), auditCovered: false };
+      const pollOps = pollStores.ops;
       const oid = String(args.operation_id || "");
-      const candidate = await loadOp(store, tracker, oid);
+      const candidate = await loadOp(pollOps, tracker, oid);
       const tracked =
         candidate?.principal === rec.principal && candidate.tenant_id === rec.tenant_id
           ? candidate
@@ -6452,7 +6512,7 @@ async function handleMcpCore(
       // No device binding: local cancel is authoritative (still durable via target CAS).
       if (!tracked.device_id) {
         const updated = await patchOp(
-          store,
+          pollOps,
           tracker,
           oid,
           {
@@ -6481,7 +6541,7 @@ async function handleMcpCore(
       // eligible for reconnect redelivery. Terminal-result CAS remains the
       // winner if the Agent completed the operation before this transition.
       const fencedTarget = await patchOp(
-        store,
+        pollOps,
         tracker,
         oid,
         {
@@ -6492,7 +6552,7 @@ async function handleMcpCore(
         ["pending", "running", "approval_required", "cancel_requested"],
       );
       if (!fencedTarget) {
-        const latest = await loadOp(store, tracker, oid);
+        const latest = await loadOp(pollOps, tracker, oid);
         const env = makeEnvelope({
           operation_id: oid,
           status: latest?.status || "failed",
@@ -6693,7 +6753,7 @@ async function handleMcpCore(
         ) {
           const cancelConfirmed = routed.status === "completed";
           const marked = await patchOp(
-            store,
+            pollOps,
             tracker,
             cancelRow.operation_id,
             {
@@ -6711,7 +6771,7 @@ async function handleMcpCore(
           // for identical retry redelivery. The target was already fenced before
           // routing, so reconnect cannot run the original operation.
           const noted = await patchOp(
-            store,
+            pollOps,
             tracker,
             cancelRow.operation_id,
             {
@@ -6787,7 +6847,7 @@ async function handleMcpCore(
       // Keep the target fenced until an authoritative Agent result wins the
       // terminal CAS. DeviceRoom acceptance alone is not device delivery.
       const updatedTarget = await patchOp(
-        store,
+        pollOps,
         tracker,
         oid,
         {
@@ -6811,7 +6871,7 @@ async function handleMcpCore(
         );
       }
       // Target already terminal between claim and patch — surface current target.
-      const latest = await loadOp(store, tracker, oid);
+      const latest = await loadOp(pollOps, tracker, oid);
       const env = makeEnvelope({
         operation_id: oid,
         status: latest?.status || "failed",
@@ -6829,6 +6889,12 @@ async function handleMcpCore(
     if (!deviceId) {
       return mcpError(id, -32602, "device_id required", { tool: name });
     }
+
+    // Issue #224 (P2): operation authority for this call (room or D1).
+    const routeStores: { ops: OperationStore; auditCovered: boolean } | null = resolvedOps
+      ?? (opStores ? await opStores.forTenant(rec.tenant_id, rec.principal) : null)
+      ?? { ops: d1ops(store), auditCovered: false };
+    const ops = routeStores.ops;
 
     // Store re-validation of device ownership + credential expiry/revoke (fail closed).
     const operable = await store.assertDeviceOperableForMcp(deviceId, rec.principal, rec.tenant_id);
@@ -7158,7 +7224,7 @@ async function handleMcpCore(
     // facts replay the prior owner; drifted facts fail closed before any route.
     let claim: Awaited<ReturnType<ControlPlaneStore["claimMcpOperationByIdempotency"]>>;
     try {
-      claim = await store.claimMcpOperationByIdempotency({
+      claim = await ops.claim({
         operation_id: trackBase.operation_id,
         tenant_id: trackBase.tenant_id,
         principal_id: trackBase.principal,
@@ -7261,14 +7327,14 @@ async function handleMcpCore(
         replayed.status !== "cancel_requested" &&
         readDispatchOutbox(replayed.data)?.state === "pending"
       ) {
-        replayed = await retryPendingDispatchOnPoll(store, tracker, replayed, router, {
+        replayed = await retryPendingDispatchOnPoll(ops, store, tracker, replayed, router, {
           clientId: rec.client_id,
           scope: rec.scope,
         });
       }
       if (!skipSyncWait) {
         replayed = await waitForAuthoritativeCompletion(
-          store,
+          ops,
           tracker,
           replayed,
           opts.waitForDeviceMs,
@@ -7298,7 +7364,7 @@ async function handleMcpCore(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7318,7 +7384,7 @@ async function handleMcpCore(
     // Cancellation may race the narrow claim→route interval. Observe the
     // durable fence once more before entering DeviceRoom; DeviceRoom repeats
     // this check at its final dispatch boundary.
-    const beforeRoute = await loadOp(store, tracker, operationId);
+    const beforeRoute = await loadOp(ops, tracker, operationId);
     if (beforeRoute?.status === "cancel_requested") {
       return mcpResult(id, toolContent(beforeRoute));
     }
@@ -7336,7 +7402,7 @@ async function handleMcpCore(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7362,7 +7428,7 @@ async function handleMcpCore(
       routed.status === "denied"
     ) {
       const marked = await patchOp(
-        store,
+        ops,
         tracker,
         operationId,
         { data: markDispatchOutboxDispatched(trackBase.data || {}) },
@@ -7397,7 +7463,7 @@ async function handleMcpCore(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7444,7 +7510,7 @@ async function handleMcpCore(
           "device_room_route_uncertain: left pending for durable finalize (timeout or post-send throw)",
         ],
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7477,7 +7543,7 @@ async function handleMcpCore(
           correlation_id: correlation,
           warnings: injectWarnings,
         });
-        const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
           status: env.status,
           summary: env.summary,
           data: env.data,
@@ -7507,7 +7573,7 @@ async function handleMcpCore(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7538,7 +7604,7 @@ async function handleMcpCore(
         targetPreview: detail.target_preview,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7573,7 +7639,7 @@ async function handleMcpCore(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7668,7 +7734,7 @@ async function handleMcpCore(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: env.status,
         summary: env.summary,
         data: env.data,
@@ -7725,7 +7791,7 @@ async function handleMcpCore(
         correlationId: correlation,
         warnings: injectWarnings,
       });
-      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      const finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
         status: apr.status,
         summary: apr.summary,
         data: apr.data,
@@ -7741,7 +7807,7 @@ async function handleMcpCore(
       });
       return mcpResult(id, toolContent(finalOp));
     }
-    let finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+    let finalOp = await finalizeRoutedOp(ops, tracker, operationId, {
       status: env.status,
       summary: env.summary,
       data: env.data,
@@ -7757,7 +7823,7 @@ async function handleMcpCore(
     });
     if (!skipSyncWait) {
       finalOp = await waitForAuthoritativeCompletion(
-        store,
+        ops,
         tracker,
         finalOp,
         opts.waitForDeviceMs,
@@ -8270,7 +8336,7 @@ async function completeApprovalPost(
         );
       }
       const prepared = await patchOp(
-        store,
+        d1ops(store),
         defaultOpTracker,
         op.operation_id,
         {

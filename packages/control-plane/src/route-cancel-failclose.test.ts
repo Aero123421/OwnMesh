@@ -10,6 +10,7 @@ import {
 } from "./mcp.ts";
 import { MemoryStore } from "./store.ts";
 import { applyMcpOperationResult } from "./device-room.ts";
+import { D1OperationStore } from "./operation-store.ts";
 import { __test } from "./index.ts";
 import { randomId } from "./util.ts";
 
@@ -475,7 +476,7 @@ test("applyMcpOperationResult: cancel_requested accepts delayed cancelled", asyn
     updated_at: new Date().toISOString(),
   });
 
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId: corr,
     payload: { status: "cancelled", operation_id: opId, summary: "cancelled on device" },
@@ -512,7 +513,7 @@ test("applyMcpOperationResult: cancel_requested accepts delayed completed/failed
       updated_at: new Date().toISOString(),
     });
 
-    const applied = await applyMcpOperationResult(store, {
+    const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: opId,
       correlationId: corr,
       payload: { status: terminal, operation_id: opId, result: { late: true } },
@@ -553,7 +554,7 @@ test("applyMcpOperationResult: approval_decision_applied folds onto target opera
     updated_at: new Date().toISOString(),
   });
 
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     // decision notification id has no store row
     operationId: decisionOpId,
     correlationId: decisionOpId,
@@ -615,7 +616,7 @@ test("applyMcpOperationResult: approval_decision deny folds onto target", async 
     updated_at: new Date().toISOString(),
   });
 
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: decisionOpId,
     correlationId: decisionOpId,
     deviceId,
@@ -673,7 +674,7 @@ test("authoritative device failure terminal-fails both approve and deny decision
       updated_at: new Date().toISOString(),
     });
     const decisionOpId = `op_failure_control_${decision}`;
-    const applied = await applyMcpOperationResult(store, {
+    const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: decisionOpId,
       correlationId: decisionOpId,
       deviceId,

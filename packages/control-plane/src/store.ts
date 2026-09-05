@@ -533,7 +533,7 @@ export function snapshotMcpOperationQuota(count: number, limit: number): McpOper
   return { rows, limit: cap, status: mcpOpsQuotaStatus(rows, cap) };
 }
 
-function hasMcpIdempotencyReceipt(op: { idempotency_key?: string | null }): boolean {
+export function hasMcpIdempotencyReceipt(op: { idempotency_key?: string | null }): boolean {
   return typeof op.idempotency_key === "string" && op.idempotency_key.length > 0;
 }
 /** Hard cap on serialized client-visible operation data_json (results / metadata). */
@@ -801,11 +801,11 @@ export function boundMcpOperationRecord(op: McpOperationRecord): McpOperationRec
   return next;
 }
 
-function isTerminalMcpStatus(status: string): boolean {
+export function isTerminalMcpStatus(status: string): boolean {
   return MCP_OPS_TERMINAL.has(status);
 }
 
-function mcpOpAgeMs(op: Pick<McpOperationRecord, "updated_at" | "created_at">, now = Date.now()): number {
+export function mcpOpAgeMs(op: Pick<McpOperationRecord, "updated_at" | "created_at">, now = Date.now()): number {
   const stamp = Date.parse(op.updated_at || op.created_at || "");
   if (!Number.isFinite(stamp)) return 0;
   return Math.max(0, now - stamp);

@@ -76,6 +76,11 @@
       {
         "name": "TRANSFER_ROOM",
         "class_name": "TransferRoom"
+      },
+      {
+        // Issue #224 plan F (P2): tenant-sharded durable operation authority.
+        "name": "OPERATION_ROOM",
+        "class_name": "OperationRoom"
       }
     ]
   },
@@ -89,6 +94,11 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["TransferRoom"]
+    },
+    {
+      // Tenant-sharded operation log storage (Issue #224 plan F P2).
+      "tag": "v3",
+      "new_sqlite_classes": ["OperationRoom"]
     }
   ]
 }

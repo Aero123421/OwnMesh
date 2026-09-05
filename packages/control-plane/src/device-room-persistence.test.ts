@@ -28,6 +28,7 @@ import {
   type PersistedRoomState,
   type SessionAttachment,
 } from "./device-room.ts";
+import { D1OperationStore } from "./operation-store.ts";
 import {
   DEFAULT_TENANT,
   SqlStore,
@@ -2134,7 +2135,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   });
 
   // Mismatch device rejected
-  const badDev = await applyMcpOperationResult(store, {
+  const badDev = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId: corr,
     payload: { status: "completed", operation_id: opId },
@@ -2143,7 +2144,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   assert.equal(badDev.ok, false);
 
   // Unknown op rejected
-  const unknown = await applyMcpOperationResult(store, {
+  const unknown = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: "op_missing_zzzz",
     correlationId: corr,
     payload: { status: "completed", operation_id: "op_missing_zzzz" },
@@ -2152,7 +2153,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   assert.equal(unknown.ok, false);
 
   // Correlation mismatch rejected
-  const badCorr = await applyMcpOperationResult(store, {
+  const badCorr = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId: "cor_wrong",
     payload: { status: "completed", operation_id: opId },
@@ -2162,7 +2163,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   assert.equal((await store.getMcpOperation(opId))?.status, "pending");
 
   // Happy path CAS
-  const ok = await applyMcpOperationResult(store, {
+  const ok = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId: corr,
     payload: { status: "completed", operation_id: opId, result: { entries: [] } },
@@ -2172,7 +2173,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   assert.equal((await store.getMcpOperation(opId))?.status, "completed");
 
   // Second terminal CAS fails closed (no resurrection)
-  const again = await applyMcpOperationResult(store, {
+  const again = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId: corr,
     payload: { status: "failed", operation_id: opId },
@@ -2337,7 +2338,7 @@ test("workspace-bound result must echo the canonical workspace version", async (
     }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
-  const substituted = await applyMcpOperationResult(store, {
+  const substituted = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId, correlationId: operationId, deviceId,
     payload: { operation_id: operationId, status: "completed", result: {
       workspace_id: "ws_bound", workspace_version: 6, entries: [],
@@ -2345,7 +2346,7 @@ test("workspace-bound result must echo the canonical workspace version", async (
   });
   assert.equal(substituted.ok, false);
   assert.equal((await store.getMcpOperation(operationId))?.status, "pending");
-  const accepted = await applyMcpOperationResult(store, {
+  const accepted = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId, correlationId: operationId, deviceId,
     payload: { operation_id: operationId, status: "completed", result: {
       workspace_id: "ws_bound", workspace_version: 7, entries: [],
@@ -2363,7 +2364,7 @@ test("workspace-bound result must echo the canonical workspace version", async (
     }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
-  const falseAttribution = await applyMcpOperationResult(store, {
+  const falseAttribution = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: unboundOperationId, correlationId: unboundOperationId, deviceId,
     payload: { operation_id: unboundOperationId, status: "completed", result: {
       workspace_id: "ws_default", workspace_version: null, entries: [],
@@ -2371,7 +2372,7 @@ test("workspace-bound result must echo the canonical workspace version", async (
   });
   assert.equal(falseAttribution.ok, false);
   assert.equal((await store.getMcpOperation(unboundOperationId))?.status, "pending");
-  const unboundAccepted = await applyMcpOperationResult(store, {
+  const unboundAccepted = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: unboundOperationId, correlationId: unboundOperationId, deviceId,
     payload: { operation_id: unboundOperationId, status: "completed", result: {
       workspace_id: null, workspace_version: null, entries: [],
@@ -2626,7 +2627,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
     ephemeral_public_key: "11".repeat(32),
     ephemeral_signature: "22".repeat(64),
   };
-  const rejected = await applyMcpOperationResult(store, {
+  const rejected = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId,
     deviceId,
@@ -2645,7 +2646,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
   assert.deepEqual(rejected, { ok: false, error: "transfer_preflight_proof_mismatch" });
   assert.equal((await store.getMcpOperation(opId))?.status, "pending");
 
-  const accepted = await applyMcpOperationResult(store, {
+  const accepted = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId,
     deviceId,
@@ -2689,20 +2690,20 @@ test("transfer artifact results are bounded, hash-checked, and exact-plan bound"
   const bytes = new TextEncoder().encode("abc"); const content_base64 = btoa("abc");
   const page_sha256 = await sha256Hex(bytes);
   const base = { plan_id: "plan_destination", offset: 0, bytes: 3, total_bytes: 3, next_offset: null, truncated: false, encoding: "base64", content_base64, page_sha256, sha256: "c".repeat(64) };
-  const tampered = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...base, page_sha256: "d".repeat(64) } } });
+  const tampered = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...base, page_sha256: "d".repeat(64) } } });
   assert.deepEqual(tampered, { ok: false, error: "transfer_artifact_page_hash_mismatch" });
   assert.equal((await store.getMcpOperation(opId))?.status, "pending");
-  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: base } });
+  const accepted = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: base } });
   assert.equal(accepted.ok, true); assert.equal((await store.getMcpOperation(opId))?.data.content_base64, content_base64);
 
   const mismatchId = randomId("op_");
   await store.putMcpOperation({ operation_id: mismatchId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact mismatch", data: { offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 3 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: mismatchId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const mismatchedDigest = await applyMcpOperationResult(store, { operationId: mismatchId, correlationId: mismatchId, deviceId, payload: { operation_id: mismatchId, status: "completed", result: { ...base, sha256: "d".repeat(64) } } });
+  const mismatchedDigest = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: mismatchId, correlationId: mismatchId, deviceId, payload: { operation_id: mismatchId, status: "completed", result: { ...base, sha256: "d".repeat(64) } } });
   assert.deepEqual(mismatchedDigest, { ok: false, error: "transfer_artifact_result_binding_mismatch" });
 
   const overflowId = randomId("op_");
   await store.putMcpOperation({ operation_id: overflowId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact overflow", data: { offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 65537 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: overflowId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const tooMany = new Uint8Array(65537); const overflow = await applyMcpOperationResult(store, { operationId: overflowId, correlationId: overflowId, deviceId, payload: { operation_id: overflowId, status: "completed", result: { ...base, bytes: 65537, total_bytes: 65537, content_base64: btoa(String.fromCharCode(...tooMany)), page_sha256: "e".repeat(64) } } });
+  const tooMany = new Uint8Array(65537); const overflow = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: overflowId, correlationId: overflowId, deviceId, payload: { operation_id: overflowId, status: "completed", result: { ...base, bytes: 65537, total_bytes: 65537, content_base64: btoa(String.fromCharCode(...tooMany)), page_sha256: "e".repeat(64) } } });
   assert.deepEqual(overflow, { ok: false, error: "transfer_artifact_result_binding_mismatch" });
 });
 
@@ -2713,16 +2714,16 @@ test("transfer start receipts reject bearer/byte fields and require exact immuta
   const facts = { transfer_id: "xfer_start_1", plan_sha256: "a".repeat(64), content_sha256: "b".repeat(64), epoch: 2, fence: 3 };
   await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_destination", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: correlationId, workspace_id: "ws_destination", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const receipt = { transfer_id: facts.transfer_id, plan_id: "plan_destination", role: "destination", plan_sha256: facts.plan_sha256, epoch: 2, fence: 3, admitted: true, completed: true, published: true, artifact_sha256: facts.content_sha256 };
-  const rejected = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, ticket: "must-not-store" } } });
+  const rejected = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, ticket: "must-not-store" } } });
   assert.deepEqual(rejected, { ok: false, error: "transfer_start_result_unknown_field" });
-  const wrongArtifact = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, artifact_sha256: "c".repeat(64) } } });
+  const wrongArtifact = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, artifact_sha256: "c".repeat(64) } } });
   assert.deepEqual(wrongArtifact, { ok: false, error: "transfer_start_result_binding_mismatch" });
-  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: receipt } });
+  const accepted = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: receipt } });
   assert.equal(accepted.ok, true); assert.deepEqual((await store.getMcpOperation(opId))?.data, receipt);
 
   const reconnectId = randomId("op_");
   await store.putMcpOperation({ operation_id: reconnectId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_destination", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: reconnectId, workspace_id: "ws_destination", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const reconnect = await applyMcpOperationResult(store, { operationId: reconnectId, correlationId: reconnectId, deviceId, payload: { operation_id: reconnectId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_RECONNECT", message: "bearer distinctive-ticket-secret", details: { ciphertext_base64: "must-not-persist" } } } });
+  const reconnect = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: reconnectId, correlationId: reconnectId, deviceId, payload: { operation_id: reconnectId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_RECONNECT", message: "bearer distinctive-ticket-secret", details: { ciphertext_base64: "must-not-persist" } } } });
   assert.equal(reconnect.ok, true);
   const storedReconnect = await store.getMcpOperation(reconnectId);
   assert.deepEqual(storedReconnect?.data, { error: { code: "OWNMESH_E_TRANSFER_RECONNECT" } });
@@ -2732,7 +2733,7 @@ test("transfer start receipts reject bearer/byte fields and require exact immuta
 
   const cleanupPendingId = randomId("op_");
   await store.putMcpOperation({ operation_id: cleanupPendingId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_source", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: cleanupPendingId, workspace_id: "ws_source", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const cleanupPending = await applyMcpOperationResult(store, { operationId: cleanupPendingId, correlationId: cleanupPendingId, deviceId, payload: { operation_id: cleanupPendingId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_CLEANUP_PENDING", message: "distinctive-cleanup-path", details: { path: "must-not-persist" } } } });
+  const cleanupPending = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: cleanupPendingId, correlationId: cleanupPendingId, deviceId, payload: { operation_id: cleanupPendingId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_CLEANUP_PENDING", message: "distinctive-cleanup-path", details: { path: "must-not-persist" } } } });
   assert.equal(cleanupPending.ok, true);
   assert.deepEqual((await store.getMcpOperation(cleanupPendingId))?.data, { error: { code: "OWNMESH_E_TRANSFER_CLEANUP_PENDING" } });
 });
@@ -2742,9 +2743,9 @@ test("transfer cancel controls persist only target-bound cleanup proof", async (
   const deviceId = "dev_cancel_destination_01"; await seedActiveDevice(store, deviceId);
   const opId = randomId("op_"); const target = "op_transfer_destination";
   await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_cancel_control", status: "pending", summary: "cancel", data: { target_operation_id: target }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: opId, workspace_id: "ws_destination", policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const substituted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: "op_other", cancelled: true, signal_delivered: true } } });
+  const substituted = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: "op_other", cancelled: true, signal_delivered: true } } });
   assert.deepEqual(substituted, { ok: false, error: "transfer_cancel_result_binding_mismatch" });
-  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: target, cancelled: false, signal_delivered: false, note: "Agent restarted" } } });
+  const accepted = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: target, cancelled: false, signal_delivered: false, note: "Agent restarted" } } });
   assert.equal(accepted.ok, true);
   assert.deepEqual((await store.getMcpOperation(opId))?.data, { target_operation_id: target, cancelled: false, signal_delivered: false });
 });
@@ -2754,11 +2755,11 @@ test("source cleanup persists only an exact plan-bound completion receipt", asyn
   const deviceId = "dev_cleanup_source_01"; await seedActiveDevice(store, deviceId);
   const opId = randomId("op_"); const planId = "xfer_source_cleanup_01";
   await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_source_cleanup", status: "pending", summary: "cleanup", data: { plan_id: planId }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: opId, workspace_id: "ws_source", policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const substituted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: "xfer_other", cancelled: true, source_only: true } } });
+  const substituted = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: "xfer_other", cancelled: true, source_only: true } } });
   assert.deepEqual(substituted, { ok: false, error: "transfer_source_cleanup_result_binding_mismatch" });
-  const injected = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true, path: "secret/path" } } });
+  const injected = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true, path: "secret/path" } } });
   assert.deepEqual(injected, { ok: false, error: "transfer_source_cleanup_result_binding_mismatch" });
-  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true } } });
+  const accepted = await applyMcpOperationResult(new D1OperationStore(store), store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true } } });
   assert.equal(accepted.ok, true);
   assert.deepEqual((await store.getMcpOperation(opId))?.data, { plan_id: planId, cleaned: true, source_only: true });
 });
@@ -2795,7 +2796,7 @@ test("internal transfer errors and approvals never persist Agent diagnostics", a
         workspace_id: "ws_destination", policy_authority: "ownmesh_device",
         created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       });
-      const applied = await applyMcpOperationResult(store, {
+      const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
         operationId, correlationId: operationId, deviceId,
         payload: {
           operation_id: operationId, status: mode.status, approval_required: mode.approval,
@@ -2864,7 +2865,7 @@ test("operation.result store write failure fails closed without forward", async 
   // Direct helper surfaces throw to caller
   await assert.rejects(
     () =>
-      applyMcpOperationResult(brokenStore, {
+      applyMcpOperationResult(new D1OperationStore(brokenStore), brokenStore, {
         operationId: opId,
         correlationId: corr,
         payload: { status: "completed", operation_id: opId },

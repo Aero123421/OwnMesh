@@ -44,6 +44,7 @@ import {
   DeviceRoomHarness,
   type DeviceEnvelope,
 } from "./device-room.ts";
+import { D1OperationStore } from "./operation-store.ts";
 import { MemoryStore, MCP_OPS_QUOTA_PRESSURE_WARNING } from "./store.ts";
 import { randomId, nowIso } from "./util.ts";
 import { __test } from "./index.ts";
@@ -1381,7 +1382,7 @@ test("durable system diagnosis drops non-contract Agent fields", async () => {
       : "observed",
     observed_at: observedAt,
   });
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId,
     correlationId: operationId,
     deviceId,

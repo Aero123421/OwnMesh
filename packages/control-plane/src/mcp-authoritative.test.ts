@@ -21,6 +21,7 @@ import {
   type SqlStatement,
 } from "./store.ts";
 import { applyMcpOperationResult, DeviceRoomHarness } from "./device-room.ts";
+import { D1OperationStore } from "./operation-store.ts";
 import { randomId, sha256Hex } from "./util.ts";
 import worker, { __setTestStore } from "./index.ts";
 
@@ -445,7 +446,7 @@ test("SqlStore put/get/update MCP operation + result apply", async () => {
   assert.equal(got?.status, "pending");
   assert.equal((await store.getMcpOperationByCorrelation("cor_sql_1"))?.operation_id, opId);
 
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     correlationId: "cor_sql_1",
     payload: { status: "completed", summary: "done", result: { entries: ["a"] } },
     deviceId: "dev_sql_01",
@@ -494,7 +495,7 @@ test("approval decision result cannot substitute its exact-bound target or decis
     transaction_id: "apr_TxA",
   };
   const applyDecision = (target: string, decision: "approve" | "deny") =>
-    applyMcpOperationResult(store, {
+    applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: "op_decision_control",
       correlationId: "op_decision_control",
       deviceId,
@@ -1261,7 +1262,7 @@ test("DeviceRoom operation.result updates authoritative MCP store state", async 
   });
 
   // Direct apply path (same helper DeviceRoom uses)
-  const updated = await applyMcpOperationResult(store, {
+  const updated = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: opId,
     correlationId: corr,
     payload: {
@@ -1464,7 +1465,7 @@ test("workspace add result observes generation and does not report active before
       updated_at: createdAt,
     });
 
-    const before = await applyMcpOperationResult(store, {
+    const before = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: pendingOp,
       correlationId: pendingOp,
       deviceId,
@@ -1498,7 +1499,7 @@ test("workspace add result observes generation and does not report active before
       created_at: createdAt,
       updated_at: createdAt,
     });
-    const after = await applyMcpOperationResult(store, {
+    const after = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: readyOp,
       correlationId: readyOp,
       deviceId,
@@ -1547,7 +1548,7 @@ test("fresh-passkey approval_required always persists a same-origin approval_url
     updated_at: createdAt,
   });
 
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: "op_47485e58d8c9411e9cbc10",
     correlationId: "op_47485e58d8c9411e9cbc10",
     deviceId,
@@ -1625,7 +1626,7 @@ test("stale workspace list cannot revive a removed generation", async () => {
       created_at: createdAt,
       updated_at: createdAt,
     });
-    const removed = await applyMcpOperationResult(store, {
+    const removed = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: removeOp,
       correlationId: removeOp,
       deviceId,
@@ -1657,7 +1658,7 @@ test("stale workspace list cannot revive a removed generation", async () => {
       created_at: createdAt,
       updated_at: createdAt,
     });
-    const stale = await applyMcpOperationResult(store, {
+    const stale = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: listOp,
       correlationId: listOp,
       deviceId,
@@ -1720,7 +1721,7 @@ test("workspace add result cannot activate a different id than the reserved bind
       created_at: createdAt,
       updated_at: createdAt,
     });
-    const applied = await applyMcpOperationResult(store, {
+    const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: addOp,
       correlationId: addOp,
       deviceId,
@@ -1840,7 +1841,7 @@ test("removed workspace id can be re-registered after a new Agent generation", a
       created_at: createdAt,
       updated_at: createdAt,
     });
-    const applied = await applyMcpOperationResult(store, {
+    const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
       operationId: addOp,
       correlationId: addOp,
       deviceId,
@@ -1890,7 +1891,7 @@ test("approval_required without issuer does not persist a relative approval_url"
     created_at: createdAt,
     updated_at: createdAt,
   });
-  const applied = await applyMcpOperationResult(store, {
+  const applied = await applyMcpOperationResult(new D1OperationStore(store), store, {
     operationId: "op_approval_no_issuer01",
     correlationId: "op_approval_no_issuer01",
     deviceId,

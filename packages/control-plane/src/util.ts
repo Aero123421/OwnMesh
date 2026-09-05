@@ -355,7 +355,7 @@ export function generateUserCode(
 // ---------------------------------------------------------------------------
 
 /** Internal ops that the edge Worker may invoke on a DeviceRoom. */
-export type InternalContextOp = "ws" | "operation" | "live_operation";
+export type InternalContextOp = "ws" | "operation" | "live_operation" | "op_store";
 
 /**
  * Claims bound into `x-ownmesh-internal-context`.
@@ -662,7 +662,12 @@ export async function verifyInternalContext(
   const device_id = map.get("device_id");
   const principal_id = map.get("principal_id");
   const tenant_id = map.get("tenant_id");
-  if (v !== "1" || !expRaw || !nonce || !op || !device_id || principal_id === undefined || tenant_id === undefined) {
+  if (v !== "1" || !expRaw || !nonce || !op || principal_id === undefined || tenant_id === undefined) {
+    return { ok: false, error: "unauthorized", status: 401 };
+  }
+  // Tenant-sharded op-store calls carry no device (Issue #224 P2); every
+  // other op still requires a non-empty device binding.
+  if (op === "op_store" ? device_id === undefined : !device_id) {
     return { ok: false, error: "unauthorized", status: 401 };
   }
   const exp = Number(expRaw);

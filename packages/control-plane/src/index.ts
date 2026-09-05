@@ -45,6 +45,7 @@ import {
   PUBLISHED_MCP_TOOLS,
 } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
+import { createOperationStoreResolver } from "./operation-store.ts";
 import {
   handleChatGptConnector,
   handleOwnerLogin,
@@ -98,6 +99,14 @@ export interface Env {
   OWNMESH_ALLOWED_ORIGINS?: string;
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
   MCP_OPS_MAX_PER_TENANT?: string;
+  /**
+   * Issue #224 (P2): operation authority. "d1" (default) keeps D1 authority;
+   * "device_do" routes device-routed operation rows to the tenant
+   * OperationRoom once a per-tenant cutover cursor exists. Unknown values
+   * fail safe to "d1".
+   */
+  OWNMESH_OPERATION_STORE?: string;
+  OPERATION_ROOM?: DurableObjectNamespace;
   AUDIT_RETENTION_DAYS?: string;
   AUDIT_MAX_PER_TENANT?: string;
   MCP_MAX_TIMEOUT_MS?: string;
@@ -196,6 +205,7 @@ async function enforceRateLimit(
 }
 
 export { DeviceRoom, TransferRoom, MCP_TOOLS };
+export { OperationRoom } from "./device-room.ts";
 export type { ControlPlaneStore };
 
 /** Optional injected store for unit tests (avoids global mutable singleton). */
@@ -917,6 +927,7 @@ async function handleFetch(
           // Short fixed fast path only; command timeout remains device-side.
           waitForDeviceMs: MCP_SYNC_WAIT_MS,
           maxTimeoutMs: parseMcpMaxTimeoutMs(env.MCP_MAX_TIMEOUT_MS),
+          operationStores: createOperationStoreResolver(env, store),
           transferTicketSecret: env.SESSION_SECRET,
           terminalizeTransferRoom: env.TRANSFER_ROOM && env.SESSION_SECRET ? async (control) => {
             const signed = await issueTransferTerminalControl(env.SESSION_SECRET!, { v: 1, ...control });
