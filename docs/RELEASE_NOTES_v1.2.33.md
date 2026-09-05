@@ -81,5 +81,8 @@ The machine-checked shipped contract remains
   EXPLAIN proofs for every dropped index, full Rust cross-platform CI,
   dependency audits, SAST, secret scanning, SBOM, and release-quality
   gates are required before publication.
+- The statement wrapper threads immutable `bind()` returns so instrumented
+  writes execute bound on production D1 (caught pre-publish by the exact
+  packaged-artifact workerd gate); a regression test pins both bind styles.
 - Capacity figures are projections pending the Gate-1 production baseline;
   the `device_do` cutover runbook requires a 24h baseline first.

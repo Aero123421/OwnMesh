@@ -313,15 +313,21 @@ export function instrumentStatement<TStmt extends InstrumentedStatementSource>(
   fingerprint: D1Fingerprint,
   recorder: D1TelemetryRecorder,
 ): TStmt {
+  // D1 bind() returns the bound statement (immutable style) on real
+  // bindings, while test adapters mutate in place. Threading the return
+  // value through `current` is correct for both: dropping it runs the
+  // statement unbound on production D1 ("Wrong number of parameter
+  // bindings" on every write).
+  let current: InstrumentedStatementSource = inner;
   const api: InstrumentedStatementSource = {
     bind(...values: unknown[]): InstrumentedStatementSource {
-      inner.bind(...values);
+      current = current.bind(...values);
       return api;
     },
     async first<T = Record<string, unknown>>(colName?: string): Promise<T | null> {
       const start = Date.now();
       try {
-        const row = await inner.first<T>(colName);
+        const row = await current.first<T>(colName);
         recorder.record({ fingerprint, ok: true, durationMs: Date.now() - start, isWrite: false });
         return row;
       } catch (error) {
@@ -342,7 +348,7 @@ export function instrumentStatement<TStmt extends InstrumentedStatementSource>(
     }> {
       const start = Date.now();
       try {
-        const result = await inner.run<T>();
+        const result = await current.run<T>();
         const meta = extractD1Meta(result);
         recorder.record({
           fingerprint,
@@ -368,7 +374,7 @@ export function instrumentStatement<TStmt extends InstrumentedStatementSource>(
     async all<T = Record<string, unknown>>(): Promise<{ results: T[] }> {
       const start = Date.now();
       try {
-        const result = await inner.all<T>();
+        const result = await current.all<T>();
         const meta = extractD1Meta(result);
         recorder.record({
           fingerprint,
