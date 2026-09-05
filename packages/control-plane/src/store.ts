@@ -23,6 +23,12 @@ import {
   parseWorkspaceId,
   type WorkspaceOperableGate,
 } from "./workspace-activation.ts";
+import {
+  D1TelemetryRecorder,
+  instrumentStatement,
+  type D1Fingerprint,
+  type D1TelemetrySnapshot,
+} from "./d1-telemetry.ts";
 
 export type { WorkspaceOperableGate } from "./workspace-activation.ts";
 
@@ -3010,6 +3016,53 @@ export class SqlStore implements ControlPlaneStore {
     this.auditLimit = parseAuditMaxPerTenant(opts?.auditMaxPerTenant);
   }
 
+  /**
+   * Issue #224 (C-1-1): prepare through a fixed fingerprint so D1
+   * rows_read/rows_written attribute to audit / operation / OAuth paths.
+   * Observation only — SQL, bind values, and error behavior are unchanged.
+   */
+  private prepare(fingerprint: D1Fingerprint, sql: string): SqlStatement {
+    return instrumentStatement(this.db.prepare(sql), fingerprint, this.d1telemetry);
+  }
+
+  /**
+   * Batch-level telemetry. Member statements must be created with the raw
+   * `this.db.prepare` (never `this.prepare`): D1 executes batches server-side
+   * without calling member run(), while the sqlite test adapter calls it, so
+   * recording here exactly once keeps both environments consistent.
+   */
+  private batchStatements<T>(fingerprint: D1Fingerprint, statements: SqlStatement[]): Promise<T[]> {
+    if (!this.db.batch) {
+      throw new Error("SqlStore batch requires db.batch");
+    }
+    const start = Date.now();
+    return this.db.batch<T>(statements).then(
+      (results) => {
+        this.d1telemetry.recordBatchResult(fingerprint, results, Date.now() - start);
+        return results;
+      },
+      (error) => {
+        this.d1telemetry.recordBatchError(fingerprint, error, Date.now() - start);
+        throw error;
+      },
+    );
+  }
+
+  /** In-memory D1 statement counters (fixed fingerprints, no request content). */
+  private readonly d1telemetry = new D1TelemetryRecorder();
+
+  getD1TelemetrySnapshot(): D1TelemetrySnapshot {
+    return this.d1telemetry.snapshot();
+  }
+
+  renderD1BaselineReport(): string {
+    return this.d1telemetry.renderBaselineReport();
+  }
+
+  resetD1Telemetry(): void {
+    this.d1telemetry.reset();
+  }
+
   mcpOpsMaxPerTenant(): number {
     return this.mcpOpsLimit;
   }
@@ -3027,22 +3080,19 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   async ensureBootstrap(): Promise<void> {
-    await this.db
-      .prepare(
+    await this.prepare("oauth.bootstrap.tenant",
         `INSERT OR IGNORE INTO tenants (id, name, created_at) VALUES (?, ?, ?)`,
       )
       .bind(DEFAULT_TENANT, "Default", nowIso())
       .run();
-    await this.db
-      .prepare(
+    await this.prepare("oauth.bootstrap.principal",
         `INSERT OR IGNORE INTO principals (id, tenant_id, kind, display_name, created_at)
          VALUES (?, ?, ?, ?, ?)`,
       )
       .bind("prin_dev", DEFAULT_TENANT, "human", "Dev User", nowIso())
       .run();
     // Ensure a bootstrap OAuth client for device-code / dev flows.
-    await this.db
-      .prepare(
+    await this.prepare("oauth.bootstrap.client",
         `INSERT OR IGNORE INTO oauth_clients (client_id, tenant_id, client_name, redirect_uris, created_at)
          VALUES (?, ?, ?, ?, ?)`,
       )
@@ -3363,8 +3413,7 @@ export class SqlStore implements ControlPlaneStore {
 
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
     const hash = await sha256Hex(code.code);
-    await this.db
-      .prepare(
+    await this.prepare("oauth.code.insert",
         `INSERT INTO oauth_auth_codes
          (code_hash, client_id, principal_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, used, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
@@ -3391,7 +3440,7 @@ export class SqlStore implements ControlPlaneStore {
     }
     const codeHash = await sha256Hex(input.code);
     const checkedAt = nowIso();
-    const row = await this.db.prepare(
+    const row = await this.prepare("oauth.code.read",
       `SELECT ac.client_id, ac.principal_id, ac.redirect_uri, ac.scope,
               ac.code_challenge, ac.code_challenge_method, ac.expires_at,
               p.tenant_id
@@ -3423,7 +3472,7 @@ export class SqlStore implements ControlPlaneStore {
     // code-consumption update and the token insert both roll back.
     let results: BatchResult[];
     try {
-      results = await this.db.batch<BatchResult>([
+      results = await this.batchStatements<BatchResult>("oauth.code.redeem", [
         this.db.prepare(
           `INSERT INTO oauth_tokens
            (access_token_hash, refresh_token_hash, client_id, principal_id, scope,
@@ -3458,7 +3507,7 @@ export class SqlStore implements ControlPlaneStore {
       // A concurrent winner may surface as a unique-index conflict on some D1
       // adapters. Distinguish that from an actual storage failure without ever
       // exposing the authorization code or verifier.
-      const winner = await this.db.prepare(
+      const winner = await this.prepare("oauth.code.read",
         `SELECT 1 AS redeemed FROM oauth_tokens WHERE auth_code_hash = ?`,
       ).bind(codeHash).first("redeemed");
       if (winner) return { status: "invalid_grant" };
@@ -3516,8 +3565,7 @@ export class SqlStore implements ControlPlaneStore {
     const refreshExpiresAt = Date.now() + refreshTtlMs;
     const accessHash = await sha256Hex(access);
     const refreshHash = await sha256Hex(refresh);
-    await this.db
-      .prepare(
+    await this.prepare("oauth.token.issue",
         `INSERT INTO oauth_tokens
          (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, 0,
@@ -3545,7 +3593,7 @@ export class SqlStore implements ControlPlaneStore {
       principal,
       expires_at: expiresAt,
       refresh_expires_at: refreshExpiresAt,
-      revoked: Boolean(await this.db.prepare(
+      revoked: Boolean(await this.prepare("oauth.token.read",
         `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
       ).bind(fam).first("revoked")),
       refresh_family: fam,
@@ -3556,8 +3604,7 @@ export class SqlStore implements ControlPlaneStore {
 
   async getAccess(token: string): Promise<TokenRecord | null> {
     const hash = await sha256Hex(token);
-    const row = await this.db
-      .prepare(
+    const row = await this.prepare("oauth.token.read",
         `SELECT t.access_token_hash, t.refresh_token_hash, t.client_id, t.principal_id, t.scope,
                 t.refresh_family, t.refresh_used, t.revoked, t.expires_at, t.refresh_expires_at, p.tenant_id
          FROM oauth_tokens t JOIN principals p ON p.id = t.principal_id
@@ -3606,7 +3653,7 @@ export class SqlStore implements ControlPlaneStore {
     const now = nowIso(nowMs);
 
     // Cleanup expired rotation receipts in a bounded batch.
-    await this.db.prepare(
+    await this.prepare("oauth.refresh.receipt_cleanup",
       `DELETE FROM refresh_rotation_receipts
        WHERE rowid IN (
          SELECT rowid FROM refresh_rotation_receipts
@@ -3617,7 +3664,7 @@ export class SqlStore implements ControlPlaneStore {
     ).bind(now, REFRESH_ROTATION_RECEIPT_CLEANUP_BATCH).run();
 
     // Authoritative pre-read for metadata + expiry + tenant. CAS in the batch is the claim.
-    const row = await this.db.prepare(
+    const row = await this.prepare("oauth.token.read",
       `SELECT t.client_id, t.principal_id, p.tenant_id AS tenant_id, t.scope, t.refresh_family, t.revoked, t.refresh_used, t.refresh_expires_at
        FROM oauth_tokens t JOIN principals p ON p.id = t.principal_id
        WHERE t.refresh_token_hash = ?`,
@@ -3644,8 +3691,7 @@ export class SqlStore implements ControlPlaneStore {
       return { ok: true, token: duplicate };
     }
 
-    const used = await this.db
-      .prepare(
+    const used = await this.prepare("oauth.token.ledger_read",
         `SELECT refresh_family FROM used_refresh_tokens WHERE refresh_token_hash = ?`,
       )
       .bind(refreshHash)
@@ -3662,7 +3708,7 @@ export class SqlStore implements ControlPlaneStore {
     // replays outside the bounded grace window.
     if (used || row.refresh_used) {
       const fam = used?.refresh_family || row.refresh_family;
-      await this.db.batch([
+      await this.batchStatements("oauth.token.reuse_revoke", [
         this.db.prepare(
           `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
         ).bind(fam, now),
@@ -3680,7 +3726,7 @@ export class SqlStore implements ControlPlaneStore {
         ).bind(row.principal_id),
       ]);
       if (!used) {
-        await this.db.prepare(
+        await this.prepare("oauth.token.ledger_write",
           `INSERT OR IGNORE INTO used_refresh_tokens (refresh_token_hash, refresh_family, used_at) VALUES (?, ?, ?)`,
         ).bind(refreshHash, fam, now).run();
       }
@@ -3716,7 +3762,7 @@ export class SqlStore implements ControlPlaneStore {
     // 3) Insert successor only if old token claimed and no other live unused token in family.
     // 4) Advance issuance generation for observability only.
     // 5) Store a rotation receipt keyed by the old refresh hash for duplicate convergence.
-    const batchResults = await this.db.batch<BatchResult>([
+    const batchResults = await this.batchStatements<BatchResult>("oauth.token.rotate_batch", [
       this.db.prepare(
         `DELETE FROM refresh_rotation_receipts
          WHERE rowid IN (
@@ -3810,11 +3856,11 @@ export class SqlStore implements ControlPlaneStore {
         return { ok: true, token: winner };
       }
 
-      const raced = await this.db.prepare(
+      const raced = await this.prepare("oauth.token.read",
         `SELECT refresh_family FROM oauth_tokens WHERE refresh_token_hash = ? AND refresh_used = 1`,
       ).bind(refreshHash).first<{ refresh_family: string }>();
       if (raced) {
-        await this.db.batch([
+        await this.batchStatements("oauth.token.reuse_revoke", [
           this.db.prepare(
             `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
           ).bind(raced.refresh_family, nowIso()),
@@ -3830,11 +3876,11 @@ export class SqlStore implements ControlPlaneStore {
         ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
       }
-      const ledger = await this.db.prepare(
+      const ledger = await this.prepare("oauth.token.ledger_read",
         `SELECT refresh_family FROM used_refresh_tokens WHERE refresh_token_hash = ?`,
       ).bind(refreshHash).first<{ refresh_family: string }>();
       if (ledger) {
-        await this.db.batch([
+        await this.batchStatements("oauth.token.reuse_revoke", [
           this.db.prepare(
             `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
           ).bind(ledger.refresh_family, nowIso()),
@@ -3854,14 +3900,14 @@ export class SqlStore implements ControlPlaneStore {
     }
 
     // Winner: never return a successor that is already revoked / family-compromised.
-    const successor = await this.db.prepare(
+    const successor = await this.prepare("oauth.token.read",
       `SELECT revoked FROM oauth_tokens WHERE access_token_hash = ?`,
     ).bind(accessHash).first<{ revoked: number }>();
-    const familyRevoked = await this.db.prepare(
+    const familyRevoked = await this.prepare("oauth.token.read",
       `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
     ).bind(fam).first("revoked");
     if (!successor || successor.revoked || familyRevoked) {
-      await this.db.batch([
+      await this.batchStatements("oauth.token.reuse_revoke", [
         this.db.prepare(
           `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
         ).bind(fam, nowIso()),
@@ -3903,7 +3949,7 @@ export class SqlStore implements ControlPlaneStore {
     refreshHash: string,
     nowMs: number,
   ): Promise<TokenRecord | null> {
-    const receipt = await this.db.prepare(
+    const receipt = await this.prepare("oauth.refresh.receipt_read",
       `SELECT old_refresh_token_hash, refresh_family, client_id, principal_id, tenant_id, scope,
               successor_access_token_hash, successor_refresh_token_hash, encrypted_successor, iv, expires_at
        FROM refresh_rotation_receipts
@@ -3925,7 +3971,7 @@ export class SqlStore implements ControlPlaneStore {
     const receiptExp = Date.parse(receipt.expires_at);
     if (!Number.isFinite(receiptExp) || nowMs > receiptExp) return null;
 
-    const successor = await this.db.prepare(
+    const successor = await this.prepare("oauth.token.read",
       `SELECT access_token_hash, revoked, refresh_used, refresh_expires_at, expires_at
        FROM oauth_tokens
        WHERE access_token_hash = ?`,
@@ -3941,7 +3987,7 @@ export class SqlStore implements ControlPlaneStore {
     const refreshExpiresAt = Date.parse(successor.refresh_expires_at);
     if (!Number.isFinite(refreshExpiresAt) || nowMs > refreshExpiresAt) return null;
 
-    const familyRevoked = await this.db.prepare(
+    const familyRevoked = await this.prepare("oauth.token.read",
       `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
     ).bind(receipt.refresh_family).first("revoked");
     if (familyRevoked) return null;
@@ -3979,12 +4025,12 @@ export class SqlStore implements ControlPlaneStore {
   async revokeToken(token: string): Promise<void> {
     const hash = await sha256Hex(token);
     const column = token.startsWith("rtk_") ? "refresh_token_hash" : "access_token_hash";
-    const row = await this.db.prepare(
+    const row = await this.prepare("oauth.token.read",
       `SELECT principal_id, revoked FROM oauth_tokens WHERE ${column} = ?`,
     ).bind(hash).first<{ principal_id: string; revoked: number }>();
     if (!row || row.revoked) return;
     if (!this.db.batch) throw new Error("SqlStore.revokeToken requires db.batch");
-    await this.db.batch([
+    await this.batchStatements("oauth.token.revoke", [
       // #162: an explicit revoke removes authority, so it advances the
       // revocation epoch and terminally invalidates bound operations.
       this.db.prepare(
@@ -4263,7 +4309,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   async putAuthorizeTransaction(tx: AuthorizeTransaction): Promise<void> {
-    await this.db.prepare(
+    await this.prepare("oauth.authorize_tx.insert",
       `INSERT INTO authorize_transactions
        (id, csrf_hash, principal_id, tenant_id, client_id, redirect_uri, scope, state,
         code_challenge, code_challenge_method, expires_at, consumed, created_at)
@@ -4277,7 +4323,7 @@ export class SqlStore implements ControlPlaneStore {
 
   async consumeAuthorizeTransaction(id: string, csrfHash: string, principalId: string): Promise<AuthorizeTransaction | null> {
     // Atomic CAS: only one concurrent consumer wins (UPDATE...RETURNING).
-    const row = await this.db.prepare(
+    const row = await this.prepare("oauth.authorize_tx.consume",
       `UPDATE authorize_transactions SET consumed = 1
        WHERE id = ? AND csrf_hash = ? AND principal_id = ? AND consumed = 0 AND expires_at > ?
        RETURNING tenant_id, client_id, redirect_uri, scope, state,
@@ -4680,8 +4726,7 @@ export class SqlStore implements ControlPlaneStore {
         ? `${event.summary} | ${JSON.stringify(event.meta)}`
         : event.summary,
     );
-    const inserted = await this.db
-      .prepare(
+    const inserted = await this.prepare("audit.append",
         `INSERT INTO audit_events (id, tenant_id, principal_id, device_id, kind, summary, created_at)
          SELECT ?, ?, ?, ?, ?, ?, ?
          WHERE COALESCE((
@@ -4702,8 +4747,7 @@ export class SqlStore implements ControlPlaneStore {
       )
       .run();
     if (sqlChanges(inserted) < 1) {
-      const existing = await this.db
-        .prepare(`SELECT id FROM audit_events WHERE id = ? LIMIT 1`)
+      const existing = await this.prepare("audit.append.conflict_check",`SELECT id FROM audit_events WHERE id = ? LIMIT 1`)
         .bind(event.id)
         .first<{ id: string }>();
       if (existing) throw new Error(`audit_event_exists:${event.id}`);
@@ -4732,8 +4776,7 @@ export class SqlStore implements ControlPlaneStore {
     const now = Date.now();
     const cutoff = new Date(now - this.auditRetentionMs).toISOString();
     const maintenanceAfter = new Date(now + AUDIT_MAINTENANCE_INTERVAL_MS).toISOString();
-    const lease = await this.db
-      .prepare(
+    const lease = await this.prepare("audit.compact.lease",
         `UPDATE audit_event_tenant_counters
          SET maintenance_after = ?
          WHERE tenant_id = ? AND maintenance_after <= ?
@@ -4743,8 +4786,7 @@ export class SqlStore implements ControlPlaneStore {
       .first<{ tenant_id: string }>();
     if (!lease) return;
 
-    const deleted = await this.db
-      .prepare(
+    const deleted = await this.prepare("audit.retention.delete",
         `DELETE FROM audit_events
          WHERE id IN (
            SELECT id FROM audit_events
@@ -4755,8 +4797,7 @@ export class SqlStore implements ControlPlaneStore {
       .bind(tenantId, cutoff, AUDIT_MAINTENANCE_BATCH)
       .run();
     if (sqlChanges(deleted) > 0) {
-      await this.db
-        .prepare(
+      await this.prepare("audit.compact.lease_reset",
           `UPDATE audit_event_tenant_counters
            SET maintenance_after = '1970-01-01T00:00:00.000Z'
            WHERE tenant_id = ?`,
@@ -4777,8 +4818,7 @@ export class SqlStore implements ControlPlaneStore {
     const tombstoneCutoff = new Date(now - MCP_OPS_TOMBSTONE_TTL_MS).toISOString();
     const maintenanceAfter = new Date(now + MCP_OPS_MAINTENANCE_INTERVAL_MS).toISOString();
 
-    const lease = await this.db
-      .prepare(
+    const lease = await this.prepare("mcp.compact.lease",
         `UPDATE mcp_operation_tenant_counters
          SET maintenance_after = ?
          WHERE tenant_id = ? AND maintenance_after <= ?
@@ -4789,8 +4829,7 @@ export class SqlStore implements ControlPlaneStore {
     if (!lease) return;
 
     // Keyed tombstones preserve replay protection for 30 days after compaction.
-    const expiredTombstones = await this.db
-      .prepare(
+    const expiredTombstones = await this.prepare("mcp.retention.delete",
         `DELETE FROM mcp_operations
          WHERE operation_id IN (
            SELECT operation_id FROM mcp_operations
@@ -4802,8 +4841,7 @@ export class SqlStore implements ControlPlaneStore {
       .run();
 
     // Keyless terminal results protect no idempotency binding.
-    const expiredKeyless = await this.db
-      .prepare(
+    const expiredKeyless = await this.prepare("mcp.retention.delete",
         `DELETE FROM mcp_operations
          WHERE operation_id IN (
            SELECT operation_id FROM mcp_operations
@@ -4818,8 +4856,7 @@ export class SqlStore implements ControlPlaneStore {
       .run();
 
     // Compact a bounded batch of keyed terminal results into small receipts.
-    const compactedKeyed = await this.db
-      .prepare(
+    const compactedKeyed = await this.prepare("mcp.retention.compact",
         `UPDATE mcp_operations
          SET status = 'tombstone',
              summary = 'tombstone: result TTL expired; idempotency retained',
@@ -4846,8 +4883,7 @@ export class SqlStore implements ControlPlaneStore {
     ) {
       // Continue draining one bounded batch on the next tenant request. Once a
       // pass changes nothing, the five-minute quiet interval takes effect.
-      await this.db
-        .prepare(
+      await this.prepare("mcp.retention.lease_reset",
           `UPDATE mcp_operation_tenant_counters
            SET maintenance_after = '1970-01-01T00:00:00.000Z'
            WHERE tenant_id = ?`,
@@ -4862,8 +4898,7 @@ export class SqlStore implements ControlPlaneStore {
    * the AFTER INSERT trigger increments the same counter transactionally.
    */
   private async insertMcpOperationIfUnderQuota(op: McpOperationRecord): Promise<boolean> {
-    const result = await this.db
-      .prepare(
+    const result = await this.prepare("mcp.operation.insert",
         `INSERT INTO mcp_operations
          (operation_id, tenant_id, principal_id, device_id, tool, status, summary,
           data_json, truncated, next_cursor, approval_required, approval_url, approval_id,
@@ -4933,16 +4968,14 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   async getMcpOperation(operationId: string): Promise<McpOperationRecord | null> {
-    const row = await this.db
-      .prepare(`SELECT * FROM mcp_operations WHERE operation_id = ?`)
+    const row = await this.prepare("mcp.operation.get",`SELECT * FROM mcp_operations WHERE operation_id = ?`)
       .bind(operationId)
       .first<Record<string, unknown>>();
     return row ? rowToMcpOperation(row) : null;
   }
 
   async getMcpOperationByCorrelation(correlationId: string): Promise<McpOperationRecord | null> {
-    const row = await this.db
-      .prepare(
+    const row = await this.prepare("mcp.operation.lookup",
         `SELECT * FROM mcp_operations WHERE correlation_id = ? ORDER BY created_at DESC LIMIT 1`,
       )
       .bind(correlationId)
@@ -4994,13 +5027,13 @@ export class SqlStore implements ControlPlaneStore {
     idempotencyKey: string;
   }): Promise<McpOperationRecord | null> {
     const statement = opts.deviceId
-      ? this.db.prepare(
+      ? this.prepare("mcp.operation.lookup",
         `SELECT * FROM mcp_operations
          WHERE principal_id = ? AND tenant_id = ? AND device_id = ?
            AND idempotency_key = ?
          ORDER BY created_at DESC LIMIT 1`,
       ).bind(opts.principalId, opts.tenantId, opts.deviceId, opts.idempotencyKey)
-      : this.db.prepare(
+      : this.prepare("mcp.operation.lookup",
         `SELECT * FROM mcp_operations
          WHERE principal_id = ? AND tenant_id = ? AND device_id IS NULL
            AND idempotency_key = ?
@@ -5015,8 +5048,7 @@ export class SqlStore implements ControlPlaneStore {
     ) {
       // A point delete keeps key reuse exact at the 30-day boundary without a
       // tenant scan; the counter trigger updates occupancy transactionally.
-      const deleted = await this.db
-        .prepare(
+      const deleted = await this.prepare("mcp.retention.delete_one",
           `DELETE FROM mcp_operations
            WHERE operation_id = ? AND status = 'tombstone' AND updated_at = ?`,
         )
@@ -5095,6 +5127,21 @@ export class SqlStore implements ControlPlaneStore {
       updated_at: patch.updated_at || nowIso(),
     });
 
+    // Issue #224 (C-1-1): attribute the write-amplification-dominant UPDATE
+    // by status transition without changing the statement itself.
+    const updateFp: D1Fingerprint =
+      patch.status === "dispatched"
+        ? "mcp.operation.update.dispatch"
+        : patch.status === "cancel_requested"
+          ? "mcp.operation.update.cancel"
+          : patch.status === "completed" ||
+              patch.status === "failed" ||
+              patch.status === "denied" ||
+              patch.status === "cancelled" ||
+              patch.status === "device_offline"
+            ? "mcp.operation.update.terminal"
+            : "mcp.operation.update.other";
+
     // CAS via conditional UPDATE.  `expectedData` is used by coordinators
     // whose durable data contains a generation/version marker; status alone
     // is not sufficient to protect concurrent metadata transitions.
@@ -5104,8 +5151,8 @@ export class SqlStore implements ControlPlaneStore {
         ? ` AND status IN (${placeholders})`
         : "";
       const dataClause = expectedData !== undefined ? " AND data_json = ?" : "";
-      const result = await this.db
-        .prepare(
+      const result = await this.prepare(
+        updateFp,
           `UPDATE mcp_operations SET
              tenant_id = ?, principal_id = ?, device_id = ?, tool = ?, status = ?, summary = ?,
              data_json = ?, truncated = ?, next_cursor = ?, approval_required = ?,
@@ -5150,8 +5197,8 @@ export class SqlStore implements ControlPlaneStore {
     }
 
     // Unconditional field update (still UPDATE-only — never INSERT OR REPLACE).
-    const result = await this.db
-      .prepare(
+    const result = await this.prepare(
+      updateFp,
         `UPDATE mcp_operations SET
            tenant_id = ?, principal_id = ?, device_id = ?, tool = ?, status = ?, summary = ?,
            data_json = ?, truncated = ?, next_cursor = ?, approval_required = ?,
@@ -5196,8 +5243,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   async putMcpApprovalTransaction(tx: McpApprovalTransaction): Promise<void> {
-    await this.db
-      .prepare(
+    await this.prepare("approval.transaction.insert",
         `INSERT INTO mcp_approval_transactions
          (id, csrf_hash, operation_id, principal_id, tenant_id, device_id,
           expires_at, consumed, decision, created_at)
@@ -5222,8 +5268,7 @@ export class SqlStore implements ControlPlaneStore {
     principalId: string,
     decision: "approve" | "deny",
   ): Promise<McpApprovalTransaction | null> {
-    const row = await this.db
-      .prepare(
+    const row = await this.prepare("approval.transaction.consume",
         `UPDATE mcp_approval_transactions
          SET consumed = 1, decision = ?
          WHERE id = ? AND csrf_hash = ? AND principal_id = ?
@@ -5255,8 +5300,7 @@ export class SqlStore implements ControlPlaneStore {
 
   async getMcpApprovalOutbox(id: string): Promise<McpApprovalOutbox | null> {
     try {
-      const row = await this.db
-        .prepare(
+      const row = await this.prepare("approval.outbox.get",
           `SELECT id, operation_id, principal_id, tenant_id, device_id, decision,
                   correlation_id, delivery_status, attempts, last_error,
                   created_at, delivered_at, claimed_at, claim_token, claim_version
@@ -5279,8 +5323,7 @@ export class SqlStore implements ControlPlaneStore {
   ): Promise<BeginMcpApprovalOutboxResult | null> {
     const existing = await this.getMcpApprovalOutbox(id);
     if (existing) {
-      const txRow = await this.db
-        .prepare(
+      const txRow = await this.prepare("approval.transaction.get",
           `SELECT id, csrf_hash, operation_id, principal_id, tenant_id, device_id,
                   expires_at, consumed, decision, created_at
            FROM mcp_approval_transactions WHERE id = ?`,
@@ -5335,7 +5378,7 @@ export class SqlStore implements ControlPlaneStore {
     type BatchResult = { meta?: { changes?: number }; success?: boolean };
 
     try {
-      const batchResults = await this.db.batch<BatchResult>([
+      const batchResults = await this.batchStatements<BatchResult>("approval.outbox.batch", [
         this.db
           .prepare(
             `UPDATE mcp_approval_transactions
@@ -5371,8 +5414,7 @@ export class SqlStore implements ControlPlaneStore {
       const inserted = sqlChanges(batchResults[1]) > 0;
       if (consumed && inserted) {
         const outbox = await this.getMcpApprovalOutbox(id);
-        const txRow = await this.db
-          .prepare(
+        const txRow = await this.prepare("approval.transaction.get",
             `SELECT id, csrf_hash, operation_id, principal_id, tenant_id, device_id,
                     expires_at, consumed, decision, created_at
              FROM mcp_approval_transactions WHERE id = ?`,
@@ -5412,8 +5454,7 @@ export class SqlStore implements ControlPlaneStore {
     // Lost race: resume authoritative outbox if peer created it.
     const peer = await this.getMcpApprovalOutbox(id);
     if (peer) {
-      const txRow = await this.db
-        .prepare(
+      const txRow = await this.prepare("approval.transaction.get",
           `SELECT id, csrf_hash, operation_id, principal_id, tenant_id, device_id,
                   expires_at, consumed, decision, created_at
            FROM mcp_approval_transactions WHERE id = ?`,
@@ -5466,8 +5507,7 @@ export class SqlStore implements ControlPlaneStore {
     ).toISOString();
     // pending → delivering, or stale delivering (lease expired / missing claimed_at).
     // Fresh claim_token + claim_version++ invalidates any prior owner.
-    const result = await this.db
-      .prepare(
+    const result = await this.prepare("approval.outbox.claim",
         `UPDATE mcp_approval_outbox
          SET delivery_status = 'delivering',
              claimed_at = ?,
@@ -5496,8 +5536,7 @@ export class SqlStore implements ControlPlaneStore {
     error?: string,
   ): Promise<void> {
     if (!claimToken || !Number.isFinite(Number(claimVersion))) return;
-    await this.db
-      .prepare(
+    await this.prepare("approval.outbox.release",
         `UPDATE mcp_approval_outbox
          SET delivery_status = 'pending',
              attempts = attempts + 1,
@@ -5513,8 +5552,7 @@ export class SqlStore implements ControlPlaneStore {
 
   async recordMcpApprovalOutboxAttempt(id: string, error?: string): Promise<void> {
     // Delivering claims must be released via releaseMcpApprovalOutboxClaim (owner token).
-    await this.db
-      .prepare(
+    await this.prepare("approval.outbox.attempt",
         `UPDATE mcp_approval_outbox
          SET attempts = attempts + 1, last_error = ?
          WHERE id = ? AND delivery_status = 'pending'`,
@@ -5553,7 +5591,7 @@ export class SqlStore implements ControlPlaneStore {
 
     // Transactional finalize: owner-gated outbox mark + conditional op CAS.
     // Op CAS is gated on current claim ownership so mismatch leaves no state change.
-    const batchResults = await this.db.batch<BatchResult>([
+    const batchResults = await this.batchStatements<BatchResult>("approval.outbox.deliver", [
       this.db
         .prepare(
           `UPDATE mcp_operations SET
