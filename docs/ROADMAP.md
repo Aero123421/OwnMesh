@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.32 · **Last updated:** 2026-09-04
+**Baseline:** v1.2.33 · **Last updated:** 2026-09-05
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -35,6 +35,17 @@ receipt so exact duplicate retries and response-loss retransmissions converge
 to the same successor token set. Reuse outside that bounded window, binding
 mismatches, and replay after the family advances still revoke the family
 fail-closed.
+
+v1.2.33 resolves the D1 write-amplification outage class (Issue #224):
+narrow status-transition CAS, seeded bootstrap, single receipt cleanup,
+throttled device polls, a scheduled retention sweep, and five redundant hot
+indexes dropped with EXPLAIN proof. Opt-in tenant OperationRoom authority
+(`OWNMESH_OPERATION_STORE=device_do` plus cutover cursor) moves operation
+rows off the shared D1 budget with hybrid D1 fallback, and budget admission
+degrades explicitly (read_only/auth_only, quota-aware readiness, structured
+503 + Retry-After) instead of killing OAuth while health stays green
+(ADR 0021). Capacity figures remain projections until the Gate-1 production
+baseline confirms them.
 
 ChatGPT CIMD interoperability was refreshed in v1.2.29: OwnMesh negotiates the
 current plural token-auth capability list and continues to select only the
