@@ -13,6 +13,9 @@
   readiness, and structured 503 + Retry-After semantics for MCP/OAuth.
 - CI-testable half of the Issue #227 connector recovery contract, plus
   operator recovery documentation.
+- Fixed the statement wrapper to thread immutable `bind()` returns so every
+  instrumented write executes bound on production D1 (release-blocker caught
+  by the packaged-artifact workerd gate before publication).
 
 ## v1.2.32 — Bounded OAuth refresh retry convergence
 
