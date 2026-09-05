@@ -250,7 +250,6 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 | `OWNMESH_E_AUTHORIZATION_REFRESHED` | The operation was never delivered and its authorization was refreshed while it waited. Resubmit the same request; it is authorized under the current credentials |
 
 ### Tool catalog looks stale
-
 ChatGPT loads the tool catalog when the connector session is established and
 keeps it. If a deployment adds or removes tools while a session is live, the
 client can keep serving the old set — new tools stay invisible and removed ones
@@ -290,6 +289,35 @@ session arguments. Clients must rediscover tools and launch external CLIs with
 exact generic `program`/`args`. CI compares releases to
 `release/mcp-catalog-baseline-v2.json` and blocks further unversioned breaking
 changes; catalog v1 is historical evidence only.
+
+### Recovery contract (transient failure vs reauth vs offline vs unknown)
+
+ChatGPT shows one generic `We couldn't connect your account` for many
+different causes. Classify with the bounded signals below — never by
+re-executing a side effect blindly. Covered by
+`packages/control-plane/src/recovery-contract.test.ts` (Issue #227).
+
+| Signal | Meaning | Action |
+|---|---|---|
+| OAuth/MCP answers 503 `temporarily_unavailable` + `Retry-After` (+ `reset_at` for quota) | Transient backend/quota failure. Credentials are NOT revoked | Wait and retry after the header/`reset_at`; do not delete the connector |
+| OAuth answers 401 `invalid_grant` (no Retry-After) | Credential expired, revoked, or never valid | Reconnect/re-consent, then poll the kept `operation_id` |
+| `reuse` / family error | Refresh replay outside the grace window | Reconnect; in-flight work may need manual reconciliation |
+| MCP `-32005 OWNMESH_QUOTA_*`, `retryable: false`, `reset_at` | Degraded budget mode | Reads resume automatically; side effects wait for reset |
+| `device_offline` | Agent/device down, control plane healthy | Restart `ownmeshd`, then poll |
+| None of the above / unknown | Unclassified | Collect UTC time, Ray ID, service version, endpoint statuses (see deploy doc) |
+
+Rules for long-running work:
+
+1. Always keep the `operation_id` (and `idempotency_key` when you supplied
+   one) outside the chat. After any recovery, poll it with
+   `ownmesh_get_operation` first.
+2. Retrying the identical call with the same idempotency key converges to
+   the one durable operation — it never executes a second side effect.
+3. A receipt stays reachable under a fresh credential for the same
+   tenant/principal: reconnect, then poll. No connector reinstall needed.
+4. If the id is lost, do not guess: re-issue with a NEW idempotency key
+   only when the action is provably unstarted, otherwise reconcile manually
+   (device journal / admin operation list) before touching anything.
 
 ---
 
