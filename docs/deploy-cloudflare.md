@@ -113,8 +113,9 @@ Reference `.dev.vars.example` in this package for local-only vars.
 
 ```jsonc
 d1_databases: [{ binding: "DB", database_name: "ownmesh", migrations_dir: "migrations" }]
-durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
+durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }, { name: "OPERATION_ROOM", class_name: "OperationRoom" }]
 ratelimits: [{ name: "AUTH_RATE_LIMITER", ... }, { name: "MCP_RATE_LIMITER", ... }]
+triggers: { crons: ["*/5 * * * *"] } // scheduled retention drain (Issue #224)
 // no r2_buckets, no turn
 ```
 
@@ -156,6 +157,36 @@ per-tenant counter transactionally. Retention is leased and limited to three
 index-backed batches of 128 rows, and a 25-second MCP wait performs at most two
 additional authoritative operation reads. A recognized D1 runtime outage
 returns sanitized HTTP 503 with `Retry-After: 60`.
+
+### D1 write budget and plan-F cutover (Issue #224)
+
+MCP operation, audit, and OAuth traffic share one account-level D1 write
+budget (Free: 100,000 rows/day). Past ~5,000 tool calls/day, enable the
+tenant operation room so operation rows leave the D1 budget:
+
+1. Deploy with the `OPERATION_ROOM` binding, the `v3` DO migration, and the
+   cron trigger above. `OWNMESH_OPERATION_STORE` stays unset (D1 authority).
+2. Run at least 24h and compare D1 Analytics rows-written against the
+   per-statement baseline (`renderD1BaselineReport`, fixed fingerprints).
+3. Set the flag: `wrangler secret put OWNMESH_OPERATION_STORE` is not
+   needed — it is a plain var: `"OWNMESH_OPERATION_STORE": "device_do"`.
+   Without a cutover cursor this changes nothing (safe to deploy first).
+4. Cut one tenant over (UTC ISO time):
+   `wrangler d1 execute DB --command "INSERT INTO operation_store_cutover
+   (tenant_id, cutover_at) VALUES ('<tenant>', '<iso>') ON CONFLICT(tenant_id)
+   DO UPDATE SET cutover_at = excluded.cutover_at"`.
+   Pre-cutover rows stay readable via hybrid fallback; in-flight operations
+   converge on retry. Roll back with `cutover_at = 'd1'`.
+5. Watch `/health/ready` (`auth_write_ready`, `budget_mode`,
+   `budget_reset_at`) and the MCP `OWNMESH_QUOTA_*` errors. `auth_only`
+   means D1 writes are exhausted: MCP fails fast and OAuth answers 503
+   `temporarily_unavailable` + `Retry-After` until the UTC-midnight reset.
+   Force a mode manually with `"OWNMESH_DEGRADED_MODE":
+   "read_only" | "auth_only"` (unset = probe-driven).
+
+Expected structure (30% auth reserve): D1-default ~3,700–5,800 calls/day,
+`device_do` ~30,000+/day with D1 holding auth only. Past ~100k calls/day
+(Workers request budget) move to Paid. See ADR 0021 for the full matrix.
 
 Persistent Workers observability is deliberately off by default. To opt in
 inside your own Cloudflare account, set `observability.enabled` to `true`, keep
@@ -321,5 +352,8 @@ curl -s https://<worker>/health | jq .
 # expect: status=ok, liveness=true, features includes no-r2-turn, storage=d1 when bound
 curl -s https://<worker>/health/ready | jq .
 # expect: status=ok only when required schema and bindings are ready (cached for at most 5 seconds)
+# plus auth_write_ready=true and budget_mode=normal. auth_only means the D1
+# write budget is exhausted: status=not_ready (503) until the UTC-midnight
+# reset in budget_reset_at. This is the signal Issue #224 was missing.
 curl -s https://<worker>/v1/migrations/status | jq .
 ```

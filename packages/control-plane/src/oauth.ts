@@ -10,6 +10,7 @@
  */
 
 import type { ControlPlaneStore } from "./store.ts";
+import { secondsUntilUtcReset, type BudgetState } from "./quota-guard.ts";
 import {
   AUTH_PAGE_CSP,
   authLocale,
@@ -388,6 +389,27 @@ async function fetchClientMetadataDocument(
 }
 
 /**
+ * Issue #224 (P4): degraded-mode 503 for OAuth write endpoints.
+ * fail fast with temporarily_unavailable + Retry-After (UTC-midnight reset)
+ * instead of attempting D1 writes an exhausted budget cannot serve.
+ * Returns null when the budget allows the request.
+ */
+export function budgetUnavailable(budget?: BudgetState): Response | null {
+  if (!budget || budget.mode !== "auth_only") return null;
+  return jsonBase(
+    {
+      error: "temporarily_unavailable",
+      error_description: `authorization service degraded until ${budget.resetAt}`,
+    },
+    {
+      status: 503,
+      noStore: true,
+      headers: { "retry-after": String(secondsUntilUtcReset()) },
+    },
+  );
+}
+
+/**
  * RFC 7591 Dynamic Client Registration.
  *
  * Security contract:
@@ -536,7 +558,12 @@ export async function handleAuthorize(
   store: ControlPlaneStore,
   issuer: string,
   security: OAuthRequestSecurity = {},
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
+  // Issue #224 (P4): fail fast in auth_only instead of burning reserved
+  // budget on authorize transactions that cannot complete.
+  const degraded = budgetUnavailable(opts?.budget);
+  if (degraded) return degraded;
   // The Worker records GET receipt before form parsing/authentication. Direct
   // internal callers have no forged-clock seam and fall back to handler entry.
   const requestReceivedAt = authorizeRequestReceipts.get(req) ?? Date.now();
@@ -837,7 +864,12 @@ function escapeHtml(s: string): string {
 export async function handleToken(
   req: Request,
   store: ControlPlaneStore,
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
+  // Issue #224 (P4): RFC 6750-style fail-fast; token issuance (including
+  // refresh rotation) needs D1 writes that an exhausted budget cannot serve.
+  const degraded = budgetUnavailable(opts?.budget);
+  if (degraded) return degraded;
   const parsedBody = await readOAuthBody(req);
   if (parsedBody instanceof Response) return parsedBody;
   const body = parsedBody;
@@ -1099,6 +1131,7 @@ export async function handleDeviceVerification(
   req: Request,
   store: ControlPlaneStore,
   security: OAuthRequestSecurity = {},
+  opts?: { budget?: BudgetState },
 ): Promise<Response> {
   await store.ensureBootstrapSeeded();
   const locale = authLocale(req);
@@ -1168,6 +1201,9 @@ export async function handleDeviceVerification(
     const parsedBody = await readOAuthBody(req);
     if (parsedBody instanceof Response) return parsedBody;
     const body = parsedBody;
+    // Issue #224 (P4): decisions are durable writes; polls stay available.
+    const degraded = budgetUnavailable(opts?.budget);
+    if (degraded) return degraded;
     if ((body.decision !== "approve" && body.decision !== "deny") || !body.transaction_id || !body.csrf_token) {
       return json({ error: "invalid_request" }, { status: 400 });
     }

@@ -201,7 +201,9 @@ test("/health is D1-free liveness; concurrent /health/ready checks coalesce one 
     ]);
     assert.equal(first.status, 200);
     assert.equal(second.status, 200);
-    assert.equal(queryCount, oneProbeQueryCount, "concurrent readiness checks share one scan");
+    // Schema scan (coalesced) plus the single shared budget write probe
+    // (Issue #224): readiness stays bounded at scan + 1.
+    assert.equal(queryCount, oneProbeQueryCount + 1, "concurrent readiness checks share one scan");
 
     const cached = await worker.fetch(
       new Request("https://cp.test/health/ready"),
@@ -209,7 +211,7 @@ test("/health is D1-free liveness; concurrent /health/ready checks coalesce one 
       ctx,
     );
     assert.equal(cached.status, 200);
-    assert.equal(queryCount, oneProbeQueryCount, "fresh readiness result is reused briefly");
+    assert.equal(queryCount, oneProbeQueryCount + 1, "fresh readiness result is reused briefly");
   } finally {
     __setTestStore(null);
   }

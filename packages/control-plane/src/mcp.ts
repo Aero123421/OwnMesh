@@ -24,6 +24,7 @@ import {
   type OperationStore,
   type ResolvedOperationStores,
 } from "./operation-store.ts";
+import type { BudgetState } from "./quota-guard.ts";
 import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   approvalSelectionReturnTo,
@@ -3935,6 +3936,12 @@ export type McpHandleOptions = {
     /** Best-effort live DeviceRoom observation; never used for authorization. */
     presenceForDevice?: (device: DeviceRecord) => Promise<"online" | "offline" | "unknown">;
     /**
+     * Issue #224 (P4): budget state resolved per request by the Worker entry.
+     * Degraded modes fail MCP calls fast with structured errors instead of
+     * burning the remaining D1 write budget. Absent in unit callers (normal).
+     */
+    budgetState?: BudgetState;
+    /**
      * Issue #224 (P2): operation authority resolver. Device-routed flows use
      * `forTenant` (room or D1); transfers and local tools stay on D1.
      * Absent in unit-only callers, where every path stays D1-backed.
@@ -5871,6 +5878,34 @@ async function handleMcpCore(
           injection_attempt: injectionAttempt,
         },
       });
+    }
+
+    // Issue #224 (P4): degraded-mode admission. Fails fast with a structured,
+    // non-retryable-until-reset error instead of burning reserved D1 budget.
+    // Room-covered reads need no D1 writes, so they stay available in
+    // auth_only; everything else degrades by risk class.
+    const budgetState = opts.budgetState;
+    if (budgetState && budgetState.mode !== "normal") {
+      const readOnly = tool.risk === "read" || tool.risk === "discovery";
+      const coveredRead = readOnly && resolvedOps?.auditCovered === true;
+      if (!readOnly || (budgetState.mode === "auth_only" && !coveredRead)) {
+        const sideEffect = !readOnly;
+        return mcpError(
+          id,
+          -32005,
+          sideEffect
+            ? "control-plane is in degraded mode; side-effect tools disabled until reset"
+            : "control-plane write budget exhausted; reads disabled until reset",
+          {
+            code: sideEffect
+              ? "OWNMESH_QUOTA_SIDE_EFFECT_DISABLED"
+              : "OWNMESH_QUOTA_READ_ONLY_DISABLED",
+            retryable: false,
+            reset_at: budgetState.resetAt,
+            mode: budgetState.mode,
+          },
+        );
+      }
     }
 
     // ---- local control-plane tools (no device) ----

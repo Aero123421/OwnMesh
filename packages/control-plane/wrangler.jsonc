@@ -100,5 +100,10 @@
       "tag": "v3",
       "new_sqlite_classes": ["OperationRoom"]
     }
-  ]
+  ],
+  // Issue #224 (P1/P4): scheduled retention drain so request traffic stops
+  // inheriting TTL catch-up bursts. Request-path leases stay as fallback.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  }
 }
