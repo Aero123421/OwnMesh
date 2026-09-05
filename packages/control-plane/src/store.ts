@@ -29,6 +29,7 @@ import {
   type D1Fingerprint,
   type D1TelemetrySnapshot,
 } from "./d1-telemetry.ts";
+import { classifyD1Error, type D1ErrorCategory } from "./d1-errors.ts";
 
 export type { WorkspaceOperableGate } from "./workspace-activation.ts";
 
@@ -428,6 +429,35 @@ export type McpOperationRecord = {
   updated_at: string;
 };
 
+/**
+ * Issue #224 (P1): narrow status-transition payload.
+ * Only mutable result columns; identity and exact-action binding columns
+ * (tenant/principal/device/tool/correlation/payload_hash/idempotency_key/
+ * workspace/action/claim_version/created_at) are never part of a transition.
+ */
+export type McpOperationTransition = {
+  status: string;
+  summary?: string;
+  data?: Record<string, unknown>;
+  truncated?: boolean;
+  next_cursor?: string | null;
+  approval_required?: boolean;
+  approval_url?: string | null;
+  approval_id?: string | null;
+  session_id?: string | null;
+  warnings?: string[];
+  updated_at?: string;
+};
+
+/** Bounded retention-sweep outcome (Issue #224 P1/P4). All counts are rows. */
+export type RetentionSweepStats = {
+  tenantsSwept: number;
+  auditDeleted: number;
+  operationsDeleted: number;
+  operationsCompacted: number;
+  receiptsCleaned: number;
+};
+
 /** One-time CSRF-bound human approval for an MCP operation. */
 export type McpApprovalTransaction = {
   id: string;
@@ -813,6 +843,14 @@ export interface ControlPlaneStore {
   ensureBootstrap(): Promise<void>;
 
   /**
+   * Issue #224 (P1): hot-path bootstrap without the write cost.
+   * Verifies the seeded rows with a single read; runs the full idempotent
+   * seed only when they are absent. Fail-closed: a failed check propagates
+   * instead of assuming a provisioned store.
+   */
+  ensureBootstrapSeeded(): Promise<void>;
+
+  /**
    * True when the tenant is provisioned and may be referenced by principals.
    * Used by OAuth handlers to fail closed for AUTH_PROVIDER claims whose
    * tenant_id was never provisioned (avoids FK 500 on principals INSERT).
@@ -887,7 +925,12 @@ export interface ControlPlaneStore {
   getDeviceCodeByUserCode(userCode: string): Promise<DeviceCodeRecord | null>;
   approveDeviceCode(userCode: string, principalId: string): Promise<boolean>;
   consumeApprovedDeviceCode(deviceCode: string, clientId: string): Promise<DeviceCodeRecord | null>;
-  markDeviceCodePolled(deviceCode: string): Promise<void>;
+  /**
+   * Record a pending device-code poll. `minIntervalMs` bounds write frequency:
+   * polls arriving sooner than that after the previous recorded poll are
+   * dropped without a write (read-then-conditional-write; fail-closed on error).
+   */
+  markDeviceCodePolled(deviceCode: string, minIntervalMs?: number): Promise<void>;
   putDeviceVerificationTransaction(tx: DeviceVerificationTransaction): Promise<void>;
   consumeDeviceVerificationTransaction(
     id: string,
@@ -1013,6 +1056,19 @@ export interface ControlPlaneStore {
     fromStatuses?: string[],
     /** Exact durable data snapshot required for a compare-and-swap update. */
     expectedData?: Record<string, unknown>,
+  ): Promise<McpOperationRecord | null>;
+  /**
+   * Issue #224 (P1): narrow status-transition CAS.
+   * Updates ONLY the mutable result columns (status, summary, data,
+   * truncated, next_cursor, approval fields, session_id, warnings,
+   * updated_at); identity and exact-action binding columns are never
+   * written, so indexed-column fan-out stays small.
+   * Returns null on miss / CAS loss, like updateMcpOperation.
+   */
+  transitionMcpOperation(
+    operationId: string,
+    transition: McpOperationTransition,
+    fromStatuses?: string[],
   ): Promise<McpOperationRecord | null>;
 
   putMcpApprovalTransaction(tx: McpApprovalTransaction): Promise<void>;
@@ -1175,6 +1231,29 @@ export interface ControlPlaneStore {
   markMigration(id: string): Promise<void>;
 
   /**
+   * Issue #224 (P1/P4): bounded retention sweep for scheduled workers.
+   * Drains audit/operation TTL batches (lease-gated, tenant-bounded) plus
+   * expired refresh-rotation receipts. Safe to run concurrently with request
+   * traffic: every batch is indexed and capped.
+   */
+  runRetentionSweep(opts?: { tenantLimit?: number }): Promise<RetentionSweepStats>;
+
+  /**
+   * Issue #224 (P4): single-row D1 write probe for /health/ready.
+   * Distinguishes quota exhaustion from a real outage without exposing
+   * raw error text.
+   */
+  probeWriteReadiness(): Promise<{ ok: true } | { ok: false; category: D1ErrorCategory }>;
+
+  /**
+   * Issue #224 (P2): per-tenant DeviceRoom operation-store cutover cursor.
+   * Absent row means D1 authority. Values are ISO timestamps; readers treat
+   * pre-cutover operation ids via D1 and newer ones via the device DO store.
+   */
+  getOperationStoreCutover(tenantId: string): Promise<string | null>;
+  setOperationStoreCutover(tenantId: string, cutoverAt: string): Promise<void>;
+
+  /**
    * Probe whether required P0 schema objects exist.
    * Never infers readiness from migration filenames alone.
    */
@@ -1220,6 +1299,9 @@ export type SchemaReadiness = {
     /** 0016 device-scoped workspace custody (workspace ids are device-local) */
     device_workspaces: boolean;
     device_workspace_members: boolean;
+    /** 0022 write probe + operation-store cutover (Issue #224 plan F) */
+    quota_probe: boolean;
+    operation_store_cutover: boolean;
   };
 };
 
@@ -1397,9 +1479,8 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "idx_mcp_ops_principal_tenant",
       "idx_mcp_ops_device",
       "idx_mcp_ops_correlation",
-      "idx_mcp_ops_updated",
-      "idx_mcp_ops_idempotency",
-      "idx_mcp_ops_payload_hash",
+      // Issue #224 (0022): idx_mcp_ops_updated, idx_mcp_ops_idempotency, and
+      // idx_mcp_ops_payload_hash were dropped as proven-redundant hot writes.
       "uq_mcp_ops_idempotency",
       "uq_mcp_ops_idempotency_no_device",
       "idx_mcp_ops_tombstone_expiry",
@@ -1450,7 +1531,8 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "claim_token",
       "claim_version",
     ],
-    indexes: ["idx_mcp_outbox_op", "idx_mcp_outbox_status"],
+    // Issue #224 (0022): idx_mcp_outbox_op dropped; operation_id UNIQUE covers it.
+    indexes: ["idx_mcp_outbox_status"],
   },
   principals_credential_generation: {
     table: "principals",
@@ -1489,6 +1571,16 @@ const SCHEMA_READINESS_OBJECTS: Record<
     ],
     indexes: ["idx_owner_auth_challenges_expiry"],
   },
+  /** 0022 write-probe row for quota-aware readiness (Issue #224 P4). */
+  quota_probe: {
+    table: "quota_probe",
+    columns: ["id", "checked_at"],
+  },
+  /** 0022 per-tenant DeviceRoom operation-store cutover cursor (Issue #224 P2). */
+  operation_store_cutover: {
+    table: "operation_store_cutover",
+    columns: ["tenant_id", "cutover_at"],
+  },
 };
 
 const DEFAULT_TENANT = "ten_default";
@@ -1523,6 +1615,8 @@ export class MemoryStore implements ControlPlaneStore {
   mcpApprovalTransactions = new Map<string, McpApprovalTransaction>();
   mcpApprovalOutbox = new Map<string, McpApprovalOutbox>();
   grants = new Map<string, GrantRecord>();
+  /** Issue #224 (P2): tenant_id -> ISO cutover cursor for the device DO operation store. */
+  operationStoreCutover = new Map<string, string>();
   /** key = `${tenant_id}\0${principal_id}` */
   tenantMembers = new Map<string, { tenant_id: string; principal_id: string; role: "owner" | "admin" | "member"; created_at: string }>();
   workspaces = new Map<string, WorkspaceRecord>();
@@ -1571,6 +1665,11 @@ export class MemoryStore implements ControlPlaneStore {
         created_at: nowIso(),
       });
     }
+  }
+
+  async ensureBootstrapSeeded(): Promise<void> {
+    if (this.principals.has("prin_dev") && this.clients.has("client_ownmesh_cli")) return;
+    await this.ensureBootstrap();
   }
 
   /**
@@ -2014,12 +2113,15 @@ export class MemoryStore implements ControlPlaneStore {
     this.deviceCodes.set(deviceCode, rec);
     return { ...rec };
   }
-  async markDeviceCodePolled(deviceCode: string): Promise<void> {
+  async markDeviceCodePolled(deviceCode: string, minIntervalMs = 0): Promise<void> {
     const rec = this.deviceCodes.get(deviceCode);
-    if (rec) {
-      rec.last_polled_at = Date.now();
-      this.deviceCodes.set(deviceCode, rec);
+    if (!rec) return;
+    if (minIntervalMs > 0) {
+      const last = rec.last_polled_at ?? 0;
+      if (Date.now() - last < minIntervalMs) return;
     }
+    rec.last_polled_at = Date.now();
+    this.deviceCodes.set(deviceCode, rec);
   }
   async putDeviceVerificationTransaction(tx: DeviceVerificationTransaction): Promise<void> {
     this.verificationTransactions.set(tx.id, { ...tx });
@@ -2479,6 +2581,40 @@ export class MemoryStore implements ControlPlaneStore {
           : cur.action,
       policy_authority: "ownmesh_device",
       updated_at: patch.updated_at || nowIso(),
+    });
+    this.mcpOperations.set(operationId, next);
+    return {
+      ...next,
+      data: { ...next.data },
+      warnings: [...next.warnings],
+      action: next.action ? { ...next.action } : next.action,
+    };
+  }
+
+  async transitionMcpOperation(
+    operationId: string,
+    transition: McpOperationTransition,
+    fromStatuses?: string[],
+  ): Promise<McpOperationRecord | null> {
+    const cur = this.mcpOperations.get(operationId);
+    if (!cur) return null;
+    if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
+    // Narrow transition: identity and exact-action binding columns are never
+    // rewritten here, mirroring the SQL narrow CAS in SqlStore.
+    const next: McpOperationRecord = boundMcpOperationRecord({
+      ...cur,
+      status: transition.status,
+      summary: transition.summary ?? cur.summary,
+      data: transition.data ? { ...transition.data } : { ...cur.data },
+      truncated: transition.truncated ?? cur.truncated,
+      next_cursor: transition.next_cursor !== undefined ? transition.next_cursor : cur.next_cursor,
+      approval_required: transition.approval_required ?? cur.approval_required,
+      approval_url: transition.approval_url ?? cur.approval_url ?? undefined,
+      approval_id: transition.approval_id ?? cur.approval_id ?? undefined,
+      session_id: transition.session_id !== undefined ? transition.session_id : cur.session_id,
+      warnings: transition.warnings ? [...transition.warnings] : [...cur.warnings],
+      policy_authority: "ownmesh_device",
+      updated_at: transition.updated_at || nowIso(),
     });
     this.mcpOperations.set(operationId, next);
     return {
@@ -2968,6 +3104,62 @@ export class MemoryStore implements ControlPlaneStore {
     this.migrations.add(id);
   }
 
+  async runRetentionSweep(opts?: { tenantLimit?: number }): Promise<RetentionSweepStats> {
+    const now = Date.now();
+    const stats: RetentionSweepStats = {
+      tenantsSwept: 0,
+      auditDeleted: 0,
+      operationsDeleted: 0,
+      operationsCompacted: 0,
+      receiptsCleaned: 0,
+    };
+    const tenantLimit = Math.max(1, Math.min(256, Math.trunc(opts?.tenantLimit ?? 64)));
+    const tenants = new Set<string>();
+    for (const op of this.mcpOperations.values()) tenants.add(op.tenant_id);
+    for (const entry of this.audits) tenants.add(entry.tenant_id);
+    for (const tenantId of [...tenants].slice(0, tenantLimit)) {
+      stats.tenantsSwept += 1;
+      const auditBefore = this.audits.length;
+      const cutoff = now - this.auditRetentionMs;
+      this.audits = this.audits.filter((entry) => {
+        if (entry.tenant_id !== tenantId) return true;
+        const created = Date.parse(entry.created_at);
+        return !Number.isFinite(created) || created >= cutoff;
+      });
+      stats.auditDeleted += auditBefore - this.audits.length;
+      const opsBefore = this.mcpOperations.size;
+      const tombstonesBefore = [...this.mcpOperations.values()].filter(
+        (op) => op.tenant_id === tenantId && op.status === "tombstone",
+      ).length;
+      this.compactMcpOperations(tenantId);
+      this.expireExpiredMcpTombstones(tenantId);
+      const tombstonesAfter = [...this.mcpOperations.values()].filter(
+        (op) => op.tenant_id === tenantId && op.status === "tombstone",
+      ).length;
+      stats.operationsDeleted += Math.max(0, opsBefore - this.mcpOperations.size);
+      stats.operationsCompacted += Math.max(0, tombstonesAfter - tombstonesBefore);
+    }
+    for (const [key, receipt] of [...this.rotationReceipts]) {
+      if (now > receipt.expiresAt) {
+        this.rotationReceipts.delete(key);
+        stats.receiptsCleaned += 1;
+      }
+    }
+    return stats;
+  }
+
+  async probeWriteReadiness(): Promise<{ ok: true } | { ok: false; category: D1ErrorCategory }> {
+    return { ok: true };
+  }
+
+  async getOperationStoreCutover(tenantId: string): Promise<string | null> {
+    return this.operationStoreCutover.get(tenantId) ?? null;
+  }
+
+  async setOperationStoreCutover(tenantId: string, cutoverAt: string): Promise<void> {
+    this.operationStoreCutover.set(tenantId, cutoverAt);
+  }
+
   async schemaReadiness(): Promise<SchemaReadiness> {
     // In-memory store always carries the full logical 0002–0020 schema.
     const checks = Object.fromEntries(
@@ -3107,6 +3299,22 @@ export class SqlStore implements ControlPlaneStore {
         nowIso(),
       )
       .run();
+  }
+
+  async ensureBootstrapSeeded(): Promise<void> {
+    // Single read: migration 0022 seeds these rows, so the insert path runs
+    // only on genuinely unprovisioned stores. EXISTS subqueries keep this one
+    // statement (reads do not consume the write budget).
+    const seeded = await this.prepare(
+      "oauth.bootstrap.check",
+      `SELECT EXISTS (SELECT 1 FROM tenants WHERE id = ?)
+         AND EXISTS (SELECT 1 FROM principals WHERE id = ?)
+         AND EXISTS (SELECT 1 FROM oauth_clients WHERE client_id = ?) AS seeded`,
+    )
+      .bind(DEFAULT_TENANT, "prin_dev", "client_ownmesh_cli")
+      .first<{ seeded: number }>();
+    if (seeded && Number(seeded.seeded) === 1) return;
+    await this.ensureBootstrap();
   }
 
   async putClient(client: OAuthClientRecord): Promise<void> {
@@ -3652,16 +3860,9 @@ export class SqlStore implements ControlPlaneStore {
     const nowMs = Date.now();
     const now = nowIso(nowMs);
 
-    // Cleanup expired rotation receipts in a bounded batch.
-    await this.prepare("oauth.refresh.receipt_cleanup",
-      `DELETE FROM refresh_rotation_receipts
-       WHERE rowid IN (
-         SELECT rowid FROM refresh_rotation_receipts
-         WHERE expires_at <= ?
-         ORDER BY expires_at ASC
-         LIMIT ?
-       )`,
-    ).bind(now, REFRESH_ROTATION_RECEIPT_CLEANUP_BATCH).run();
+    // Issue #224 (P1): no per-request receipt cleanup here. Expired receipts
+    // are removed inside the healthy-rotation batch below and by the scheduled
+    // retention sweep, so response-loss retries stay a cheap receipt read.
 
     // Authoritative pre-read for metadata + expiry + tenant. CAS in the batch is the claim.
     const row = await this.prepare("oauth.token.read",
@@ -3756,7 +3957,8 @@ export class SqlStore implements ControlPlaneStore {
 
     type BatchResult = { meta?: { changes?: number }; success?: boolean };
     // Single atomic batch. Each statement is self-gated via WHERE/EXISTS - no SQL changes() cross-statement dependency.
-    // 0) Cleanup expired receipts (same as before, idempotent inside the batch).
+    // 0) Bounded expired-receipt cleanup (sole per-rotation cleanup; the
+    //    scheduled retention sweep covers response-loss retry paths).
     // 1) Ledger INSERT OR IGNORE SELECT is the CAS claim (unique PK).
     // 2) Mark old token used only if ledger claim exists.
     // 3) Insert successor only if old token claimed and no other live unused token in family.
@@ -4218,11 +4420,22 @@ export class SqlStore implements ControlPlaneStore {
       last_polled_at: row.last_polled_at ? Date.parse(row.last_polled_at) : undefined };
   }
 
-  async markDeviceCodePolled(deviceCode: string): Promise<void> {
+  async markDeviceCodePolled(deviceCode: string, minIntervalMs = 0): Promise<void> {
     const hash = await sha256Hex(deviceCode);
+    const now = nowIso();
+    if (minIntervalMs > 0) {
+      // Single conditional UPDATE: fresh polls are zero-change writes instead
+      // of a poll-frequency write stream (Issue #224 P1).
+      const cutoff = new Date(Date.now() - minIntervalMs).toISOString();
+      await this.db.prepare(
+        `UPDATE device_codes SET last_polled_at = ? WHERE device_code_hash = ? AND status = 'pending'
+         AND (last_polled_at IS NULL OR last_polled_at <= ?)`,
+      ).bind(now, hash, cutoff).run();
+      return;
+    }
     await this.db.prepare(
       `UPDATE device_codes SET last_polled_at = ? WHERE device_code_hash = ? AND status = 'pending'`,
-    ).bind(nowIso(), hash).run();
+    ).bind(now, hash).run();
   }
 
   async putDeviceVerificationTransaction(tx: DeviceVerificationTransaction): Promise<void> {
@@ -4772,7 +4985,7 @@ export class SqlStore implements ControlPlaneStore {
    * Acquire a per-tenant lease and delete at most one indexed batch. If work
    * remains, reset the lease so the next append continues draining it.
    */
-  private async compactAuditEvents(tenantId: string): Promise<void> {
+  private async compactAuditEvents(tenantId: string): Promise<{ deleted: number }> {
     const now = Date.now();
     const cutoff = new Date(now - this.auditRetentionMs).toISOString();
     const maintenanceAfter = new Date(now + AUDIT_MAINTENANCE_INTERVAL_MS).toISOString();
@@ -4784,7 +4997,7 @@ export class SqlStore implements ControlPlaneStore {
       )
       .bind(maintenanceAfter, tenantId, new Date(now).toISOString())
       .first<{ tenant_id: string }>();
-    if (!lease) return;
+    if (!lease) return { deleted: 0 };
 
     const deleted = await this.prepare("audit.retention.delete",
         `DELETE FROM audit_events
@@ -4796,7 +5009,8 @@ export class SqlStore implements ControlPlaneStore {
       )
       .bind(tenantId, cutoff, AUDIT_MAINTENANCE_BATCH)
       .run();
-    if (sqlChanges(deleted) > 0) {
+    const deletedCount = sqlChanges(deleted);
+    if (deletedCount > 0) {
       await this.prepare("audit.compact.lease_reset",
           `UPDATE audit_event_tenant_counters
            SET maintenance_after = '1970-01-01T00:00:00.000Z'
@@ -4805,6 +5019,7 @@ export class SqlStore implements ControlPlaneStore {
         .bind(tenantId)
         .run();
     }
+    return { deleted: deletedCount };
   }
 
   /**
@@ -4812,7 +5027,9 @@ export class SqlStore implements ControlPlaneStore {
    * Every statement touches at most MCP_OPS_MAINTENANCE_BATCH rows, so an MCP
    * request never inherits work proportional to the operation table size.
    */
-  private async compactMcpOperations(tenantId: string): Promise<void> {
+  private async compactMcpOperations(
+    tenantId: string,
+  ): Promise<{ deleted: number; compacted: number }> {
     const now = Date.now();
     const resultCutoff = new Date(now - MCP_OPS_RESULT_TTL_MS).toISOString();
     const tombstoneCutoff = new Date(now - MCP_OPS_TOMBSTONE_TTL_MS).toISOString();
@@ -4826,7 +5043,7 @@ export class SqlStore implements ControlPlaneStore {
       )
       .bind(maintenanceAfter, tenantId, new Date(now).toISOString())
       .first<{ tenant_id: string }>();
-    if (!lease) return;
+    if (!lease) return { deleted: 0, compacted: 0 };
 
     // Keyed tombstones preserve replay protection for 30 days after compaction.
     const expiredTombstones = await this.prepare("mcp.retention.delete",
@@ -4891,6 +5108,10 @@ export class SqlStore implements ControlPlaneStore {
         .bind(tenantId)
         .run();
     }
+    return {
+      deleted: sqlChanges(expiredTombstones) + sqlChanges(expiredKeyless),
+      compacted: sqlChanges(compactedKeyed),
+    };
   }
 
   /**
@@ -5030,13 +5251,13 @@ export class SqlStore implements ControlPlaneStore {
       ? this.prepare("mcp.operation.lookup",
         `SELECT * FROM mcp_operations
          WHERE principal_id = ? AND tenant_id = ? AND device_id = ?
-           AND idempotency_key = ?
+           AND idempotency_key = ? AND length(idempotency_key) > 0
          ORDER BY created_at DESC LIMIT 1`,
       ).bind(opts.principalId, opts.tenantId, opts.deviceId, opts.idempotencyKey)
       : this.prepare("mcp.operation.lookup",
         `SELECT * FROM mcp_operations
          WHERE principal_id = ? AND tenant_id = ? AND device_id IS NULL
-           AND idempotency_key = ?
+           AND idempotency_key = ? AND length(idempotency_key) > 0
          ORDER BY created_at DESC LIMIT 1`,
       ).bind(opts.principalId, opts.tenantId, opts.idempotencyKey);
     const row = await statement.first<Record<string, unknown>>();
@@ -5239,6 +5460,77 @@ export class SqlStore implements ControlPlaneStore {
         ?? 0,
     );
     if (changes < 1) return null;
+    return this.getMcpOperation(operationId);
+  }
+
+  async transitionMcpOperation(
+    operationId: string,
+    transition: McpOperationTransition,
+    fromStatuses?: string[],
+  ): Promise<McpOperationRecord | null> {
+    // Narrow CAS: only mutable result columns are SET, so indexed identity and
+    // exact-action binding columns keep their index entries (Issue #224 P1).
+    // Pre-read merges omitted result fields; the conditional UPDATE is the claim.
+    const cur = await this.getMcpOperation(operationId);
+    if (!cur) return null;
+    if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
+    const placeholders = fromStatuses?.map(() => "?").join(",") || "";
+    const statusClause = fromStatuses && fromStatuses.length > 0
+      ? ` AND status IN (${placeholders})`
+      : "";
+    const next = boundMcpOperationRecord({
+      ...cur,
+      status: transition.status,
+      summary: transition.summary ?? cur.summary,
+      data: transition.data ?? cur.data,
+      truncated: transition.truncated ?? cur.truncated,
+      next_cursor: transition.next_cursor !== undefined ? transition.next_cursor : cur.next_cursor,
+      approval_required: transition.approval_required ?? cur.approval_required,
+      approval_url: transition.approval_url ?? cur.approval_url ?? undefined,
+      approval_id: transition.approval_id ?? cur.approval_id ?? undefined,
+      session_id: transition.session_id !== undefined ? transition.session_id : cur.session_id,
+      warnings: transition.warnings ?? cur.warnings,
+      policy_authority: "ownmesh_device",
+      updated_at: transition.updated_at || nowIso(),
+    });
+    // Telemetry parity with updateMcpOperation's status-derived fingerprints.
+    const transitionFp: D1Fingerprint =
+      next.status === "dispatched"
+        ? "mcp.operation.update.dispatch"
+        : next.status === "cancel_requested"
+          ? "mcp.operation.update.cancel"
+          : next.status === "completed" ||
+              next.status === "failed" ||
+              next.status === "denied" ||
+              next.status === "cancelled" ||
+              next.status === "device_offline"
+            ? "mcp.operation.update.terminal"
+            : "mcp.operation.update.other";
+    const updated = await this.prepare(
+      transitionFp,
+      `UPDATE mcp_operations SET
+         status = ?, summary = ?, data_json = ?, truncated = ?,
+         next_cursor = ?, approval_required = ?, approval_url = ?,
+         approval_id = ?, session_id = ?, warnings_json = ?, updated_at = ?
+       WHERE operation_id = ?${statusClause}`,
+    )
+      .bind(
+        next.status,
+        next.summary,
+        JSON.stringify(next.data || {}),
+        next.truncated ? 1 : 0,
+        next.next_cursor ?? null,
+        next.approval_required ? 1 : 0,
+        next.approval_url ?? null,
+        next.approval_id ?? null,
+        next.session_id ?? null,
+        JSON.stringify(next.warnings || []),
+        next.updated_at,
+        operationId,
+        ...(fromStatuses || []),
+      )
+      .run();
+    if (sqlChanges(updated) < 1) return null;
     return this.getMcpOperation(operationId);
   }
 
@@ -6038,8 +6330,114 @@ export class SqlStore implements ControlPlaneStore {
       .run();
   }
 
+  async runRetentionSweep(opts?: { tenantLimit?: number }): Promise<RetentionSweepStats> {
+    // Tenant-bounded drain for scheduled workers. Request-path leases are
+    // still honored inside the compact calls, so concurrent traffic cannot
+    // double-spend a retention pass.
+    const tenantLimit = Math.max(1, Math.min(256, Math.trunc(opts?.tenantLimit ?? 64)));
+    const stats: RetentionSweepStats = {
+      tenantsSwept: 0,
+      auditDeleted: 0,
+      operationsDeleted: 0,
+      operationsCompacted: 0,
+      receiptsCleaned: 0,
+    };
+    let tenants: string[] = [];
+    try {
+      // Enumerate tenants with retention state (not the tenants registry):
+      // exactly the tenants that can hold backlog.
+      const rows = await this.db
+        .prepare(
+          `SELECT tenant_id FROM mcp_operation_tenant_counters
+           UNION
+           SELECT tenant_id FROM audit_event_tenant_counters
+           ORDER BY tenant_id LIMIT ?`,
+        )
+        .bind(tenantLimit)
+        .all<{ tenant_id: string }>();
+      tenants = (rows.results || []).map((row) => String(row.tenant_id));
+    } catch {
+      return stats;
+    }
+    for (const tenantId of tenants) {
+      stats.tenantsSwept += 1;
+      try {
+        const audit = await this.compactAuditEvents(tenantId);
+        stats.auditDeleted += audit.deleted;
+      } catch {
+        // One tenant's backlog must not abort the sweep; the next scheduled
+        // pass retries. Failures remain visible via per-statement telemetry.
+      }
+      try {
+        const ops = await this.compactMcpOperations(tenantId);
+        stats.operationsDeleted += ops.deleted;
+        stats.operationsCompacted += ops.compacted;
+      } catch {
+        // Same bounded-retry policy as audit above.
+      }
+    }
+    try {
+      const receipts = await this.prepare(
+        "retention.sweep.receipts",
+        `DELETE FROM refresh_rotation_receipts
+         WHERE rowid IN (
+           SELECT rowid FROM refresh_rotation_receipts
+           WHERE expires_at <= ?
+           ORDER BY expires_at ASC
+           LIMIT ?
+         )`,
+      )
+        .bind(new Date(Date.now()).toISOString(), REFRESH_ROTATION_RECEIPT_CLEANUP_BATCH)
+        .run();
+      stats.receiptsCleaned = sqlChanges(receipts);
+    } catch {
+      // Bounded retry on the next sweep.
+    }
+    return stats;
+  }
+
+  async probeWriteReadiness(): Promise<{ ok: true } | { ok: false; category: D1ErrorCategory }> {
+    try {
+      await this.prepare(
+        "quota.probe",
+        `INSERT INTO quota_probe (id, checked_at) VALUES ('probe', ?)
+         ON CONFLICT(id) DO UPDATE SET checked_at = excluded.checked_at`,
+      )
+        .bind(new Date(Date.now()).toISOString())
+        .run();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, category: classifyD1Error(error) };
+    }
+  }
+
+  async getOperationStoreCutover(tenantId: string): Promise<string | null> {
+    try {
+      const row = await this.prepare(
+        "store.cutover.get",
+        `SELECT cutover_at FROM operation_store_cutover WHERE tenant_id = ? LIMIT 1`,
+      )
+        .bind(tenantId)
+        .first<{ cutover_at: string }>();
+      return row ? String(row.cutover_at) : null;
+    } catch {
+      // Pre-0022 schema: no cutover table means D1 authority.
+      return null;
+    }
+  }
+
+  async setOperationStoreCutover(tenantId: string, cutoverAt: string): Promise<void> {
+    await this.prepare(
+      "store.cutover.set",
+      `INSERT INTO operation_store_cutover (tenant_id, cutover_at) VALUES (?, ?)
+       ON CONFLICT(tenant_id) DO UPDATE SET cutover_at = excluded.cutover_at`,
+    )
+      .bind(tenantId, cutoverAt)
+      .run();
+  }
+
   /**
-   * Probe 0002–0020 tables, required columns (SELECT projections), and indexes
+   * Probe 0002–0022 tables, required columns (SELECT projections), and indexes
    * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {

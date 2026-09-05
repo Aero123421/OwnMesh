@@ -890,7 +890,7 @@ export async function handleOwnerPasskeyRegistrationOptions(
   if (!existing) return passkeyError("owner_auth_schema_unavailable", 503);
   if (existing.length > 0) return passkeyError("owner_already_registered", 409);
 
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   if (!(await store.tenantExists(OWNER_TENANT))) return passkeyError("owner_tenant_unavailable", 503);
   await store.ensurePrincipal(OWNER_ID, "Owner", "human", OWNER_TENANT);
   const userIdBytes = randomBytes(32);

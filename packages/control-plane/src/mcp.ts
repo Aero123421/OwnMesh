@@ -18,7 +18,7 @@
  * Prompt-injection / model judgment MUST NOT bypass (2)/(3).
  */
 
-import type { ControlPlaneStore, DeviceRecord, McpOperationRecord, McpOperationQuotaSnapshot } from "./store.ts";
+import type { ControlPlaneStore, DeviceRecord, McpOperationRecord, McpOperationQuotaSnapshot, McpOperationTransition } from "./store.ts";
 import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   approvalSelectionReturnTo,
@@ -2841,6 +2841,35 @@ async function patchOp(
   if (patch.tool !== undefined) storePatch.tool = patch.tool;
   if (patch.principal !== undefined) storePatch.principal_id = patch.principal;
   if (patch.tenant_id !== undefined) storePatch.tenant_id = patch.tenant_id;
+  // Issue #224 (P1): patches touching only mutable result columns use the
+  // narrow transition CAS (small indexed-column fan-out). Identity/binding
+  // changes keep the full-row CAS path.
+  const narrowKeys = new Set([
+    "status", "summary", "data", "truncated", "next_cursor",
+    "approval_required", "approval_url", "approval_id", "session_id",
+    "warnings", "updated_at",
+  ]);
+  const wideUpdateNeeded = Object.keys(storePatch).some((key) => !narrowKeys.has(key));
+  if (!wideUpdateNeeded && storePatch.status !== undefined && !expectedData) {
+    const transition: McpOperationTransition = {
+      status: storePatch.status,
+      updated_at: storePatch.updated_at,
+    };
+    if (storePatch.summary !== undefined) transition.summary = storePatch.summary;
+    if (storePatch.data !== undefined) transition.data = storePatch.data;
+    if (storePatch.truncated !== undefined) transition.truncated = storePatch.truncated;
+    if (storePatch.next_cursor !== undefined) transition.next_cursor = storePatch.next_cursor;
+    if (storePatch.approval_required !== undefined) transition.approval_required = storePatch.approval_required;
+    if (storePatch.approval_url !== undefined) transition.approval_url = storePatch.approval_url;
+    if (storePatch.approval_id !== undefined) transition.approval_id = storePatch.approval_id;
+    if (storePatch.session_id !== undefined) transition.session_id = storePatch.session_id;
+    if (storePatch.warnings !== undefined) transition.warnings = storePatch.warnings;
+    const transitioned = await store.transitionMcpOperation(operationId, transition, fromStatuses);
+    if (!transitioned) return undefined;
+    const tracked = trackedFromRecord(transitioned);
+    tracker.put(tracked);
+    return tracked;
+  }
   const updated = await store.updateMcpOperation(operationId, storePatch, fromStatuses, expectedData);
   if (!updated) return undefined;
   const tracked = trackedFromRecord(updated);

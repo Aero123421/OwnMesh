@@ -21,6 +21,7 @@ export const D1_FINGERPRINTS = [
   "oauth.bootstrap.tenant",
   "oauth.bootstrap.principal",
   "oauth.bootstrap.client",
+  "oauth.bootstrap.check",
   "oauth.authorize_tx.insert",
   "oauth.authorize_tx.consume",
   "oauth.code.insert",
@@ -61,6 +62,10 @@ export const D1_FINGERPRINTS = [
   "approval.outbox.release",
   "approval.outbox.attempt",
   "approval.outbox.deliver",
+  "quota.probe",
+  "retention.sweep.receipts",
+  "store.cutover.get",
+  "store.cutover.set",
 ] as const;
 
 export type D1Fingerprint = (typeof D1_FINGERPRINTS)[number];

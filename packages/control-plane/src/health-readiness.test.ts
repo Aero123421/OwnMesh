@@ -110,6 +110,12 @@ const WORKSPACE_SCHEMA_KEYS = [
   "device_workspace_members",
 ] as const;
 
+/** 0022 plan-F P1: write probe + operation-store cutover (Issue #224). */
+const PLAN_F_SCHEMA_KEYS = [
+  "quota_probe",
+  "operation_store_cutover",
+] as const;
+
 const P0_SCHEMA_KEYS = [
   "devices_status",
   "revoked_refresh_families",
@@ -132,6 +138,7 @@ const ALL_SCHEMA_KEYS = [
   ...P0_SCHEMA_KEYS,
   ...MCP_SCHEMA_KEYS,
   ...WORKSPACE_SCHEMA_KEYS,
+  ...PLAN_F_SCHEMA_KEYS,
 ] as const;
 
 test("RFC 9728 protected-resource metadata is served at origin and /mcp path", async () => {
@@ -582,7 +589,9 @@ test("missing required 0002 index → schema_ready:false and /health/ready 503",
   const { db, store } = openStoreWith(allMigrationFiles());
   assert.equal((await store.schemaReadiness()).schema_ready, true);
   db.exec(`DROP INDEX idx_auth_codes_client`);
-  db.exec(`DROP INDEX idx_mcp_ops_updated`);
+  // idx_mcp_ops_updated was dropped as redundant in 0022; use a still-required
+  // index to prove missing-index detection still fails closed.
+  db.exec(`DROP INDEX idx_mcp_ops_correlation`);
   const readiness = await store.schemaReadiness();
   assert.equal(readiness.schema_ready, false);
   assert.equal(readiness.checks.oauth_auth_codes, false);

@@ -500,7 +500,7 @@ export async function handleRegister(
   }
   const clientId = randomToken("client_").slice(0, 24);
   const clientName = body.client_name || "ownmesh-client";
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   await store.putClient({
     client_id: clientId,
     tenant_id: rec.tenant_id,
@@ -548,7 +548,7 @@ export async function handleAuthorize(
   // solely from the stored snapshot (ignore any resubmitted/altered OAuth params).
   // index.ts merges form fields into url.searchParams before calling us.
   if (req.method === "POST" && url.searchParams.has("decision")) {
-    await store.ensureBootstrap();
+    await store.ensureBootstrapSeeded();
     let postPrincipal = security.principal;
     if (!postPrincipal && security.allowDevBypass) {
       postPrincipal = { id: "prin_dev", tenant_id: DEFAULT_TENANT, display_name: "prin_dev" };
@@ -647,7 +647,7 @@ export async function handleAuthorize(
     );
   }
 
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   let client = await store.getClient(clientId);
   // For a known client, reject an altered redirect before authentication.
   if (client && !isAllowedCimdClientId(clientId) && !client.redirect_uris.includes(redirect)) {
@@ -842,7 +842,7 @@ export async function handleToken(
   if (parsedBody instanceof Response) return parsedBody;
   const body = parsedBody;
   const grant = body.grant_type;
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
 
   // Reject confidential-client auth. We only support public clients + PKCE (none).
   // Presence of client_secret (including empty string) is client_secret_post — fail closed.
@@ -967,7 +967,9 @@ export async function handleToken(
       return json({ error: "access_denied" }, { status: 400 });
     }
     if (rec.status === "pending") {
-      await store.markDeviceCodePolled(deviceCode);
+      // Throttle the last_polled_at write stream to the device-flow interval
+      // (Issue #224 P1); slow_down semantics below are unchanged.
+      await store.markDeviceCodePolled(deviceCode, Math.max(1_000, rec.interval_sec * 1000));
       // slow_down if polled too fast
       if (
         rec.last_polled_at &&
@@ -1048,7 +1050,7 @@ export async function handleDeviceAuthorization(
   const body = parsedBody;
   const clientId = body.client_id || "";
   const scope = body.scope || DEFAULT_SCOPE;
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   if (!clientId || !(await store.getClient(clientId))) {
     return json({ error: "unauthorized_client" }, { status: 401 });
   }
@@ -1098,7 +1100,7 @@ export async function handleDeviceVerification(
   store: ControlPlaneStore,
   security: OAuthRequestSecurity = {},
 ): Promise<Response> {
-  await store.ensureBootstrap();
+  await store.ensureBootstrapSeeded();
   const locale = authLocale(req);
   let principal = security.principal;
   if (!principal && security.allowDevBypass) principal = { id: "prin_dev", tenant_id: DEFAULT_TENANT };
