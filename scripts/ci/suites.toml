@@ -1,0 +1,96 @@
+# Canonical CI suite definitions (Issue #230).
+# Single source of truth for suite commands. `.github/workflows/ci.yml` holds
+# orchestration/permissions/OS only and invokes each suite via
+# `python3 scripts/ci/run.py <suite>`; CONTRIBUTING.md and local runs use the
+# same entrypoint. Thin layer only: invokes Cargo/pnpm/Python directly with
+# argv lists (no shell string concatenation).
+
+[rust-linux]
+description = "Linux-only full Rust correctness (fmt, clippy, test, bins check)"
+commands = [
+  "cargo metadata --locked --format-version 1 --no-deps",
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets --locked -- -D warnings",
+  "cargo test --workspace --all-targets --locked --exclude ownmesh-session-host --exclude ownmeshd",
+]
+timeout_minutes = 15
+
+[rust-linux-stateful]
+description = "Linux-only daemon/PTY stateful phases (same runner, no test-binary rerun)"
+commands = [
+  "cargo test -p ownmeshd --bin ownmeshd --locked",
+  "cargo test -p ownmeshd --test adversarial_security --locked -- --skip runtime::",
+  "cargo test -p ownmeshd --test lease_expiry --locked -- --skip runtime::",
+  "cargo test -p ownmeshd --test persist_rollback --locked -- --skip runtime::",
+  "cargo test -p ownmeshd --test broker_capability_forgery --locked",
+  "cargo test -p ownmeshd --test platform_endpoint_security --locked",
+  "cargo test -p ownmesh-session-host --all-targets --locked -- --test-threads=1",
+]
+timeout_minutes = 20
+
+[typescript]
+description = "TypeScript/schema/control-plane gates (path-aware)"
+commands = [
+  "pnpm install --frozen-lockfile",
+  "pnpm -r test",
+  "pnpm -r typecheck",
+  "pnpm -r lint",
+  "pnpm --dir packages/control-plane exec wrangler deploy --dry-run",
+]
+timeout_minutes = 10
+
+[platform-windows]
+description = "Windows compile compatibility + affected native link/run evidence (CI invokes via run.py platform-windows)"
+commands = [
+  "cargo check --workspace --all-targets --locked",
+  "cargo test --locked -p ownmesh-fs --lib",
+  "cargo test --locked -p ownmesh-ipc --lib",
+  "cargo test --locked -p ownmesh-ipc windows_rejects_foreign_owned_state_directory_before_hardening -- --ignored",
+]
+timeout_minutes = 15
+
+[platform-macos]
+description = "macOS compile compatibility + affected native link/run evidence (CI invokes via run.py platform-macos)"
+commands = [
+  "cargo check --workspace --all-targets --locked",
+  "cargo test --locked -p ownmesh-fs --lib",
+  "cargo test --locked -p ownmesh-ipc --lib",
+]
+timeout_minutes = 15
+
+[security-fast]
+description = "PR fast security: changed-range gitleaks scan (canonical local command; CI wraps the same scan in the pinned gitleaks action for upload/summary)"
+commands = [
+  "gitleaks detect --no-banner --redact --verbose --log-opts=HEAD~5..HEAD -- .",
+]
+timeout_minutes = 10
+
+[security-boundary]
+description = "Affected Rust privacy/redaction boundary subset (once; deep suite stays weekly in security.yml)"
+commands = [
+  "cargo test --locked -p ownmesh-diagnostics -p ownmesh-config -p ownmesh-update -p ownmesh-transfer -p ownmesh-policy -p ownmesh-identity -- --nocapture",
+]
+timeout_minutes = 10
+
+[release-policy]
+description = "Release graph checker + mutation + installer (each once)"
+commands = [
+  "python3 scripts/tests/test_installers.py",
+  "python3 scripts/check_release_quality.py",
+  "python3 scripts/tests/run_release_quality_tests.py",
+]
+timeout_minutes = 10
+
+[tui-i18n]
+description = "TUI translation completeness invariant (unique gate; snapshots run once in rust-linux workspace test)"
+commands = [
+  "cargo run --locked -p ownmesh-tui -- --check-i18n",
+]
+timeout_minutes = 10
+
+[scale-filesystem]
+description = "Production-scale filesystem boundaries (nightly/weekly/manual only)"
+commands = [
+  "cargo test --locked -p ownmesh-fs --test scale_directory -- --ignored --test-threads=1 --nocapture",
+]
+timeout_minutes = 60

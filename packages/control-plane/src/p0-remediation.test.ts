@@ -28,18 +28,18 @@ test("production OAuth defaults reject unknown clients, implicit login_hint, aut
   const store = new MemoryStore();
   await store.ensureBootstrap();
   const unknown = await handleAuthorize(new Request(
-    "https://cp.test/oauth/authorize?response_type=code&client_id=unknown&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256&login_hint=attacker&auto=1",
+    "https://cp.test/oauth/authorize?response_type=code&client_id=unknown&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256&login_hint=attacker&auto=1&resource=https%3A%2F%2Fcp.test%2Fmcp",
   ), store, "https://cp.test");
   assert.equal(unknown.status, 401);
   assert.equal(await store.getClient("unknown"), null);
 
   await store.putClient({ client_id: "known", tenant_id: "ten_default", client_name: "known", redirect_uris: ["https://client.test/cb"], created_at: new Date().toISOString() });
   const noIdentity = await handleAuthorize(new Request(
-    "https://cp.test/oauth/authorize?response_type=code&client_id=known&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256&login_hint=attacker&auto=1",
+    "https://cp.test/oauth/authorize?response_type=code&client_id=known&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256&login_hint=attacker&auto=1&resource=https%3A%2F%2Fcp.test%2Fmcp",
   ), store, "https://cp.test");
   assert.equal(noIdentity.status, 401);
   const noAutoConsent = await handleAuthorize(new Request(
-    "https://cp.test/oauth/authorize?response_type=code&client_id=known&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256&auto=1",
+    "https://cp.test/oauth/authorize?response_type=code&client_id=known&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256&auto=1&resource=https%3A%2F%2Fcp.test%2Fmcp",
   ), store, "https://cp.test", { principal: { id: "prin_dev", tenant_id: "ten_default" } });
   assert.equal(noAutoConsent.status, 200);
   assert.equal(noAutoConsent.headers.get("location"), null);
@@ -51,7 +51,7 @@ test("production OAuth defaults reject unknown clients, implicit login_hint, aut
   __setTestStore(store);
   const authProvider = { fetch: async () => Response.json({ principal_id: "prin_dev", tenant_id: "ten_default" }) } as unknown as Fetcher;
   const workerUnknown = await worker.fetch(new Request(
-    "https://cp.test/oauth/authorize?response_type=code&client_id=still_unknown&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256",
+    "https://cp.test/oauth/authorize?response_type=code&client_id=still_unknown&redirect_uri=https%3A%2F%2Fclient.test%2Fcb&code_challenge=x&code_challenge_method=S256&resource=https%3A%2F%2Fcp.test%2Fmcp",
   ), { AUTH_PROVIDER: authProvider }, ctx);
   assert.equal(workerUnknown.status, 401);
   assert.equal(await store.getClient("still_unknown"), null);
@@ -61,7 +61,7 @@ test("production OAuth defaults reject unknown clients, implicit login_hint, aut
 test("worker reports missing auth provider and missing production D1 without falling back", async () => {
   __setTestStore(new MemoryStore());
   const auth = await worker.fetch(new Request(
-    "https://cp.test/oauth/authorize?response_type=code&client_id=x&redirect_uri=https%3A%2F%2Fx.test%2Fcb&code_challenge=x&code_challenge_method=S256",
+    "https://cp.test/oauth/authorize?response_type=code&client_id=x&redirect_uri=https%3A%2F%2Fx.test%2Fcb&code_challenge=x&code_challenge_method=S256&resource=https%3A%2F%2Fcp.test%2Fmcp",
   ), {}, ctx);
   assert.equal(auth.status, 503);
   assert.equal((await auth.json() as { error: string }).error, "auth_provider_unavailable");

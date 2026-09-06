@@ -1,0 +1,8 @@
+{
+  "name": "ownmesh",
+  "version": "0.1.0",
+  "description": "OwnMesh device capability runtime over Streamable HTTP MCP (experimental, unverified live).",
+  "author": {
+    "name": "OwnMesh"
+  }
+}

@@ -1,18 +1,31 @@
 name: Security
 
+# Deep / scheduled security (Issue #230 Phase 3, ADR 0022).
+# PR-time fast subset lives in ci.yml `security-fast` (changed-range gitleaks
+# + affected boundary tests). This workflow never runs on PRs so the same
+# clippy/typecheck/lint/tests are not executed twice for one SHA.
+#
+# - weekly schedule: new advisories, full-history secrets, strict SBOM, full
+#   adversarial/fuzz corpus, retention/redaction invariants.
+# - main lockfile pushes: dependency audits only (fast signal on new deps).
+# - manual dispatch: full deep suite.
+
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
   schedule:
     - cron: "17 5 * * 1"
   workflow_dispatch:
-  workflow_call:
+  push:
+    branches: [main, master]
+    paths:
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+      - "Cargo.toml"
+      - "package.json"
+      - "packages/*/package.json"
 
 concurrency:
   group: security-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -65,42 +78,11 @@ jobs:
       - name: pnpm audit (high and critical are blocking)
         run: pnpm audit --audit-level=high
 
-  sast-rust:
-    name: SAST (Rust 1.92 clippy -D warnings)
+  secret-scanning-full-history:
+    name: Secret scanning (full history)
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust 1.92 toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with:
-          toolchain: "1.92.0"
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: cargo clippy (workspace, all targets, locked)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  sast-typescript:
-    name: SAST (TypeScript)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22"
-      - name: Enable corepack (pnpm 9.15.0)
-        run: |
-          corepack enable
-          corepack prepare pnpm@9.15.0 --activate
-      - name: pnpm install (frozen lockfile)
-        run: pnpm install --frozen-lockfile
-      - name: Typecheck all packages
-        run: pnpm -r typecheck
-      - name: Lint all packages
-        run: pnpm -r lint
-
-  secret-scanning:
-    name: Secret scanning (gitleaks)
-    runs-on: ubuntu-latest
+    # Weekly full-history scan. PRs get changed-range scan in ci.yml security-fast.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       security-events: write
@@ -108,15 +90,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Gitleaks
+      - name: Gitleaks (full history)
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "true"
           GITLEAKS_ENABLE_SUMMARY: "true"
 
-  sbom:
-    name: SBOM (strict CycloneDX Rust + Node)
+  sbom-weekly:
+    name: SBOM weekly (strict CycloneDX)
+    # Weekly continuous audit. Release assets use an exact-tag-SHA SBOM
+    # regenerated in release.yml (missing/invalid fails publish).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -166,13 +151,14 @@ jobs:
       - name: Upload SBOM artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: sbom-cyclonedx
+          name: sbom-cyclonedx-weekly
           path: sbom/*.cdx.json
           if-no-files-found: error
           retention-days: 90
 
-  audit-retention-and-redaction:
-    name: Audit retention + redaction invariants
+  deep-adversarial:
+    name: Deep adversarial + privacy invariants (weekly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -190,18 +176,14 @@ jobs:
           corepack prepare pnpm@9.15.0 --activate
       - name: pnpm install (frozen lockfile)
         run: pnpm install --frozen-lockfile
-      - name: Rust privacy / redaction / relay / Full Access invariants
+      - name: Full Rust privacy / redaction invariants
         run: >-
           cargo test --locked
           -p ownmesh-diagnostics -p ownmesh-config -p ownmesh-update
           -p ownmesh-transfer -p ownmesh-policy -p ownmesh-identity
           -- --nocapture
-      - name: Control-plane security hardening tests
+      - name: Full control-plane hardening tests
         run: pnpm --filter @ownmesh/control-plane test
-      # Asserts the values a fresh install actually receives, rather than
-      # grepping for `= false` literals. A source grep passed on incidental
-      # matches (including test fixtures) and could not detect a flipped
-      # default expressed via `#[derive(Default)]` or `#[serde(default = ..)]`.
       - name: Confirm telemetry/relay/update-network defaults remain OFF
         run: >-
           cargo test --locked
@@ -209,10 +191,3 @@ jobs:
           -p ownmesh-update --test privacy_defaults
           -p ownmesh-diagnostics --test privacy_and_redaction
           -- --nocapture
-
-  release-policy:
-    name: Release cannot bypass CI or security
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: python scripts/check_release_quality.py

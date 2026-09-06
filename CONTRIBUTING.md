@@ -46,13 +46,29 @@ pnpm -r lint
 cargo metadata --locked --format-version 1 --no-deps > /dev/null
 cargo fmt --all --check # cargo-fmt never resolves dependencies and has no --locked option
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo build --workspace --locked
 cargo test --workspace --all-targets --locked
 pnpm install --frozen-lockfile
 pnpm -r test
 pnpm -r typecheck
 pnpm -r lint
-python scripts/check_release_quality.py
+python3 scripts/check_release_quality.py
+```
+
+Canonical suite runner (same commands CI uses; single source is `scripts/ci/suites.toml`):
+
+```bash
+python scripts/ci/run.py --list
+python scripts/ci/run.py rust-linux
+python scripts/ci/run.py rust-linux-stateful
+python scripts/ci/run.py typescript
+python scripts/ci/run.py platform-windows
+python scripts/ci/run.py platform-macos
+python scripts/ci/run.py platform --os windows --scope affected
+python scripts/ci/run.py security-fast
+python scripts/ci/run.py security-boundary
+python scripts/ci/run.py scale --suite filesystem
+python scripts/ci/run.py release-policy
+python scripts/ci/run.py tui-i18n
 ```
 
 ### Local validation and CI policy
@@ -137,6 +153,87 @@ commits. The rule applies from here forward.
 3. Ensure the quality gates above pass locally.
 4. Describe **what** and **why**; link specifications or ADRs when relevant.
 5. Call out security / privilege / protocol impact explicitly.
+6. CodeRabbitレビューはCIが自動で依頼する（PR open/更新時は `@coderabbitai review`、`review-ready` ラベル時は `full review`）。手動の `@coderabbitai review` はCIが未発火だった場合のフォールバックのみ。
+
+## Test taxonomy and placement (Issue #230)
+
+Decide placement by asking “where does this test run, on which OS/event?” using
+[`docs/ci-test-tiers.md`](./docs/ci-test-tiers.md). Summary:
+
+| Tier | Place | Default run |
+|---|---|---|
+| Unit / contract | source `#[cfg(test)]`, TS `*.test.ts` | relevant PR / Linux |
+| Component integration | `crates/<crate>/tests/<domain>.rs`, `*.integration.test.ts` | relevant PR / Linux |
+| Platform | `tests/platform_<os>_<domain>.rs` | affected PR on owning OS + nightly |
+| Security/adversarial | `security_*`, `adversarial_*` | affected PR + weekly |
+| Scale / soak | `tests/scale_*.rs` (`#[ignore="scale: ..."]`) | nightly/weekly/manual |
+| E2E | `scripts/tests/test_e*.py` | nightly/release |
+| Release / supply chain | `scripts/tests/test_release_*.py` | affected PR + release |
+
+### Minimum evidence per change
+
+- Bug fix: add a focused regression that fails before, passes after.
+- Public/security-invariant change: add at least one negative path, not only success.
+- Auth/policy/privilege/replay/persistence change: cover missing/invalid/expired credential, substitution, duplicate/replay, persistence failure before/after side effect, crash/restart/retry, malformed/oversized input, redaction.
+- Schema/protocol change: update Rust + TypeScript + JSON Schema + fixtures + compat in one PR.
+- OS-specific code: link/run evidence on the target OS, not compile only.
+- D1 migration: empty-DB full chain, prior-schema upgrade, constraints/index/query plan, non-idempotent re-apply behavior on a local fixture.
+
+### Deterministic rules
+
+- No external internet, real Cloudflare account, real OAuth provider, or personal home/config/keychain.
+- No wall-clock sleep for sync; use fake clock/channel/barrier/poll-with-deadline.
+- Inject or fixed-seed RNG/ID/time. Explicit timeout + bounded output for process/network/file IO.
+- Isolate temp dir/port/state per test; clean up child/process/socket/file.
+- RAII-restore unavoidable global env changes; isolate process-wide mutation behind a lock or single-thread target.
+- No test-order dependence. Never disable production security checks via `cfg(test)`.
+
+### Production-limit tests
+
+Verify logic with injected small limits in the default suite; verify the real
+production constant once in `scale_*`:
+
+```rust
+#[test]
+fn spills_to_disk_after_memory_entry_limit() {
+    let limits = DirectoryPagingLimits {
+        memory_entries: 3, spool_entries: 16, page_entries: 2, page_json_bytes: 4_096,
+    };
+    // ... 4-entry fixture, same implementation as production ...
+}
+
+#[test]
+#[ignore = "scale: creates 25,050 real filesystem entries"]
+fn production_directory_spool_boundary() { /* real FS, once */ }
+```
+
+```bash
+cargo test --locked -p ownmesh-fs --test scale_directory -- --ignored --test-threads=1
+```
+
+`#[ignore]` is only for permanent scale tests (`scale:` reason, nightly-run).
+Flaky quarantine is prohibited by default (Issue/owner/expiry/nightly required,
+never for security/release gates).
+
+### Focused commands
+
+```bash
+cargo test --locked -p <crate> --all-targets
+cargo test --locked -p ownmeshd --test <target> <name>
+cargo test --locked -p <crate> --test platform_windows_<domain>
+pnpm --filter @ownmesh/control-plane test
+pnpm --filter @ownmesh/control-plane typecheck
+pnpm --filter @ownmesh/control-plane lint
+pnpm --filter @ownmesh/schema test
+```
+
+### Runtime budget (initial)
+
+Pure unit <100ms, component integration <5s, single default test binary >30s on
+hosted Linux triggers split/tier review, single test >10s needs PR justification.
+Large counts, serialized global state, real process trees, and production bounds
+are scale/platform candidates. CI collects duration reports; post-baseline,
+e.g. “≥30s absolute and ≥30% regression” becomes a review signal.
 
 ## Issues
 

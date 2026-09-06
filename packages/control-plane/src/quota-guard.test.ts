@@ -121,9 +121,20 @@ test("degraded modes gate MCP calls by risk class", async () => {
   assert.equal(writeErr.reset_at, future);
   assert.equal(writeErr.mode, "read_only");
 
-  // auth_only without room coverage rejects even reads, without D1 writes.
+  // auth_only without room coverage rejects even reads with transient 503
+  // (retryable, never credential loss). Issue #227.
   const readBlocked = await mcpCall(store, issued.access_token, "ownmesh_list_devices", {}, authOnly);
-  assert.equal(((readBlocked.body.error as { data: { code: string } }).data).code, "OWNMESH_QUOTA_READ_ONLY_DISABLED");
+  assert.equal(readBlocked.status, 503);
+  const blockedErr = readBlocked.body.error as { message: string; data: Record<string, unknown> };
+  assert.equal(blockedErr.message, "temporarily_unavailable");
+  const blockedData = blockedErr.data as {
+    reason: string; retryable: boolean; reset_at: string; mode: string;
+  };
+  assert.equal(blockedData.reason, "d1_write_quota_exceeded");
+  assert.equal(blockedData.retryable, true);
+  assert.equal(blockedData.reset_at, future);
+  assert.equal(blockedData.mode, "auth_only");
+  assert.ok("diagnostic_id" in blockedErr.data);
 
   // Normal mode is unaffected.
   const normal = await mcpCall(store, issued.access_token, "ownmesh_list_devices", {});

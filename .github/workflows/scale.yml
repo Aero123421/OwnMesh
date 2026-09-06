@@ -1,0 +1,88 @@
+name: Scale (nightly / weekly)
+
+# Production-boundary scale and soak suites (Issue #230 Phase 1/5).
+# Default PR CI never runs these; nightly runs the smoke subset, weekly runs
+# the full soak. Failures are blocking signals with an owner, never ignored
+# because "PR passed".
+
+on:
+  schedule:
+    - cron: "37 4 * * *"      # nightly smoke
+    - cron: "41 5 * * 0"      # weekly full soak
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Scale suite to run"
+        required: false
+        default: "filesystem"
+        type: choice
+        options:
+          - filesystem
+          - all
+
+concurrency:
+  group: scale-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scale-filesystem:
+    name: Production filesystem boundaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.92 toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Production boundary scale smoke (single-threaded)
+        run: cargo test --locked -p ownmesh-fs --test scale_directory -- --ignored --test-threads=1 --nocapture
+
+      - name: Upload scale logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scale-filesystem-logs
+          path: target/debug/deps/scale_directory-*.d
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Failure triage is notification-only (no secrets, no issue write).
+  # On failure it publishes owner/due/Issue-template to the step summary
+  # and exposes them as job outputs for branch protection / dashboards.
+  # See docs/ci-test-tiers.md "Nightly/weekly ownership".
+  triage:
+    name: Scale failure triage (blocking signal)
+    needs: [scale-filesystem]
+    if: failure()
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.triage.outputs.owner }}
+      due: ${{ steps.triage.outputs.due }}
+      issue_title: ${{ steps.triage.outputs.issue_title }}
+    steps:
+      - id: triage
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'owner=@Aero123421' >> "$GITHUB_OUTPUT"
+          echo 'due=triage within 1 business day' >> "$GITHUB_OUTPUT"
+          echo 'issue_title=[scale] nightly/weekly failure needs triage' >> "$GITHUB_OUTPUT"
+          {
+            echo "## Scale failure triage (blocking, owner required)"
+            echo ""
+            echo "- Owner: @Aero123421 (per .github/CODEOWNERS; docs/ci-test-tiers.md nightly/weekly ownership)"
+            echo "- Due: triage within 1 business day; file an Issue before any retry or quarantine"
+            echo "- Issue template: title \`[scale] <date> <suite> failure\`, body links this run URL and the \`scale-filesystem-logs\` artifact"
+            echo "- Issue fields: owner, expiry (for quarantine only), nightly execution required"
+            echo "- Quarantine: prohibited by default; never applies to security/release gates"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
