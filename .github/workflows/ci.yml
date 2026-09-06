@@ -196,6 +196,11 @@ jobs:
         run: python3 scripts/ci/run.py platform-windows
         shell: bash
 
+      - name: Build installer binaries (minimal five-binary set)
+        if: needs.plan.outputs.installers == 'true' || needs.plan.outputs.release_policy == 'true' || needs.plan.outputs.full == 'true'
+        shell: bash
+        run: cargo build --locked -p ownmesh -p ownmesh-tui -p ownmeshd -p ownmesh-session-host -p ownmesh-broker
+
       - name: Windows portable installer integration (installer/release changes)
         if: needs.plan.outputs.installers == 'true' || needs.plan.outputs.release_policy == 'true' || needs.plan.outputs.full == 'true'
         shell: pwsh

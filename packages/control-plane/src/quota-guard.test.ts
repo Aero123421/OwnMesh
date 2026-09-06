@@ -232,7 +232,7 @@ test("degraded admission precedes the D1 audit write (no write on reject)", asyn
   await store.ensureBootstrap();
   const issued = await store.issueTokens("client_ownmesh_cli", "prin_audit_order", "ownmesh.device ownmesh.read ownmesh.write ownmesh.exec");
   const future = utcResetIso(Date.now() + 1000);
-  const authOnly: BudgetState = { mode: "auth_only", source: "probe", resetAt: future, checkedAt: Date.now(), probeCategory: "quota_exhausted" };
+  const authOnly: BudgetState = { mode: "auth_only", source: "probe", resetAt: future, checkedAt: Date.now(), probeCategory: "quota_exceeded" };
   const before = await store.listAudit(issued.tenant_id, 50);
   const blocked = await mcpCall(store, issued.access_token, "ownmesh_list_devices", {}, authOnly);
   assert.equal(blocked.status, 503);
