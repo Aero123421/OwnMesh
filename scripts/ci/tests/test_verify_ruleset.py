@@ -80,6 +80,18 @@ class CollectContextsTests(unittest.TestCase):
             self.assertIn(needle, text, needle)
         self.assertNotIn("contexts documented", text)
 
+    def test_all_branches_include_covers_main(self):
+        details = [main_ruleset(contexts=vr.REQUIRED_CONTEXTS,
+                                include=("~ALL",))]
+        self.assertEqual(vr.missing_contexts(vr.collect_required_contexts(details)), [])
+
+    def test_all_branches_exclude_removes_main(self):
+        detail = main_ruleset(contexts=vr.REQUIRED_CONTEXTS,
+                              include=("~ALL",))
+        detail["conditions"]["ref_name"]["exclude"] = ["~ALL"]
+        missing = vr.missing_contexts(vr.collect_required_contexts([detail]))
+        self.assertEqual(missing, list(vr.REQUIRED_CONTEXTS))
+
 
 if __name__ == "__main__":
     unittest.main()

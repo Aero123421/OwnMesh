@@ -61,7 +61,7 @@ def ruleset_targets_main(detail: object) -> bool:
         return True
     covered = any(
         isinstance(pat, str) and (
-            pat in ("refs/heads/main", "~DEFAULT_BRANCH")
+            pat in ("refs/heads/main", "~DEFAULT_BRANCH", "~ALL")
             or fnmatch.fnmatch("refs/heads/main", pat)
         )
         for pat in includes
@@ -70,7 +70,10 @@ def ruleset_targets_main(detail: object) -> bool:
         return False
     if isinstance(excludes, list):
         for pat in excludes:
-            if isinstance(pat, str) and fnmatch.fnmatch("refs/heads/main", pat):
+            if not isinstance(pat, str):
+                continue
+            # "~ALL" excludes every branch including main (fail-closed).
+            if pat == "~ALL" or fnmatch.fnmatch("refs/heads/main", pat):
                 return False
     return True
 

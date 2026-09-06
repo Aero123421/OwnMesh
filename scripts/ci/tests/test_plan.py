@@ -82,6 +82,14 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(p["installers"])
         self.assertTrue(p["release_policy"])
 
+    def test_release_governance_sets_release_policy(self):
+        for f in (".github/CODEOWNERS",
+                  ".github/pull_request_template.md",
+                  ".coderabbit.yaml"):
+            with self.subTest(f=f):
+                p = plan.plan_from_files([f])
+                self.assertTrue(p["release_policy"], f)
+
 
 class LabelBranchingTests(unittest.TestCase):
     def test_no_labels_is_path_filtered(self):
@@ -186,6 +194,15 @@ class GateStrictMatchTests(unittest.TestCase):
         ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(
             encoding="utf-8")
         self.assertIn('heavy_deferred', ci)
+
+    def test_ci_call_full_review_not_suppressed_by_plain_review(self):
+        ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8")
+        # Full-review request needs its own idempotency needle: a prior plain
+        # `review` call must not suppress the first `full review`.
+        self.assertIn("REVIEW_CALL_GREPR", ci)
+        self.assertIn("@coderabbitai full review", ci)
+        self.assertIn('if [[ "$BODY" == *"full review"* ]]', ci)
 
 
 class DiffRangeTests(unittest.TestCase):

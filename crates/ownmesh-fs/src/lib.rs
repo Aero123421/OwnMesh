@@ -669,7 +669,16 @@ pub fn list_dir_page_with_limits(
     };
     // Server-side bounds come from the injected limits so unit tests and
     // production share one code path (Issue #230).
-    let limit = max_entries.clamp(1, limits.page_entries);
+    // Fail-closed: DirectoryPagingLimits is a public API (all fields pub), so
+    // page_entries:0 would make clamp(1, 0) panic. Reject zero bounds and
+    // zero caller requests instead of panicking or over-serving.
+    if limits.page_entries == 0 {
+        return Err(FsError::EntryLimit);
+    }
+    if max_entries == 0 {
+        return Err(FsError::EntryLimit);
+    }
+    let limit = max_entries.min(limits.page_entries).max(1);
     let max_page_json_bytes = limits.page_json_bytes;
     let max_memory_snapshot = limits.memory_entries;
     let max_spool_entries = limits.spool_entries;
@@ -2263,5 +2272,31 @@ mod tests {
         huge.push_str(&"y".repeat(MAX_UNIFIED_DIFF_BYTES));
         let err = apply_unified_diff(&ws, "note.txt", &huge, None).unwrap_err();
         assert!(matches!(err, FsError::Patch(_)), "{err:?}");
+    }
+
+    /// Fail-closed paging bounds: zero page ceiling or zero caller request
+    /// must error, never panic via clamp(1, 0) on the public limits API.
+    #[test]
+    fn list_page_with_limits_rejects_zero_bounds_fail_closed() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path().join("tree"), true).unwrap();
+        std::fs::create_dir_all(ws.root()).unwrap();
+        write_file(&ws, "a.txt", b"x").unwrap();
+        let zero_page = DirectoryPagingLimits {
+            memory_entries: 3,
+            spool_entries: 16,
+            page_entries: 0,
+            page_json_bytes: 4_096,
+        };
+        let err = list_dir_page_with_limits(&ws, "", false, 2, None, zero_page).unwrap_err();
+        assert!(matches!(err, FsError::EntryLimit), "{err:?}");
+        let limits = DirectoryPagingLimits {
+            memory_entries: 3,
+            spool_entries: 16,
+            page_entries: 2,
+            page_json_bytes: 4_096,
+        };
+        let err = list_dir_page_with_limits(&ws, "", false, 0, None, limits).unwrap_err();
+        assert!(matches!(err, FsError::EntryLimit), "{err:?}");
     }
 }

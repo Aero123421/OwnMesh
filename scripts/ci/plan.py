@@ -107,9 +107,13 @@ MACOS_SENSITIVE = (
 TS_PREFIXES = ("packages/", "pnpm-lock.yaml", "pnpm-workspace.yaml")
 SCHEMA_PREFIXES = ("spec-bundle/schemas/", "packages/ownmesh-schema/")
 
-# Release trust graph ownership.
+# Release trust graph ownership (CODEOWNERS / review automation / PR contract
+# changes alter who gates releases, so they set release_policy=true).
 RELEASE_PREFIXES = (
     ".github/workflows/",
+    ".github/CODEOWNERS",
+    ".github/pull_request_template.md",
+    ".coderabbit.yaml",
     "scripts/check_release_quality.py",
     "scripts/tests/run_release_quality_tests.py",
     "scripts/tests/test_installers.py",
@@ -199,16 +203,20 @@ def plan_for_file_set(files: list[str], labels: set[str] | None = None) -> dict:
     if LABEL_REVIEW_READY in labels:
         return with_label_metadata(full_plan("label review-ready (full)", labels), labels)
     # Docs-only fast path: only markdown/docs/assets, no code/workflows.
-    non_docs = [
-        f
-        for f in files
-        if not (
+    # Release-governance files (.github/CODEOWNERS, PR template, review
+    # automation) are never docs-only even when they end in .md: they alter
+    # who gates releases and must set release_policy=true below.
+    def _is_docs_only_path(f: str) -> bool:
+        if f.startswith(RELEASE_PREFIXES):
+            return False
+        return (
             f.endswith(".md")
             or f.startswith("docs/")
             or f.startswith("assets/")
             or f == "NOTICE"
         )
-    ]
+
+    non_docs = [f for f in files if not _is_docs_only_path(f)]
     if files and not non_docs:
         return with_label_metadata({
             "schema_version": SCHEMA_VERSION,

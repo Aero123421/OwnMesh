@@ -403,12 +403,21 @@ jobs:
           esac
           # Idempotency: PR body already calls, or a prior auto-call comment
           # exists -> do not re-post (prevents spam and bot loops).
+          # Full-review aware: a prior plain `review` call must not suppress
+          # the first `full review` (review-ready) call. Only a prior full
+          # review satisfies a full-review request; a plain request is
+          # satisfied by either.
+          if [[ "$BODY" == *"full review"* ]]; then
+            REVIEW_CALL_GREPR='@coderabbitai full review'
+          else
+            REVIEW_CALL_GREPR='@coderabbitai\( full\)\? review'
+          fi
           PR_BODY=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')
-          if printf '%s' "$PR_BODY" | grep -qi '@coderabbitai\( full\)\? review'; then
+          if printf '%s' "$PR_BODY" | grep -qi "$REVIEW_CALL_GREPR"; then
             echo "coderabbit-call: call already in PR body, skipping"
             exit 0
           fi
-          if gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[].body' | grep -qi '@coderabbitai\( full\)\? review'; then
+          if gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[].body' | grep -qi "$REVIEW_CALL_GREPR"; then
             echo "coderabbit-call: prior call comment exists, skipping"
             exit 0
           fi

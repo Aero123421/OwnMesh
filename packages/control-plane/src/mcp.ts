@@ -6070,29 +6070,13 @@ async function handleMcpCore(
     if (opStores && needsAuthority && !injectionAttempt && !TRANSFER_AUDIT_TOOLS.has(name)) {
       resolvedOps = await opStores.forTenant(rec.tenant_id, rec.principal);
     }
-    if (!resolvedOps?.auditCovered) {
-      await store.appendAudit({
-        id: randomId("aud_"),
-        tenant_id: rec.tenant_id,
-        principal_id: rec.principal,
-        device_id: deviceId || undefined,
-        kind: "mcp.tool_call",
-        summary: name,
-        created_at: nowIso(),
-        meta: {
-          op: name,
-          correlation_id: correlation,
-          operation_id: operationId,
-          injection_attempt: injectionAttempt,
-        },
-      });
-    }
-
-    // Issue #224 (P4) + #227: degraded-mode admission. auth_only is transient
+    // Issue #224 (P4) + #227: degraded-mode admission first. auth_only is transient
     // D1 exhaustion -> HTTP 503 + Retry-After (retryable, never credential
     // loss). read_only is an operator override -> structured JSON-RPC error
     // until reset. Room-covered reads need no D1 writes, so they stay
     // available in auth_only; everything else degrades by risk class.
+    // Admission precedes the D1 audit write below so quota exhaustion never
+    // spends a D1 write before rejecting.
     const budgetState = opts.budgetState;
     if (budgetState && budgetState.mode !== "normal") {
       const readOnly = tool.risk === "read" || tool.risk === "discovery";
@@ -6113,6 +6097,23 @@ async function handleMcpCore(
           },
         );
       }
+    }
+    if (!resolvedOps?.auditCovered) {
+      await store.appendAudit({
+        id: randomId("aud_"),
+        tenant_id: rec.tenant_id,
+        principal_id: rec.principal,
+        device_id: deviceId || undefined,
+        kind: "mcp.tool_call",
+        summary: name,
+        created_at: nowIso(),
+        meta: {
+          op: name,
+          correlation_id: correlation,
+          operation_id: operationId,
+          injection_attempt: injectionAttempt,
+        },
+      });
     }
 
     // ---- local control-plane tools (no device) ----

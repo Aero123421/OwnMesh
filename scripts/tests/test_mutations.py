@@ -489,6 +489,24 @@ class CheckerMutationTests(unittest.TestCase):
         with _Mutation("crates/ownmesh/src/commands/exec.rs", mutate):
             _must_fail("exec local daemon ad")
 
+    def test_mutation_missing_suite_section_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = "[platform-windows]"
+            self.assertIn(needle, text)
+            return text.replace(needle, "[platform-windows-removed]", 1)
+
+        with _Mutation("scripts/ci/suites.toml", mutate):
+            _must_fail("missing platform-windows suite section")
+
+    def test_mutation_typescript_typecheck_removed_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = '  "pnpm -r typecheck",\n'
+            self.assertIn(needle, text)
+            return text.replace(needle, "", 1)
+
+        with _Mutation("scripts/ci/suites.toml", mutate):
+            _must_fail("typescript typecheck removed")
+
 
 if __name__ == "__main__":
     # Avoid leaving mutations behind if the process is hard-killed mid-test:

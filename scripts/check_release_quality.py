@@ -40,7 +40,12 @@ def job_block(workflow: str, job_id: str) -> str:
 
 
 def suite_section(suites_text: str, suite_name: str) -> str:
-    """Return one TOML suite section body (fail-closed: empty when missing)."""
+    """Return one TOML suite section body (fail-closed: empty when missing).
+
+    Callers MUST NOT use the return value in a bare ``needle not in section``
+    assertion: an empty (missing) section would vacuously pass. Assert
+    presence first (``require(section != "", ...)``) or use require_text.
+    """
     match = re.search(
         rf"(?ms)^\[{re.escape(suite_name)}\]\n(.*?)(?=^\[[^\]]+\]|\Z)",
         suites_text,
@@ -202,9 +207,13 @@ def main() -> int:
             "Windows must not run full workspace test")
     require("cargo test --workspace --all-targets --locked" not in mac_job,
             "macOS must not run full workspace test")
-    require("cargo test --workspace --all-targets --locked" not in suite_section(suites, "platform-windows"),
+    win_section = suite_section(suites, "platform-windows")
+    mac_section = suite_section(suites, "platform-macos")
+    require(win_section != "", "platform-windows suite section missing (fail-closed)")
+    require(mac_section != "", "platform-macos suite section missing (fail-closed)")
+    require("cargo test --workspace --all-targets --locked" not in win_section,
             "Windows suite must not run full workspace test")
-    require("cargo test --workspace --all-targets --locked" not in suite_section(suites, "platform-macos"),
+    require("cargo test --workspace --all-targets --locked" not in mac_section,
             "macOS suite must not run full workspace test")
     require_text(win_job, "scripts/ci/run.py platform-windows", "Windows via canonical runner")
     require_text(mac_job, "scripts/ci/run.py platform-macos", "macOS via canonical runner")

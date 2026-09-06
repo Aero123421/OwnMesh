@@ -27,13 +27,14 @@ SHA = "a" * 40
 OTHER_SHA = "b" * 40
 
 
-def good_check(name="CI / required", sha=SHA):
+def good_check(name="CI / required", sha=SHA, run_id=123):
     return {
         "name": name,
         "head_sha": sha,
         "status": "completed",
         "conclusion": "success",
         "app": {"slug": "github-actions"},
+        "html_url": f"https://github.com/owner/name/actions/runs/{run_id}/job/456",
     }
 
 
@@ -232,6 +233,28 @@ class EligibilityFixtureTests(unittest.TestCase):
         err = eligibility.validate_context_checks(
             "CI / required", [good_check(), bad], SHA)
         self.assertIsNotNone(err)
+
+    def test_accepts_run_id_bound_success(self):
+        self.assertIsNone(
+            eligibility.validate_context_checks(
+                "CI / required", [good_check(run_id=123)], SHA, "123"))
+
+    def test_rejects_same_name_check_from_other_workflow_run(self):
+        # Exact SHA + success but bound to a different run id: forged
+        # same-name check from another workflow must not satisfy eligibility.
+        other = good_check(run_id=999)
+        err = eligibility.validate_context_checks(
+            "CI / required", [other], SHA, "123")
+        self.assertIsNotNone(err)
+        self.assertIn("run-id", err.lower())
+
+    def test_rejects_unbound_check_when_run_id_required(self):
+        unbound = good_check()
+        del unbound["html_url"]
+        err = eligibility.validate_context_checks(
+            "CI / required", [unbound], SHA, "123")
+        self.assertIsNotNone(err)
+        self.assertIn("run-id", err.lower())
 
 
 class AllowMissingChecksGuardTests(unittest.TestCase):

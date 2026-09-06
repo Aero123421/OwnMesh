@@ -65,11 +65,36 @@ def is_success_check(run: dict, sha: str) -> bool:
     )
 
 
-def validate_context_checks(ctx: str, candidates: list[dict], sha: str) -> str | None:
+def check_belongs_to_run(run: dict, run_id: str) -> bool:
+    """True when a check-run payload is bound to the expected workflow run id.
+
+    A same-name check from another workflow (forged producer with an identical
+    context string) must not satisfy eligibility. Binding is via the check's
+    ``html_url``/``details_url`` (``.../actions/runs/<run_id>/...``) or an
+    explicit ``run_id``/``workflow_run_id`` field when present. Missing
+    binding is fail-closed (False).
+    """
+    rid = str(run_id or "").strip()
+    if not rid or rid == "0":
+        return False
+    for key in ("run_id", "workflow_run_id"):
+        if str(run.get(key, "") or "").strip() == rid:
+            return True
+    for key in ("html_url", "details_url"):
+        url = str(run.get(key, "") or "")
+        if f"/runs/{rid}/" in url or url.rstrip("/").endswith(f"/runs/{rid}"):
+            return True
+    return False
+
+
+def validate_context_checks(ctx: str, candidates: list[dict], sha: str,
+                             expected_run_id: str | None = None) -> str | None:
     """Validate one required context against exact-SHA candidates.
 
     Returns an error string for stale/forged/missing/skipped/canceled/neutral,
     or None when exactly a GitHub-Actions success exists with no bad states.
+    When ``expected_run_id`` is given, at least one success must be bound to
+    that workflow run (same-name checks from other workflows are rejected).
     """
     exact = [r for r in candidates if r.get("head_sha") == sha]
     if not exact:
@@ -89,6 +114,13 @@ def validate_context_checks(ctx: str, candidates: list[dict], sha: str) -> str |
     if bad:
         states = [(b.get("status"), b.get("conclusion")) for b in exact]
         return f"{ctx} not success for exact SHA (states={states})"
+    if expected_run_id is not None and str(expected_run_id).strip():
+        rid = str(expected_run_id).strip()
+        bound = any(is_success_check(r, sha) and check_belongs_to_run(r, rid)
+                    for r in exact)
+        if not bound:
+            return (f"{ctx} has no success bound to expected run-id {rid} "
+                    f"for exact SHA (same-name check from another workflow rejected)")
     return None
 
 
@@ -245,7 +277,8 @@ def main() -> int:
             for run in runs:
                 by_name.setdefault(run.get("name", ""), []).append(run)
             for ctx in REQUIRED_CONTEXTS:
-                err = validate_context_checks(ctx, by_name.get(ctx, []), args.sha)
+                err = validate_context_checks(ctx, by_name.get(ctx, []), args.sha,
+                                              str(args.run_id))
                 if err:
                     errors.append(err)
             # Workflow producer binding: ci.yml must have a successful run at

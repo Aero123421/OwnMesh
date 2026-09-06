@@ -29,7 +29,7 @@ commands = [
 timeout_minutes = 20
 
 [typescript]
-description = "TypeScript/schema/control-plane gates (path-aware)"
+description = "TypeScript/schema/control-plane gates (path-aware; schema test stays unit-only, schema type check runs once here, no duplication)"
 commands = [
   "pnpm install --frozen-lockfile",
   "pnpm -r test",
