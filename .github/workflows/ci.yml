@@ -21,6 +21,11 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+    # Default PR types (opened/synchronize/reopened) do NOT include labeled
+    # or ready_for_review, which this workflow needs: labeled(review-ready)
+    # drives plan full + coderabbit-call, unlabeled re-plans on label
+    # removal (fail-closed), ready_for_review re-issues the call on undraft.
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
   workflow_dispatch:
 
 # PR runs cancel superseded runs only. Main push evidence must never be
@@ -352,7 +357,13 @@ jobs:
     # no secrets:inherit. GITHUB_TOKEN is passed via env and never logged.
     # Drafts are excluded: review call is (re-)issued on undraft via
     # opened/synchronize/labeled(review-ready) after ready_for_review.
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true && (github.event.action == 'opened' || github.event.action == 'synchronize' || (github.event.action == 'labeled' && toLower(github.event.label.name || '') == 'review-ready')) && github.actor != 'coderabbitai[bot]' && github.event.sender.login != 'coderabbitai[bot]'
+    # NOTE: GitHub Actions expressions have no toLower()/toUpper() (that is
+    # Azure Pipelines). Use an exact match on the canonical lowercase label
+    # name; `github.event.label` is absent on opened/synchronize so the
+    # comparison evaluates to null == 'review-ready' (false) without error.
+    # Case-insensitive handling of the full label list lives in the bash
+    # script below (LABELS_LOWER) and in scripts/ci/plan.py.
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true && (github.event.action == 'opened' || github.event.action == 'synchronize' || (github.event.action == 'labeled' && github.event.label.name == 'review-ready')) && github.actor != 'coderabbitai[bot]' && github.event.sender.login != 'coderabbitai[bot]'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write

@@ -126,7 +126,8 @@ class LabelBranchingTests(unittest.TestCase):
 
     def test_review_ready_case_insensitive_forces_full(self):
         # "Review-Ready" / padded casing must behave like "review-ready"
-        # (ci.yml matches via toLower + lowercased LABELS_LOWER).
+        # (plan.py lowercases; ci.yml normalizes via LABELS_LOWER in bash
+        # because GitHub expressions have no toLower()).
         for raw in ("Review-Ready", "REVIEW-READY", " review-ready "):
             labels = plan.parse_labels(raw)
             p = plan.plan_from_files(["README.md", "docs/foo.md"], labels)
@@ -165,8 +166,21 @@ class GateStrictMatchTests(unittest.TestCase):
     def test_ci_call_label_match_case_insensitive(self):
         ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(
             encoding="utf-8")
-        self.assertIn("toLower(github.event.label.name)", ci)
+        # GitHub Actions expressions have no toLower(): the job `if:` must
+        # use an exact match on the canonical label name (see run
+        # 34020313728 "Unrecognized function: 'toLower'"); case-insensitive
+        # handling lives in bash (LABELS_LOWER) and plan.py.
+        self.assertNotIn("toLower(github.event", ci)
+        self.assertIn("github.event.label.name == 'review-ready'", ci)
         self.assertIn("LABELS_LOWER", ci)
+
+    def test_ci_pr_types_include_labeled(self):
+        # labeled/unlabeled/ready_for_review are non-default PR types; without
+        # them the review-ready label and undraft never re-trigger the plan.
+        ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8")
+        for needle in ("labeled", "unlabeled", "ready_for_review"):
+            self.assertIn(needle, ci, needle)
 
     def test_ci_required_asserts_heavy_deferred(self):
         ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(
