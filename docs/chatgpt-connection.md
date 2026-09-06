@@ -233,12 +233,12 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 
 | Symptom | Check |
 |---|---|
-| OAuth fails | `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, redirect URI exact match, PKCE S256 |
+| OAuth fails | `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `resource=https://<worker>/mcp` (RFC 8707 exact), redirect URI match (HTTPS exact; loopback port-flexible per RFC 8252 §7.3), PKCE S256 |
 | `unauthorized_client` / `client metadata validation failed` | Upgrade the control plane to v1.2.29 or later. v1.2.29 fixes the Cloudflare Workers CIMD fetch mode; it also negotiates ChatGPT's plural token-auth capability list while still selecting only public-client `none`. |
 | Connector repeatedly asks you to sign in | Upgrade the control plane to v1.2.30 or later. v1.2.30 recognizes ChatGPT's stable CIMD client/callback pair and issues rotating refresh tokens even when ChatGPT omits `offline_access`. Expired access tokens must still get HTTP 401 + `WWW-Authenticate` from `/mcp` so ChatGPT can refresh. |
 | ChatGPT reports 502 after idle | New chat, then re-consent if 401 refresh still fails. `GET /mcp` with `Accept: text/event-stream` is 405 by design (no long-lived SSE on Workers) |
 | CLI vs Worker version skew | `ownmesh doctor --check-network` warns when `/health` version does not match the CLI |
-| `insufficient_scope` | Re-consent with required scopes |
+| `insufficient_scope` | Re-consent with required scopes (tool calls return HTTP 403 + `WWW-Authenticate: Bearer error="insufficient_scope"` with step-up `scope`) |
 | `device_offline` | `ownmeshd run`, enrollment, `/agent/connect` WebSocket. On Linux, also check lingering: without it (`loginctl show-user $USER -p Linger` → `Linger=no`) the agent stops at GUI logout and the device goes offline until you log in again (`ownmesh doctor` warns). A hung reconnect on a dual-stack host with a blackholed IPv6 route is another known cause; the bounded connect timeout (v1.2.21+) retries with an IPv4 fallback instead of hanging forever |
 | Stuck `approval_required` | TUI/CLI/browser approve; then `ownmesh_get_operation` |
 | Write works in ChatGPT UI but file missing | ChatGPT confirm ≠ OwnMesh approve |
@@ -267,6 +267,9 @@ curl -s https://<worker>/health | jq .mcp_catalog
 `tools/list` bytes, so it changes whenever a tool name, description,
 annotation, or `inputSchema` changes. `catalog_version`, its 1.x compatibility
 range, selected surface, and digest are returned in discovery metadata.
+`/health` exposes the same pair as `mcp_catalog.version` (= `catalog_version`,
+compat major) and `mcp_catalog.revision` (= `catalog_revision`, deploy digest);
+the names differ by surface but the values are identical.
 
 First determine which OpenAI lifecycle owns the metadata:
 
@@ -299,12 +302,13 @@ re-executing a side effect blindly. Covered by
 
 | Signal | Meaning | Action |
 |---|---|---|
-| OAuth/MCP answers 503 `temporarily_unavailable` + `Retry-After` (+ `reset_at` for quota) | Transient backend/quota failure. Credentials are NOT revoked | Wait and retry after the header/`reset_at`; do not delete the connector |
+| OAuth answers 503 `temporarily_unavailable` + `Retry-After` (+ `reason` `d1_write_quota_exceeded`/`d1_unavailable`/`schema_not_ready`, `retryable:true`, `reset_at`, `diagnostic_id`, `service_version`) | Transient backend/quota failure. Credentials are NOT revoked | Wait and retry after the header/`reset_at`; do not delete the connector. `invalid_grant` is never returned for transient failures |
 | OAuth answers 401 `invalid_grant` (no Retry-After) | Credential expired, revoked, or never valid | Reconnect/re-consent, then poll the kept `operation_id` |
 | `reuse` / family error | Refresh replay outside the grace window | Reconnect; in-flight work may need manual reconciliation |
-| MCP `-32005 OWNMESH_QUOTA_*`, `retryable: false`, `reset_at` | Degraded budget mode | Reads resume automatically; side effects wait for reset |
+| MCP answers HTTP 503 `temporarily_unavailable` + `Retry-After` (`reason` `d1_write_quota_exceeded`, `retryable:true`) | Degraded budget (auth_only probe). Same transient as OAuth | Retry after reset; credential family stays valid; no reinstall |
+| MCP `-32005 OWNMESH_QUOTA_SIDE_EFFECT_DISABLED`, `retryable:false` | Operator `read_only` override (intentional, not transient) | Reads resume automatically; side effects wait for reset |
 | `device_offline` | Agent/device down, control plane healthy | Restart `ownmeshd`, then poll |
-| None of the above / unknown | Unclassified | Collect UTC time, Ray ID, service version, endpoint statuses (see deploy doc) |
+| None of the above / unknown | Unclassified | Collect UTC time, Ray ID, `diagnostic_id`, service version, endpoint statuses (see deploy doc) |
 
 Rules for long-running work:
 
@@ -315,9 +319,27 @@ Rules for long-running work:
    the one durable operation — it never executes a second side effect.
 3. A receipt stays reachable under a fresh credential for the same
    tenant/principal: reconnect, then poll. No connector reinstall needed.
-4. If the id is lost, do not guess: re-issue with a NEW idempotency key
-   only when the action is provably unstarted, otherwise reconcile manually
-   (device journal / admin operation list) before touching anything.
+4. If the id is lost, use `ownmesh_list_operations` with the remembered
+   `device_id`/`tool`/`idempotency_key` and a narrow `since` range to
+   rediscover newest-first within your tenant/principal boundary — never a
+   foreign row. Do not guess: re-issue with a NEW idempotency key only when
+   the action is provably unstarted, otherwise reconcile manually before
+   touching anything.
+
+### External smoke receipt (manual, when running against real ChatGPT)
+
+Record without secrets or user content:
+
+- UTC timestamp / Cloudflare Ray ID / OwnMesh `diagnostic_id`
+- deployed service version + commit SHA
+- OAuth endpoint HTTP status + bounded `reason` + `Retry-After`
+- MCP `initialize`/`tools/list`/`tools/call` HTTP status + bounded category
+- `/health` vs `/health/ready` (must differ in `auth_only`)
+- budget mode / quota `reset_at` / D1 write classification
+- operation ID, status transitions, dispatch/claim/result receipts
+- Agent presence + device route state
+- fault injected → generic account error shown? → recovery → same operation
+  convergence (side effects max once)
 
 ---
 

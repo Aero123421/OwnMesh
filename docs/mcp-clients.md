@@ -31,8 +31,22 @@ are not configurable:
 - `token_endpoint_auth_method` must be `none`. Confidential clients are
   rejected: `client_secret_post` and `client_secret_basic` both fail closed.
 - PKCE `S256` is mandatory. `plain` is refused.
-- `redirect_uri` must match a registered value **exactly** — no prefix or
-  wildcard matching, and the value is re-checked at the token endpoint.
+- `redirect_uri` must match a registered value. HTTPS callbacks stay
+  byte-exact — no prefix or wildcard matching, and the value is re-checked at
+  the token endpoint. For `http://` loopback callbacks (`127.0.0.1`, `::1`,
+  `localhost`) only the port may vary per RFC 8252 §7.3, so a client like
+  Claude Code can bind an ephemeral port per login while
+  `http://127.0.0.1/callback` is registered. Path, query, host form, userinfo,
+  and fragment must still match exactly, and token redemption always requires
+  the exact runtime URI bound to the authorization code.
+- `resource` (RFC 8707) is required on authorization and token requests and
+  must be exactly `https://<your-worker>/mcp` for the issuer you are calling.
+  Authorization codes, access tokens, and refresh families are bound to that
+  audience; `/mcp` rejects a token minted for another resource, and refresh
+  cannot switch audiences. Device authorization accepts the same optional
+  `resource` and binds the device code and its token when supplied.
+  Existing unbound tokens stay usable until
+  reauthorization binds them.
 - Redirect URIs registered through `/oauth/register` must be `https://`, or
   `http://` on a loopback host (`127.0.0.1`, `::1`, `localhost`) per RFC 8252
   §7.3. A row inserted directly into D1 bypasses registration validation, so
@@ -172,8 +186,8 @@ between them.
 | --- | --- |
 | `{"error":"registration_disabled"}` | Route 3 flag is off. Use route 1. |
 | `{"error":"unauthorized_client","error_description":"unknown client"}` | No client row for that `client_id`. |
-| `redirect_uri does not exactly match registration` | Byte-for-byte mismatch, often a trailing slash or a changed loopback port. |
+| `redirect_uri does not exactly match registration` | Mismatch: HTTPS is byte-for-byte (often a trailing slash); `http://` loopback allows only the port to differ, so check path, host form, query, userinfo, and fragment. |
 | `only token_endpoint_auth_method=none is supported` | The client is trying to be confidential. Disable its client secret. |
 | `PKCE S256 required` | The client sent `plain` or omitted `code_challenge`. |
 | `{"error":"insufficient_scope"}` (HTTP 403) | A REST or registration request lacks `ownmesh.device`. |
-| JSON-RPC `-32003` `insufficient_scope` | A tool call lacks the scope named in `data.required`. |
+| JSON-RPC `-32003` `insufficient_scope` | A tool call lacks the scope named in `data.required`. HTTP 403 + `WWW-Authenticate: Bearer error="insufficient_scope"` carries the step-up `scope`. |

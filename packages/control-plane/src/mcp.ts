@@ -25,6 +25,8 @@ import {
   type ResolvedOperationStores,
 } from "./operation-store.ts";
 import type { BudgetState } from "./quota-guard.ts";
+import { retryAfterSecondsForReset, utcResetIso } from "./quota-guard.ts";
+import { classifyD1Error, isRetryableStorageError, storageUnavailableReason, type D1ErrorCategory } from "./d1-errors.ts";
 import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   approvalSelectionReturnTo,
@@ -1612,6 +1614,46 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "exec",
   },
   {
+    name: "ownmesh_list_operations",
+    description:
+      "List recent operations for this tenant/principal (newest first) for rediscovery when operation_id was lost. Filter by device, tool, idempotency key, and narrow time range. Never returns foreign tenant/principal rows; never auto-re-executes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        device_id: { type: "string", description: "Enrolled device id (dev_...) filter" },
+        tool: { type: "string", description: "Tool name filter (e.g. ownmesh_command_run)" },
+        idempotency_key: {
+          type: "string",
+          minLength: 1,
+          maxLength: 256,
+          description: "Exact idempotency key to converge to the one durable operation",
+        },
+        since: {
+          type: "string",
+          description: "ISO-8601 lower bound on created_at (narrow time range)",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 50,
+          default: 20,
+          description: "Max rows (newest first, bounded)",
+        },
+        cursor: str,
+      },
+      required: [],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "discovery",
+  },
+  {
     name: "ownmesh_transfer_plan",
     description: "Create an immutable, metadata-only cross-device transfer plan. Both workspace custody records and both active devices are revalidated by the control plane.",
     inputSchema: {
@@ -3024,9 +3066,20 @@ function mcpProtectedResourceMetadataUrl(issuer: string): string | null {
   }
 }
 
-function mcpBearerChallenge(issuer: string, error?: "invalid_token"): string {
+function mcpBearerChallenge(issuer: string, error?: "invalid_token" | "insufficient_scope", scope?: string): string {
   const parts = ['Bearer realm="ownmesh"'];
   if (error) parts.push(`error="${error}"`);
+  if (scope) {
+    // Scope values are allowlisted (ownmesh.*) but still serialized through a
+    // bounded quoted-string filter so tool names or config can never inject
+    // header parameters.
+    const safeScope = scope
+      .split(/\s+/)
+      .filter((s) => /^[A-Za-z0-9._:-]+$/.test(s))
+      .slice(0, 16)
+      .join(" ");
+    if (safeScope) parts.push(`scope="${safeScope}"`);
+  }
   const metadata = mcpProtectedResourceMetadataUrl(issuer);
   if (metadata) parts.push(`resource_metadata="${metadata}"`);
   return parts.join(", ");
@@ -3052,10 +3105,74 @@ function mcpUnauthorized(
   );
 }
 
+/**
+ * Issue #196: runtime insufficient-scope must be an OAuth 403 scope challenge,
+ * not an HTTP 200 tool error, so spec-conforming clients can step up scopes
+ * and retry once instead of treating it as a plain tool failure.
+ */
+function mcpInsufficientScope(
+  id: string | number | null | undefined,
+  issuer: string,
+  requiredScope: string,
+  grantedScope: string,
+  toolName: string,
+): Response {
+  const granted = grantedScope.split(/\s+/).filter(Boolean);
+  const required = requiredScope.split(/\s+/).filter(Boolean);
+  const seen = new Set<string>();
+  const stepUp: string[] = [];
+  for (const s of [...granted, ...required]) {
+    if (!s || seen.has(s)) continue;
+    // Only advertise allowlisted scopes in the challenge; never reflect raw
+    // tool names or config text into the header.
+    if (!/^(ownmesh\.(read|write|exec|session|device)|offline_access)$/.test(s)) continue;
+    seen.add(s);
+    stepUp.push(s);
+    if (stepUp.length >= 16) break;
+  }
+  // Always include the newly required scope even if the granted set was empty
+  // or contained only non-allowlisted values.
+  for (const s of required) {
+    if (!seen.has(s) && /^(ownmesh\.(read|write|exec|session|device)|offline_access)$/.test(s)) {
+      stepUp.push(s);
+      break;
+    }
+  }
+  return json(
+    {
+      jsonrpc: "2.0",
+      id: id ?? null,
+      error: { code: -32003, message: "insufficient_scope", data: { required: requiredScope, tool: toolName } },
+    },
+    {
+      status: 403,
+      noStore: true,
+      headers: {
+        "www-authenticate": mcpBearerChallenge(issuer, "insufficient_scope", stepUp.join(" ")),
+      },
+    },
+  );
+}
+
 type McpAccess = {
   rec: NonNullable<Awaited<ReturnType<ControlPlaneStore["getAccess"]>>>;
   principal: NonNullable<Awaited<ReturnType<ControlPlaneStore["getPrincipal"]>>>;
 };
+
+/**
+ * Issue #195: canonical MCP audience for this issuer. Mirrors
+ * oauth.canonicalMcpResource without creating an mcp↔oauth import cycle.
+ */
+function canonicalMcpResourceForIssuer(issuer: string): string | null {
+  try {
+    const u = new URL(issuer);
+    if (u.username || u.password || u.hash) return null;
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    return `${u.origin}/mcp`;
+  } catch {
+    return null;
+  }
+}
 
 async function resolveMcpAccess(
   store: ControlPlaneStore,
@@ -3069,6 +3186,15 @@ async function resolveMcpAccess(
   }
   const rec = await store.getAccess(token);
   if (!rec) return mcpUnauthorized(id, issuer, "invalid_token");
+  // Issue #195: a bound token is accepted only for its canonical audience.
+  // Unbound pre-migration tokens stay usable (compat) until reauthorization;
+  // a bound token for another resource (issuer root, other path) is rejected.
+  if (rec.resource !== undefined && rec.resource !== null) {
+    const canonical = canonicalMcpResourceForIssuer(issuer);
+    if (!canonical || rec.resource !== canonical) {
+      return mcpUnauthorized(id, issuer, "invalid_token");
+    }
+  }
   const principal = await store.getPrincipal(rec.principal);
   const principalCredentialGeneration = Number(principal?.credential_generation);
   const principalRevocationEpoch = principalRevocationEpochOf(principal ?? {});
@@ -5424,10 +5550,87 @@ function mcpHttpError(
   code: number,
   message: string,
   data?: unknown,
+  extraHeaders?: Record<string, string>,
 ): Response {
   return json(
     { jsonrpc: "2.0", id: id ?? null, error: { code, message, data } },
-    { status, noStore: true },
+    { status, noStore: true, headers: extraHeaders },
+  );
+}
+
+/**
+ * Issue #227 SHOULD-5: single MCP 503 data builder.
+ * `mcpBudgetUnavailable` (probe path) and `mcpStorageUnavailable` (throw path)
+ * share reason vocabulary (via `storageUnavailableReason`) and this payload;
+ * only the reset source and `mode` differ. OAuth keeps its own REST envelope
+ * (see oauth.ts) because the transports differ — JSON-RPC `error.data` here
+ * vs OAuth top-level JSON there.
+ */
+function mcpUnavailableData(
+  reason: string,
+  retryAfter: number,
+  resetAt: string,
+  extra?: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    reason,
+    retryable: true,
+    retry_after_seconds: retryAfter,
+    reset_at: resetAt,
+    diagnostic_id: randomId("diag_"),
+    service_version: SERVICE_VERSION,
+    ...extra,
+  };
+}
+
+/**
+ * Issue #227: auth_only (probe-detected D1 write exhaustion) is transient.
+ * Return protocol-correct HTTP 503 + Retry-After with bounded reason so
+ * ChatGPT retries instead of treating it as credential loss. Never converts
+ * to invalid_grant/reuse/revoke. Includes retryable:true, reset_at,
+ * diagnostic_id, service_version; no SQL/token/paths.
+ */
+function mcpBudgetUnavailable(
+  id: string | number | null | undefined,
+  budgetState: { mode: string; resetAt: string; probeCategory?: D1ErrorCategory },
+): Response {
+  const reason = storageUnavailableReason(budgetState.probeCategory ?? "unknown", "mcp");
+  // SHOULD-3: Retry-After is the clamped diff to the budget reset (cap 86400).
+  const retryAfter = retryAfterSecondsForReset(budgetState.resetAt);
+  return mcpHttpError(
+    id,
+    503,
+    -32005,
+    "temporarily_unavailable",
+    mcpUnavailableData(reason, retryAfter, budgetState.resetAt, { mode: budgetState.mode }),
+    { "retry-after": String(retryAfter) },
+  );
+}
+
+/**
+ * Issue #227: unexpected D1/storage throw anywhere in MCP handling converges
+ * to the same sanitized 503 contract as the budget probe path — never an
+ * uncaught exception, never invalid_token/reuse. Uses the centralized
+ * `isRetryableStorageError`; anything else rethrows fail-closed.
+ * No SQL/token/paths leak.
+ */
+function mcpStorageUnavailable(
+  id: string | number | null | undefined,
+  error: unknown,
+): Response {
+  const category = classifyD1Error(error);
+  const reason = storageUnavailableReason(category, "mcp");
+  // SHOULD-3: no budget here, so the reset is the next UTC midnight with
+  // Retry-After as its diff (same instant `checkBudget` would report).
+  const resetAt = utcResetIso();
+  const retryAfter = retryAfterSecondsForReset(resetAt);
+  return mcpHttpError(
+    id,
+    503,
+    -32005,
+    "temporarily_unavailable",
+    mcpUnavailableData(reason, retryAfter, resetAt),
+    { "retry-after": String(retryAfter) },
   );
 }
 
@@ -5586,7 +5789,12 @@ export async function handleMcp(
       }
     }
   }
-  const response = await handleMcpCore(req, store, url, router, opts, context);
+  const response = await handleMcpCore(req, store, url, router, opts, context).catch((error: unknown) => {
+    // Issue #227 SHOULD-1: centralized retryable-storage predicate (no bare
+    // timeout/quota substrings); non-storage rethrows fail-closed.
+    if (isRetryableStorageError(error)) return mcpStorageUnavailable(context.body?.id ?? null, error);
+    throw error;
+  });
   return context.era === "modern"
     ? modernizeMcpResponse(response, context.body?.method || "")
     : response;
@@ -5807,10 +6015,7 @@ async function handleMcpCore(
     }
 
     if (!scopeOk(rec.scope, tool)) {
-      return mcpError(id, -32003, "insufficient_scope", {
-        required: tool.scope,
-        tool: name,
-      });
+      return mcpInsufficientScope(id, issuer, tool.scope, rec.scope, name);
     }
 
     if (ADMIN_MCP_TOOL_NAMES.has(name)) {
@@ -5883,26 +6088,25 @@ async function handleMcpCore(
       });
     }
 
-    // Issue #224 (P4): degraded-mode admission. Fails fast with a structured,
-    // non-retryable-until-reset error instead of burning reserved D1 budget.
-    // Room-covered reads need no D1 writes, so they stay available in
-    // auth_only; everything else degrades by risk class.
+    // Issue #224 (P4) + #227: degraded-mode admission. auth_only is transient
+    // D1 exhaustion -> HTTP 503 + Retry-After (retryable, never credential
+    // loss). read_only is an operator override -> structured JSON-RPC error
+    // until reset. Room-covered reads need no D1 writes, so they stay
+    // available in auth_only; everything else degrades by risk class.
     const budgetState = opts.budgetState;
     if (budgetState && budgetState.mode !== "normal") {
       const readOnly = tool.risk === "read" || tool.risk === "discovery";
       const coveredRead = readOnly && resolvedOps?.auditCovered === true;
-      if (!readOnly || (budgetState.mode === "auth_only" && !coveredRead)) {
-        const sideEffect = !readOnly;
+      if (budgetState.mode === "auth_only" && !coveredRead) {
+        return mcpBudgetUnavailable(id, budgetState);
+      }
+      if (budgetState.mode === "read_only" && !readOnly) {
         return mcpError(
           id,
           -32005,
-          sideEffect
-            ? "control-plane is in degraded mode; side-effect tools disabled until reset"
-            : "control-plane write budget exhausted; reads disabled until reset",
+          "control-plane is in degraded mode; side-effect tools disabled until reset",
           {
-            code: sideEffect
-              ? "OWNMESH_QUOTA_SIDE_EFFECT_DISABLED"
-              : "OWNMESH_QUOTA_READ_ONLY_DISABLED",
+            code: "OWNMESH_QUOTA_SIDE_EFFECT_DISABLED",
             retryable: false,
             reset_at: budgetState.resetAt,
             mode: budgetState.mode,
@@ -6487,6 +6691,61 @@ async function handleMcpCore(
         ? { ...tracked, warnings: [...(tracked.warnings || []), ...waitWarnings] }
         : tracked;
       return mcpResult(id, toolContent(snapshot, args.include_diagnostics === true));
+    }
+
+    if (name === "ownmesh_list_operations") {
+      // Issue #227: rediscovery when operation_id was lost. Tenant+principal
+      // isolated, newest first, bounded. Never auto-re-executes; caller must
+      // poll the returned operation_id explicitly.
+      const since = typeof args.since === "string" && args.since ? args.since : undefined;
+      if (since && Number.isNaN(Date.parse(since))) {
+        return mcpError(id, -32602, "invalid since timestamp", { since });
+      }
+      const candidates = await store.listRecentMcpOperations({
+        tenantId: rec.tenant_id,
+        principalId: rec.principal,
+        deviceId: typeof args.device_id === "string" && args.device_id ? args.device_id : undefined,
+        tool: typeof args.tool === "string" && args.tool ? args.tool : undefined,
+        idempotencyKey: typeof args.idempotency_key === "string" && args.idempotency_key
+          ? args.idempotency_key
+          : undefined,
+        since,
+        limit: typeof args.limit === "number" ? args.limit : 20,
+      });
+      const compact = candidates.map((op) => ({
+        operation_id: op.operation_id,
+        tool: op.tool,
+        status: op.status,
+        device_id: op.device_id ?? null,
+        // idempotency_key is redacted from public envelopes by design
+        // (PUBLIC_PRIVATE_KEYS); the caller already knows the key it queried
+        // for — convergence is proven by the returned operation_id.
+        created_at: op.created_at,
+        updated_at: op.updated_at,
+        summary: op.summary,
+      }));
+      const page = paginateList(compact, {
+        cursor: typeof args.cursor === "string" ? args.cursor : undefined,
+        limit: typeof args.limit === "number" ? args.limit : undefined,
+      });
+      const env = makeEnvelope({
+        operation_id: operationId,
+        status: "completed",
+        summary: `listed ${page.page.length} operation(s)`,
+        data: { operations: page.page },
+        truncated: page.truncated,
+        next_cursor: page.next_cursor,
+        warnings: injectWarnings,
+      });
+      await persistOp(store, tracker, {
+        ...env,
+        tool: name,
+        principal: rec.principal,
+        tenant_id: rec.tenant_id,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      return mcpResult(id, toolContent(env));
     }
 
     if (name === "ownmesh_cancel_operation") {

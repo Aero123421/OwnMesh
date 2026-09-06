@@ -345,7 +345,7 @@ test("SQL rotateRefresh source has no cross-statement changes() gate", async () 
     "utf8",
   );
   const classIdx = src.indexOf("export class SqlStore");
-  const start = src.indexOf("async rotateRefresh(refreshToken: string)", classIdx);
+  const start = src.indexOf("async rotateRefresh(refreshToken:", classIdx);
   const end = src.indexOf("async revokeToken(token: string)", start);
   const body = src.slice(start, end);
   assert.equal(body.includes("changes() > 0"), false);
