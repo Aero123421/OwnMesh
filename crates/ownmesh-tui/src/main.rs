@@ -24,6 +24,8 @@
 mod app;
 mod control_plane;
 mod i18n;
+#[cfg(test)]
+mod interaction_tests;
 mod palette;
 mod terminal;
 mod theme;
@@ -82,6 +84,7 @@ struct Cli {
 const APPROVAL_CLI_TIMEOUT: Duration = Duration::from_secs(6 * 60 + 30);
 const APPROVAL_CHILD_POLL: Duration = Duration::from_millis(200);
 const SETUP_AGENT_WAIT: Duration = Duration::from_secs(5);
+const MAX_INPUT_BYTES: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupCliOutcome {
@@ -125,6 +128,18 @@ fn main() -> StdExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), ExitCode> {
+    // fetch_status() ensures the layout, so reject a non-TTY *before* calling
+    // it. One-shot status output remains usable from pipes and scripts.
+    if !cli.status
+        && !cli.once
+        && (!std::io::stdin().is_tty() || !std::io::stdout().is_tty())
+    {
+        eprintln!(
+            "ownmesh-tui requires an interactive terminal; stdin/stdout are not TTYs. \
+             Use `ownmesh-tui --status` for non-interactive output."
+        );
+        return Err(ExitCode::UsageConfig);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -159,15 +174,6 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
             }
         }
     } else {
-        // Refuse non-interactive runs before touching config/state paths so a
-        // piped invocation creates nothing and fails closed (#137).
-        if !std::io::stdin().is_tty() || !std::io::stdout().is_tty() {
-            eprintln!(
-                "ownmesh-tui requires an interactive terminal; stdin/stdout are not TTYs. \
-                 Use `ownmesh --status` for non-interactive output."
-            );
-            return Err(ExitCode::UsageConfig);
-        }
         let paths = OwnMeshPaths::discover().map_err(|err| {
             eprintln!("paths: {err}");
             ExitCode::UsageConfig
@@ -279,9 +285,7 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                     handle_key(&mut app, key, rt);
                 }
                 Event::Resize(_, _) | Event::Mouse(_) => {}
-                Event::Paste(text) if app.overlay == Overlay::Wizard => {
-                    append_wizard_server_text(&mut app, &text);
-                }
+                Event::Paste(text) => handle_paste(&mut app, &text),
                 _ => {}
             }
 
@@ -410,6 +414,9 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
+    if key.kind == KeyEventKind::Release {
+        return;
+    }
     // Global emergency exit. Raw mode delivers Ctrl+C as a regular key event,
     // so the terminal driver never raises SIGINT for us; it must work from
     // every screen, palette, wizard step, and overlay (issue #136).
@@ -419,9 +426,34 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         return;
     }
 
-    // Global: Ctrl+K palette
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-        app.open_palette();
+    // Repeated confirmation keys must not advance through wizard steps or
+    // submit another approval. Text editing and cursor movement may repeat.
+    if key.kind == KeyEventKind::Repeat
+        && (!key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+            || !repeatable_key(app, key.code))
+    {
+        return;
+    }
+
+    // Ctrl+K toggles the palette without changing the underlying dialog.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key
+            .modifiers
+            .difference(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            .is_empty()
+        && matches!(key.code, KeyCode::Char('k' | 'K'))
+    {
+        if app.palette.open {
+            app.palette.close();
+        } else {
+            app.open_palette();
+        }
+        return;
+    }
+
+    // Only explicit control bindings above are commands. For example, Ctrl+D
+    // must not deny an approval, and Alt+Q must not quit the application.
+    if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
         return;
     }
 
@@ -469,12 +501,19 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         return;
     }
 
-    match key.code {
+    // Terminals may encode Shift+Tab as either BackTab or Tab + SHIFT.
+    let code = if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
+        KeyCode::BackTab
+    } else {
+        key.code
+    };
+    match code {
         KeyCode::Char('q' | 'Q') => app.should_quit = true,
         KeyCode::F(1) | KeyCode::Char('?') => app.overlay = Overlay::Help,
         KeyCode::Char('/' | ':') => app.open_palette(),
         KeyCode::Esc if app.screen != Screen::Dashboard => app.goto_screen(Screen::Dashboard),
         KeyCode::Tab if app.screen == Screen::Dashboard => app.move_overview_action(1),
+        KeyCode::BackTab if app.screen == Screen::Dashboard => app.move_overview_action(-1),
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l')
             if !key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -531,6 +570,12 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         KeyCode::Char('r') if app.screen == Screen::Devices => {
             refresh_devices(app, rt);
         }
+        KeyCode::Char('r') if app.screen == Screen::Sessions => {
+            apply_sessions_refresh(app, rt.block_on(ipc_call("session.list", None)));
+        }
+        KeyCode::Char('r') if matches!(app.screen, Screen::Dashboard | Screen::Diagnostics) => {
+            apply_local_refresh(app, rt.block_on(fetch_status()));
+        }
         KeyCode::Char('p') if app.screen == Screen::Settings => {
             app.cycle_settings_preset();
         }
@@ -546,7 +591,17 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
 fn handle_palette_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.palette.close(),
-        KeyCode::Enter => app.run_selected_palette(),
+        KeyCode::Enter => {
+            if filter_commands(app.lang, &app.palette.query)
+                .get(app.palette.cursor)
+                .is_some()
+            {
+                // A navigation command must reveal its destination, rather
+                // than leaving a wizard/help dialog covering the new screen.
+                app.overlay = Overlay::None;
+                app.run_selected_palette();
+            }
+        }
         KeyCode::Up => {
             let n = filter_commands(app.lang, &app.palette.query).len();
             app.palette.move_cursor(-1, n);
@@ -560,8 +615,8 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
             app.palette.cursor = 0;
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.palette.query.push(c);
-            app.palette.cursor = 0;
+            let mut buffer = [0; 4];
+            append_palette_text(app, c.encode_utf8(&mut buffer));
         }
         _ => {}
     }
@@ -625,27 +680,106 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent) {
         },
         KeyCode::Char(c)
             if app.wizard.step == WizardStep::Server
-                && !key.modifiers.contains(KeyModifiers::CONTROL)
-                && app.wizard.control_plane_url.len() < 2048 =>
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
-            app.wizard.control_plane_url.push(c);
-            app.wizard.error = None;
+            let mut buffer = [0; 4];
+            append_wizard_server_text(app, c.encode_utf8(&mut buffer));
         }
         _ => {}
     }
+}
+
+fn repeatable_key(app: &App, code: KeyCode) -> bool {
+    if app.palette.open || (app.overlay == Overlay::Wizard && app.wizard.step == WizardStep::Server) {
+        return matches!(
+            code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Up | KeyCode::Down
+        );
+    }
+    if app.overlay == Overlay::Wizard {
+        return matches!(code, KeyCode::Up | KeyCode::Down);
+    }
+    app.overlay == Overlay::None
+        && matches!(
+            code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'k')
+        )
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    // Match keyboard focus: an open palette always sits above an overlay.
+    if app.palette.open {
+        append_palette_text(app, text);
+    } else if app.overlay == Overlay::Wizard {
+        append_wizard_server_text(app, text);
+    }
+}
+
+fn append_input_text(input: &mut String, text: &str) {
+    for ch in text.chars().filter(|ch| !ch.is_control()) {
+        if input.len() + ch.len_utf8() > MAX_INPUT_BYTES {
+            break;
+        }
+        input.push(ch);
+    }
+}
+
+fn append_palette_text(app: &mut App, text: &str) {
+    append_input_text(&mut app.palette.query, text);
+    app.palette.cursor = 0;
 }
 
 fn append_wizard_server_text(app: &mut App, text: &str) {
     if app.wizard.step != WizardStep::Server {
         return;
     }
-    for ch in text.chars().filter(|ch| !ch.is_control()) {
-        if app.wizard.control_plane_url.len() + ch.len_utf8() > 2048 {
-            break;
-        }
-        app.wizard.control_plane_url.push(ch);
-    }
+    append_input_text(&mut app.wizard.control_plane_url, text);
     app.wizard.error = None;
+}
+
+fn apply_sessions_refresh(app: &mut App, result: Result<serde_json::Value, ownmesh_ipc::IpcError>) {
+    match result {
+        Ok(value) => {
+            app.set_sessions_from_json(&value);
+            app.status_line = format!(
+                "{}: {}",
+                i18n::t(app.lang, i18n::Msg::NavSessions),
+                app.sessions.len()
+            );
+        }
+        Err(error) => app.status_line = actionable_ipc_error(&error),
+    }
+}
+
+fn apply_local_refresh(app: &mut App, result: Result<DaemonStatus, ownmesh_ipc::IpcError>) {
+    let daemon = match result {
+        Ok(status) => {
+            app.status_line = format!(
+                "{}: {}",
+                i18n::t(app.lang, app.screen.title_msg()),
+                status.state
+            );
+            Some(status)
+        }
+        Err(error) => {
+            app.status_line = actionable_ipc_error(&error);
+            None
+        }
+    };
+    let refreshed = App::new(app.paths.clone(), daemon);
+    if app.readiness.server_url != refreshed.readiness.server_url
+        || app.readiness.account_present != refreshed.readiness.account_present
+    {
+        // Discard the snapshot when the recorded server/login state changes.
+        app.device_inventory = refreshed.device_inventory;
+    }
+    // Refresh observations only; keep --lang and unsaved settings/wizard edits.
+    app.daemon = refreshed.daemon;
+    app.doctor = refreshed.doctor;
+    app.readiness = refreshed.readiness;
+    app.overview_action_cursor = app
+        .overview_action_cursor
+        .min(app.overview_actions().len().saturating_sub(1));
 }
 
 fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
