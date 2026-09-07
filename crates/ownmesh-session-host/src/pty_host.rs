@@ -488,9 +488,15 @@ fn terminate_std_child_tree(child: &mut Child) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{}", child.id())])
-            .status();
+        let group = format!("-{}", child.id());
+        // procps kill parses a negative PID as options without `--` and can
+        // turn e.g. -12345 into -1 (every permitted process, including CI).
+        // Match the platform-specific group operand used by kill_process_tree.
+        #[cfg(target_os = "macos")]
+        let group_args: [&str; 2] = ["-TERM", &group];
+        #[cfg(not(target_os = "macos"))]
+        let group_args: [&str; 3] = ["-TERM", "--", &group];
+        let _ = Command::new("kill").args(group_args).status();
         let _ = child.kill();
     }
     let _ = child.wait();
@@ -2233,6 +2239,66 @@ mod tests {
         assert!(host.write_frame(b"x").is_err());
         assert!(host.write_frame(&vec![b'x'; 64 * 1024 + 1]).is_err());
         host.terminate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_termination_is_scoped_to_its_process_group() {
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // This child shares the test runner's group, not the session's group.
+        // A session close must leave both it and the runner alive.
+        let mut unrelated = ChildGuard(
+            Command::new("/bin/sh")
+                .args(["-c", "exec sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let command = PtyCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "sleep 30 & printf '%s\\n' \"$!\"; wait".into(),
+            ],
+            cwd: None,
+            env: vec![],
+        };
+        let mut host = StructuredProcessHost::spawn(&command, PtySize::default()).unwrap();
+        let mut output = Vec::new();
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !output.contains(&b'\n') && std::time::Instant::now() < ready_deadline {
+            output.extend(host.drain_stdout(64).unwrap().0);
+            assert!(output.len() <= 64, "unexpected child readiness output");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant: u32 = std::str::from_utf8(&output)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("session must report its live descendant before termination");
+        assert!(unix_pid_is_live(descendant));
+        assert!(unrelated.0.try_wait().unwrap().is_none());
+
+        host.terminate().unwrap();
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while unix_pid_is_live(descendant) && std::time::Instant::now() < exit_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(host.is_exited(), "the session leader must be reaped");
+        assert!(!unix_pid_is_live(descendant), "session descendant survived");
+        assert!(
+            unrelated.0.try_wait().unwrap().is_none(),
+            "session termination signalled an unrelated process"
+        );
     }
 
     /// Structured child that writes to both streams and exits with `code`.
