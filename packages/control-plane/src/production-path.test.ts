@@ -557,7 +557,8 @@ test("production-path: delayed AUTH_PROVIDER cannot extend consent expiry past G
       new Request(
         `${ISSUER}/oauth/authorize?response_type=code&client_id=${CLIENT}` +
           `&redirect_uri=${encodeURIComponent(REDIRECT)}` +
-          "&code_challenge=receipt_boundary&code_challenge_method=S256&scope=ownmesh.read",
+          "&code_challenge=receipt_boundary&code_challenge_method=S256&scope=ownmesh.read" +
+          `&resource=${encodeURIComponent(`${ISSUER}/mcp`)}`,
       ),
       {
         OAUTH_ISSUER: ISSUER,
@@ -599,7 +600,8 @@ test("production-path: authorize consent-tx + PKCE exchange via worker + SqlStor
         `${ISSUER}/oauth/authorize?response_type=code&client_id=${CLIENT}` +
           `&redirect_uri=${encodeURIComponent(REDIRECT)}` +
           `&code_challenge=${challenge}&code_challenge_method=S256` +
-          `&scope=ownmesh.read%20offline_access&state=st_prod`,
+          `&scope=ownmesh.read%20offline_access&state=st_prod` +
+          `&resource=${encodeURIComponent(`${ISSUER}/mcp`)}`,
       ),
       e,
       ctx,
@@ -643,7 +645,7 @@ test("production-path: authorize consent-tx + PKCE exchange via worker + SqlStor
           redirect_uri: REDIRECT,
           client_id: CLIENT,
           code_verifier: verifier,
-        }),
+        resource: "https://cp.test/mcp",}),
       }),
       e,
       ctx,
@@ -908,7 +910,8 @@ test("production-path negatives: CSRF replay rejected on authorize and device ve
       new Request(
         `${ISSUER}/oauth/authorize?response_type=code&client_id=${CLIENT}` +
           `&redirect_uri=${encodeURIComponent(REDIRECT)}` +
-          `&code_challenge=${challenge}&code_challenge_method=S256&scope=ownmesh.read&state=s`,
+          `&code_challenge=${challenge}&code_challenge_method=S256&scope=ownmesh.read&state=s` +
+          `&resource=${encodeURIComponent(`${ISSUER}/mcp`)}`,
       ),
       e,
       ctx,
@@ -939,7 +942,8 @@ test("production-path negatives: CSRF replay rejected on authorize and device ve
       new Request(
         `${ISSUER}/oauth/authorize?response_type=code&client_id=${CLIENT}` +
           `&redirect_uri=${encodeURIComponent(REDIRECT)}` +
-          `&code_challenge=${challenge}&code_challenge_method=S256&scope=ownmesh.read`,
+          `&code_challenge=${challenge}&code_challenge_method=S256&scope=ownmesh.read` +
+          `&resource=${encodeURIComponent(`${ISSUER}/mcp`)}`,
       ),
       e,
       ctx,
@@ -1102,7 +1106,8 @@ test("production-path: AUTH_PROVIDER unknown tenant fails closed (401/403) on au
         `${ISSUER}/oauth/authorize?response_type=code&client_id=${CLIENT}` +
           `&redirect_uri=${encodeURIComponent(REDIRECT)}` +
           `&code_challenge=${challenge}&code_challenge_method=S256` +
-          `&scope=ownmesh.read%20offline_access&state=st_unknown_tenant`,
+          `&scope=ownmesh.read%20offline_access&state=st_unknown_tenant` +
+          `&resource=${encodeURIComponent(`${ISSUER}/mcp`)}`,
       ),
       e,
       ctx,

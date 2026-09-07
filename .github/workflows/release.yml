@@ -1,5 +1,12 @@
 name: Release
 
+# Exact-SHA evidence-consuming CD (Issue #230 Phase 4, ADR 0022).
+# Never re-runs ci.yml / security.yml for the same SHA. The
+# release-eligibility job verifies the tag SHA already has success
+# `CI / required` + `CI / security-required` from the expected workflow,
+# then build/SBOM/E2E/metadata consume that proof. Tag to build matrix starts
+# in p95 <= 2 min (no full CI re-run).
+
 on:
   push:
     tags:
@@ -13,24 +20,85 @@ permissions:
   contents: read
 
 jobs:
-  # Reusable workflows are hard prerequisites. A failed/cancelled CI or Security
-  # invocation leaves every build/publish job skipped by normal needs semantics.
-  ci-gate:
-    name: Required CI gate
+  release-eligibility:
+    name: Exact-SHA eligibility proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
-    uses: ./.github/workflows/ci.yml
+      actions: read
+    outputs:
+      sha: ${{ steps.eligibility.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
-  security-gate:
-    name: Required security gate
-    permissions:
-      contents: read
-      security-events: write
-    uses: ./.github/workflows/security.yml
+      - id: eligibility
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CI_RUN_ID="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&per_page=5" --jq '[.workflow_runs[] | select(.conclusion == "success")][0].id')"
+          if [ -z "${CI_RUN_ID}" ]; then
+            echo "::error::no successful ci.yml run for exact SHA ${GITHUB_SHA}"
+            exit 1
+          fi
+          if [ "${CI_RUN_ID}" = "null" ]; then
+            echo "::error::no successful ci.yml run for exact SHA ${GITHUB_SHA}"
+            exit 1
+          fi
+          python3 scripts/ci/release_eligibility.py \
+            --tag "${GITHUB_REF_NAME}" \
+            --sha "${GITHUB_SHA}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --expected-workflow "CI" \
+            --run-id "${CI_RUN_ID}"
+          echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          cat release-eligibility.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify main branch ruleset precondition
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify_ruleset.py --repo "${GITHUB_REPOSITORY}" --expect-ruleset
+
+      - name: Upload eligibility evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-eligibility
+          path: release-eligibility.json
+          if-no-files-found: error
+          retention-days: 90
+
+  release-gate-integrity:
+    name: Release gate integrity (no bypass flags)
+    needs: [release-eligibility]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reject gate-bypass flags in release workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Character class keeps this step's own pattern text from self-matching;
+          # a malicious PR inserting the bypass flag still matches and fails closed.
+          if grep -rn "allow-missing-check[s]" .github/workflows/release.yml; then
+            echo "::error::gate-bypass flag detected in release.yml; release gate must stay fail-closed"
+            exit 1
+          fi
+          echo "release gate integrity: no bypass flags"
 
   build:
     name: Release build (${{ matrix.asset }})
-    needs: [ci-gate, security-gate]
+    needs: [release-eligibility]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -162,9 +230,61 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  sbom-release:
+    name: Release SBOM (exact tag SHA)
+    needs: [release-eligibility]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.92 toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-sbom
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: Enable corepack (pnpm 9.15.0)
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+      - name: pnpm install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: Generate exact-SHA SBOMs (validated, no fallback)
+        run: |
+          set -euo pipefail
+          rm -rf sbom
+          mkdir sbom
+          pnpm dlx @cyclonedx/cdxgen@11.0.1 -t rust --no-install-deps --fail-on-error --validate \
+            -o sbom/sbom-rust.cdx.json --spec-version 1.5 .
+          pnpm dlx @cyclonedx/cdxgen@11.0.1 -t pnpm --no-install-deps --fail-on-error --validate \
+            -o sbom/sbom-control-plane.cdx.json --spec-version 1.5 .
+          python3 - <<'PY'
+          import json
+          for path in ["sbom/sbom-rust.cdx.json", "sbom/sbom-control-plane.cdx.json"]:
+              with open(path, encoding="utf-8") as handle:
+                  data = json.load(handle)
+              assert data.get("bomFormat") == "CycloneDX", path
+              assert data.get("specVersion") == "1.5", path
+              assert isinstance(data.get("version"), int) and data["version"] > 0, path
+              components = data.get("components")
+              assert isinstance(components, list) and components, f"empty SBOM: {path}"
+          PY
+      - name: Upload release SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-release
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
   release-candidate-e2e:
     name: Exact packaged Linux artifact against local workerd
-    needs: [ci-gate, security-gate, build]
+    needs: [release-eligibility, build]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -215,9 +335,19 @@ jobs:
           OWNMESH_E2E_ARTIFACT_DIR: ${{ github.workspace }}/release-candidate/extracted
         run: python scripts/tests/test_e9_workerd_transfer.py
 
+  release-policy-final:
+    name: Release policy final (exact SHA)
+    needs: [release-eligibility]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 scripts/check_release_quality.py
+
   distribution-metadata:
     name: Installers and Homebrew formula
-    needs: [ci-gate, security-gate, build, release-candidate-e2e]
+    needs: [release-eligibility, build, release-candidate-e2e, sbom-release, release-policy-final]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -259,7 +389,7 @@ jobs:
 
   publish:
     name: Publish gated release
-    needs: [ci-gate, security-gate, build, release-candidate-e2e, distribution-metadata]
+    needs: [release-eligibility, release-gate-integrity, build, sbom-release, release-candidate-e2e, release-policy-final, distribution-metadata]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -275,11 +405,6 @@ jobs:
         with:
           pattern: release-*
           merge-multiple: true
-          path: dist
-      - name: Download strict SBOMs from Security gate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: sbom-cyclonedx
           path: dist
       - name: Fail if any required artifact or current-tag notes are absent
         run: |

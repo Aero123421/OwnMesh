@@ -604,6 +604,54 @@ pub fn list_dir_page(
     max_entries: usize,
     cursor: Option<&str>,
 ) -> FsResult<DirListPage> {
+    list_dir_page_with_limits(
+        ws,
+        rel,
+        recursive,
+        max_entries,
+        cursor,
+        DirectoryPagingLimits::production(),
+    )
+}
+
+/// Issue #230 Phase 1: injectable paging/spool bounds so the default unit suite
+/// can verify spill logic with tiny fixtures while production-scale filesystem
+/// work lives in `tests/scale_*` (nightly/weekly/manual). Production and tests
+/// share this exact implementation; only the limits differ.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectoryPagingLimits {
+    /// In-memory snapshot bound before spilling to durable spool.
+    pub memory_entries: usize,
+    /// Hard spool entry quota (disk-backed, still bounded).
+    pub spool_entries: usize,
+    /// Server-side page ceiling independent of caller `max_entries`.
+    pub page_entries: usize,
+    /// UTF-8 JSON page budget for Agent/DeviceRoom envelopes.
+    pub page_json_bytes: usize,
+}
+
+impl DirectoryPagingLimits {
+    /// Production bounds. Do not lower without a threat-model review: the
+    /// memory/spool split is the Full Access chunking contract.
+    #[must_use]
+    pub const fn production() -> Self {
+        Self {
+            memory_entries: 25_000,
+            spool_entries: 250_000,
+            page_entries: 500,
+            page_json_bytes: 96_000,
+        }
+    }
+}
+
+pub fn list_dir_page_with_limits(
+    ws: &WorkspaceRoot,
+    rel: impl AsRef<Path>,
+    recursive: bool,
+    max_entries: usize,
+    cursor: Option<&str>,
+    limits: DirectoryPagingLimits,
+) -> FsResult<DirListPage> {
     // Restricted mode holds the directory handle across enumeration so a
     // rename-to-symlink replacement of the checked path cannot retarget listing.
     let (held_dir, path) = if ws.enforce {
@@ -619,16 +667,21 @@ pub fn list_dir_page(
         }
         (None, path)
     };
-    // Server-side ceiling independent of caller-supplied max_entries.
-    const MAX_PAGE_ENTRIES: usize = 500;
-    /// UTF-8 JSON page budget so Agent/DeviceRoom envelopes never lose the
-    /// directory cursor to a generic truncation stand-in.
-    const MAX_PAGE_JSON_BYTES: usize = 96_000;
-    /// In-memory snapshot bound. Above this, entries spill to a durable spool.
-    const MAX_DIR_MEMORY_SNAPSHOT: usize = 25_000;
-    /// Hard spool entry quota (disk-backed, still bounded).
-    const MAX_DIR_SPOOL_ENTRIES: usize = 250_000;
-    let limit = max_entries.clamp(1, MAX_PAGE_ENTRIES);
+    // Server-side bounds come from the injected limits so unit tests and
+    // production share one code path (Issue #230).
+    // Fail-closed: DirectoryPagingLimits is a public API (all fields pub), so
+    // page_entries:0 would make clamp(1, 0) panic. Reject zero bounds and
+    // zero caller requests instead of panicking or over-serving.
+    if limits.page_entries == 0 {
+        return Err(FsError::EntryLimit);
+    }
+    if max_entries == 0 {
+        return Err(FsError::EntryLimit);
+    }
+    let limit = max_entries.min(limits.page_entries).max(1);
+    let max_page_json_bytes = limits.page_json_bytes;
+    let max_memory_snapshot = limits.memory_entries;
+    let max_spool_entries = limits.spool_entries;
 
     // Resume from a durable spool cursor without re-walking the tree.
     // Cursor is bound to this request's canonical root + recursive flag so a
@@ -639,7 +692,7 @@ pub fn list_dir_page(
             snapshot,
             after.as_ref(),
             limit,
-            MAX_PAGE_JSON_BYTES,
+            max_page_json_bytes,
             Some(spool_id.as_str()),
         ));
     }
@@ -669,7 +722,7 @@ pub fn list_dir_page(
             return Err(FsError::EntryLimit);
         }
         if !spilled {
-            if snapshot.len() >= MAX_DIR_MEMORY_SNAPSHOT {
+            if snapshot.len() >= max_memory_snapshot {
                 // Spill existing snapshot + continue on disk-backed vector with
                 // a much higher hard cap so large valid trees remain retrievable.
                 spool_entries = std::mem::take(&mut snapshot);
@@ -680,7 +733,7 @@ pub fn list_dir_page(
                 return Ok(());
             }
         }
-        if spool_entries.len() >= MAX_DIR_SPOOL_ENTRIES {
+        if spool_entries.len() >= max_spool_entries {
             return Err(FsError::EntryLimit);
         }
         spool_entries.push(info);
@@ -750,7 +803,7 @@ pub fn list_dir_page(
         snapshot,
         after.as_ref(),
         limit,
-        MAX_PAGE_JSON_BYTES,
+        max_page_json_bytes,
         spool_id.as_deref(),
     ))
 }
@@ -1960,15 +2013,16 @@ mod tests {
         );
     }
 
+    /// Pagination integrity with a small deterministic fixture.
+    /// The production 4,500-entry regression lives in
+    /// `tests/scale_directory.rs` (`production_pagination_walks_past_four_thousand_entries`).
     #[test]
-    fn list_page_walks_past_four_thousand_entries_without_silent_drop() {
+    fn list_page_paginates_small_tree_without_silent_drop() {
         let dir = tempdir().unwrap();
         let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
-        // Reproduce the former scan_budget=4000 trap: later pages must still see
-        // entries beyond the first window, every name exactly once.
-        const N: usize = 4_500;
+        const N: usize = 90;
         for i in 0..N {
-            let name = format!("f{i:05}.txt");
+            let name = format!("f{i:03}.txt");
             write_file(&ws, &name, b"x").unwrap();
         }
         let mut seen = std::collections::HashSet::new();
@@ -1976,8 +2030,8 @@ mod tests {
         let mut pages = 0_usize;
         loop {
             pages += 1;
-            assert!(pages < 200, "pagination failed to terminate");
-            let page = list_dir_page(&ws, "", false, 200, cursor.as_deref()).unwrap();
+            assert!(pages < 20, "pagination failed to terminate");
+            let page = list_dir_page(&ws, "", false, 20, cursor.as_deref()).unwrap();
             for entry in &page.entries {
                 assert!(
                     seen.insert(entry.name.clone()),
@@ -1994,47 +2048,40 @@ mod tests {
         assert_eq!(
             seen.len(),
             N,
-            "expected every entry once; got {} across {pages} pages",
-            seen.len()
+            "expected every entry once across {pages} pages"
         );
-        for i in 0..N {
-            let name = format!("f{i:05}.txt");
-            assert!(seen.contains(&name), "missing {name}");
-        }
     }
 
-    /// Large directories that exceed the in-memory snapshot bound must still be
-    /// fully retrievable via durable spool cursors (Full Access chunking).
+    /// Spill logic with injected limits and a tiny fixture.
+    /// Production and tests share `list_dir_page_with_limits`; only the bounds
+    /// differ. The 25,050-file production boundary lives in
+    /// `tests/scale_directory.rs` (`production_directory_spool_boundary`).
     #[test]
-    fn list_page_retrieves_all_entries_beyond_memory_snapshot_via_spool() {
+    fn spills_to_disk_after_memory_entry_limit() {
         let _guard = DIR_SPOOL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempdir().unwrap();
-        // Isolate spool IO under the test temp dir.
         std::env::set_var("OWNMESH_STATE_DIR", dir.path().join("state"));
         let ws = WorkspaceRoot::new(dir.path().join("tree"), true).unwrap();
         std::fs::create_dir_all(ws.root()).unwrap();
-        // Just over the 25_000 in-memory bound.
-        const N: usize = 25_050;
-        for i in 0..N {
-            let name = format!("g{i:05}.txt");
-            write_file(&ws, &name, b"x").unwrap();
+        let limits = DirectoryPagingLimits {
+            memory_entries: 3,
+            spool_entries: 16,
+            page_entries: 2,
+            page_json_bytes: 4_096,
+        };
+        for i in 0..4 {
+            write_file(&ws, format!("g{i:02}.txt"), b"x").unwrap();
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         let mut cursor: Option<String> = None;
-        let mut pages = 0_usize;
         let mut saw_v2 = false;
-        loop {
-            pages += 1;
-            assert!(pages < 400, "pagination failed to terminate");
-            let page = list_dir_page(&ws, "", false, 200, cursor.as_deref()).unwrap();
+        for _ in 0..10 {
+            let page =
+                list_dir_page_with_limits(&ws, "", false, 2, cursor.as_deref(), limits).unwrap();
             for entry in &page.entries {
-                assert!(
-                    seen.insert(entry.name.clone()),
-                    "duplicate entry across pages: {}",
-                    entry.name
-                );
+                seen.insert(entry.name.clone());
             }
             if let Some(c) = page.next_cursor.as_deref() {
                 if c.starts_with("v2:") {
@@ -2045,18 +2092,12 @@ mod tests {
                 break;
             }
             cursor = page.next_cursor;
-            assert!(cursor.is_some(), "truncated page must carry next_cursor");
         }
         assert!(
             saw_v2,
-            "expected durable v2 spool cursor for >25k directory"
+            "expected durable v2 spool cursor with injected limits"
         );
-        assert_eq!(
-            seen.len(),
-            N,
-            "expected every entry once via spool pages; got {} across {pages} pages",
-            seen.len()
-        );
+        assert_eq!(seen.len(), 4, "expected all 4 entries via spool pages");
     }
 
     /// Adversarial unordered-enumeration property: names that sort early must not
@@ -2123,6 +2164,8 @@ mod tests {
         );
     }
 
+    /// Cursor-to-root binding with a tiny spooled fixture.
+    /// Production 25,050-file variant lives in `tests/scale_directory.rs`.
     #[test]
     fn list_page_v2_cursor_bound_to_root_rejects_cross_workspace_substitution() {
         let _guard = DIR_SPOOL_TEST_LOCK
@@ -2134,30 +2177,36 @@ mod tests {
         let ws_b = WorkspaceRoot::new(dir.path().join("b"), true).unwrap();
         std::fs::create_dir_all(ws_a.root()).unwrap();
         std::fs::create_dir_all(ws_b.root()).unwrap();
-        // Force durable spool on A.
-        const N: usize = 25_050;
-        for i in 0..N {
-            write_file(&ws_a, format!("a{i:05}.txt"), b"x").unwrap();
+        let limits = DirectoryPagingLimits {
+            memory_entries: 3,
+            spool_entries: 16,
+            page_entries: 2,
+            page_json_bytes: 4_096,
+        };
+        for i in 0..5 {
+            write_file(&ws_a, format!("a{i:02}.txt"), b"x").unwrap();
         }
         write_file(&ws_b, "only-b.txt", b"b").unwrap();
-        let page_a = list_dir_page(&ws_a, "", false, 10, None).unwrap();
+        let page_a = list_dir_page_with_limits(&ws_a, "", false, 2, None, limits).unwrap();
         assert!(page_a.truncated);
         let cursor = page_a.next_cursor.expect("v2 cursor");
         assert!(cursor.starts_with("v2:"), "cursor={cursor}");
-        // Same cursor against workspace B must fail closed (not return A's snapshot).
-        let err = list_dir_page(&ws_b, "", false, 10, Some(cursor.as_str())).unwrap_err();
+        let err = list_dir_page_with_limits(&ws_b, "", false, 2, Some(cursor.as_str()), limits)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("does not match") || msg.contains("cursor"),
             "expected request-identity bind failure, got {msg}"
         );
-        // Control: continuation on A still works.
-        let page_a2 = list_dir_page(&ws_a, "", false, 10, Some(cursor.as_str())).unwrap();
+        let page_a2 =
+            list_dir_page_with_limits(&ws_a, "", false, 2, Some(cursor.as_str()), limits).unwrap();
         assert!(!page_a2.entries.is_empty());
     }
 
+    /// Aggregate budget stays fail-closed; production 8,000-file variant lives
+    /// in `tests/scale_directory.rs` (`production_aggregate_byte_budget`).
     #[test]
-    fn list_page_rejects_oversized_name_path_aggregate_budget() {
+    fn list_page_long_names_stay_within_page_budget() {
         let _guard = DIR_SPOOL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2165,25 +2214,14 @@ mod tests {
         std::env::set_var("OWNMESH_STATE_DIR", dir.path().join("state"));
         let ws = WorkspaceRoot::new(dir.path().join("tree"), true).unwrap();
         std::fs::create_dir_all(ws.root()).unwrap();
-        // Long-but-legal basenames: aggregate byte budget is enforced before
-        // serialize, so huge transient JSON allocations cannot accumulate unbounded.
-        const M: usize = 8_000;
-        for i in 0..M {
-            // Stay under Windows 255-char component limit.
-            let name = format!("N{i:05}_{}.txt", "x".repeat(200));
+        for i in 0..20 {
+            let name = format!("N{i:03}_{}.txt", "x".repeat(200));
             write_file(&ws, &name, b"x").unwrap();
         }
-        match list_dir_page(&ws, "", false, 50, None) {
-            Ok(page) => {
-                let json = serde_json::to_vec(&page.entries).unwrap();
-                assert!(json.len() <= 96_000 + 8_192);
-                assert!(!page.entries.is_empty());
-            }
-            Err(FsError::EntryLimit) => {
-                // Fail-closed on aggregate budget is acceptable and preferred.
-            }
-            Err(other) => panic!("unexpected error: {other}"),
-        }
+        let page = list_dir_page(&ws, "", false, 50, None).unwrap();
+        assert!(!page.entries.is_empty());
+        let json = serde_json::to_vec(&page.entries).unwrap();
+        assert!(json.len() <= 96_000 + 8_192);
     }
 
     #[test]
@@ -2234,5 +2272,31 @@ mod tests {
         huge.push_str(&"y".repeat(MAX_UNIFIED_DIFF_BYTES));
         let err = apply_unified_diff(&ws, "note.txt", &huge, None).unwrap_err();
         assert!(matches!(err, FsError::Patch(_)), "{err:?}");
+    }
+
+    /// Fail-closed paging bounds: zero page ceiling or zero caller request
+    /// must error, never panic via clamp(1, 0) on the public limits API.
+    #[test]
+    fn list_page_with_limits_rejects_zero_bounds_fail_closed() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path().join("tree"), true).unwrap();
+        std::fs::create_dir_all(ws.root()).unwrap();
+        write_file(&ws, "a.txt", b"x").unwrap();
+        let zero_page = DirectoryPagingLimits {
+            memory_entries: 3,
+            spool_entries: 16,
+            page_entries: 0,
+            page_json_bytes: 4_096,
+        };
+        let err = list_dir_page_with_limits(&ws, "", false, 2, None, zero_page).unwrap_err();
+        assert!(matches!(err, FsError::EntryLimit), "{err:?}");
+        let limits = DirectoryPagingLimits {
+            memory_entries: 3,
+            spool_entries: 16,
+            page_entries: 2,
+            page_json_bytes: 4_096,
+        };
+        let err = list_dir_page_with_limits(&ws, "", false, 0, None, limits).unwrap_err();
+        assert!(matches!(err, FsError::EntryLimit), "{err:?}");
     }
 }

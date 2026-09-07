@@ -1045,34 +1045,67 @@ test("initialize advertises Streamable HTTP protocol version", async () => {
 
 test("tool authorization rejects missing scope", async () => {
   const { store, token } = await authed("ownmesh.read");
-  const { body } = await callTool(store, token, "ownmesh_command_run", {
+  const { res, body } = await callTool(store, token, "ownmesh_command_run", {
     device_id: "dev_x",
     program: "echo",
     idempotency_key: "idem_scope_run",
   });
   assert.equal(body.error?.code, -32003);
   assert.match(body.error?.message || "", /insufficient_scope/);
+  // Issue #196: runtime scope failure is an OAuth 403 challenge, not HTTP 200.
+  assert.equal(res.status, 403);
+  const challenge = res.headers.get("www-authenticate") || "";
+  assert.match(challenge, /Bearer/);
+  assert.match(challenge, /error="insufficient_scope"/);
+  assert.match(challenge, /scope="[^"]*ownmesh\.exec[^"]*"/);
+  assert.match(challenge, /resource_metadata="https:\/\/cp\.test\/\.well-known\/oauth-protected-resource\/mcp"/);
 });
 
 test("read scope cannot write files", async () => {
   const { store, token } = await authed("ownmesh.read");
-  const { body } = await callTool(store, token, "ownmesh_fs_write", {
+  const { res, body } = await callTool(store, token, "ownmesh_fs_write", {
     device_id: "dev_x",
     path: "a.txt",
     content: "x",
     idempotency_key: "idem_scope_write",
   });
   assert.equal(body.error?.code, -32003);
+  assert.equal(res.status, 403);
+  const challenge = res.headers.get("www-authenticate") || "";
+  assert.match(challenge, /error="insufficient_scope"/);
+  assert.match(challenge, /scope="[^"]*ownmesh\.write[^"]*"/);
 });
 
 test("exec scope required for shell tool", async () => {
   const { store, token } = await authed("ownmesh.write");
   // write scope must not imply execution authority
-  const { body } = await callTool(store, token, "ownmesh_command_shell", {
+  const { res, body } = await callTool(store, token, "ownmesh_command_shell", {
     device_id: "dev_x",
     command: "echo hi",
     idempotency_key: "idem_scope_shell",
   });
+  assert.equal(body.error?.code, -32003);
+  assert.equal(res.status, 403);
+  const challenge = res.headers.get("www-authenticate") || "";
+  assert.match(challenge, /error="insufficient_scope"/);
+});
+
+test("insufficient_scope challenge preserves granted scopes and survives modern adapter", async () => {
+  const { store, token } = await authed("ownmesh.read ownmesh.device");
+  const res = await handleMcp(
+    modernRpc("tools/call", { name: "ownmesh_command_run", arguments: { device_id: "dev_modern_scope", program: "echo", idempotency_key: "idem_modern_scope" } }, token, { "mcp-name": "ownmesh_command_run" }),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test", tracker: new OperationTracker() },
+  );
+  assert.equal(res.status, 403);
+  const challenge = res.headers.get("www-authenticate") || "";
+  assert.match(challenge, /error="insufficient_scope"/);
+  // Granted scopes are retained so reauthorization does not narrow the token.
+  assert.match(challenge, /ownmesh\.read/);
+  assert.match(challenge, /ownmesh\.exec/);
+  const body = (await res.json()) as { error?: { code: number; message: string } };
   assert.equal(body.error?.code, -32003);
 });
 

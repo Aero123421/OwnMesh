@@ -17,6 +17,7 @@
 /installers/                        @Aero123421
 /.github/workflows/                 @Aero123421
 /scripts/check_release_quality.py   @Aero123421
+/scripts/ci/                        @Aero123421
 /release/SUPPORTED_SURFACES.json    @Aero123421
 
 # Decision records and the specification they revise.

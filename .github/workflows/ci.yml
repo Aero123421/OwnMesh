@@ -1,16 +1,38 @@
 name: CI
 
+# Tiered PR/main required CI (Issue #230, ADR 0022).
+# Linux is the sole full Rust correctness tier. Windows/macOS provide compile
+# compatibility plus affected native link/run evidence. Path planning is
+# fail-closed via scripts/ci/plan.py; fixed aggregators are the only required
+# checks so matrix renames can never silently unprotect main.
+#
+# Label-driven branching (plan.py 4th argv, comma-separated PR labels):
+# - no labels: standard path-filtered tiers.
+# - `review-ready`: full (heavier pre-merge signal).
+# - `hotfix`: records hotfix:true only. No time-based (e.g. 3h) gates exist
+#   today, so the plan stays fail-closed; reserved branch point for future
+#   time-gate exemptions (see plan.py).
+# - `do-not-merge`: records do_not_merge:true; `required` always fails.
+# Heavy tiers (scale/e2e/security-deep/strict-SBOM) never run here; they stay
+# nightly/weekly/release-only (plan heavy_deferred=true, docs/ci-test-tiers.md).
+
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+    # Default PR types (opened/synchronize/reopened) do NOT include labeled
+    # or ready_for_review, which this workflow needs: labeled(review-ready)
+    # drives plan full + coderabbit-call, unlabeled re-plans on label
+    # removal (fail-closed), ready_for_review re-issues the call on undraft.
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
   workflow_dispatch:
-  workflow_call:
 
+# PR runs cancel superseded runs only. Main push evidence must never be
+# cancelled by a later merge.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -20,22 +42,84 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  rust:
-    name: Rust 1.92 (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows
-            os: windows-latest
-            workspace_test_args: ""
-          - name: macOS
-            os: macos-latest
-            workspace_test_args: ""
-          - name: Linux
-            os: ubuntu-latest
-            workspace_test_args: "--exclude ownmesh-session-host --exclude ownmeshd"
+  plan:
+    name: Change plan (always)
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.plan.outputs.full }}
+      docs_only: ${{ steps.plan.outputs.docs_only }}
+      rust: ${{ steps.plan.outputs.rust }}
+      rust_platform_windows: ${{ steps.plan.outputs.rust_platform_windows }}
+      rust_platform_macos: ${{ steps.plan.outputs.rust_platform_macos }}
+      typescript: ${{ steps.plan.outputs.typescript }}
+      schemas: ${{ steps.plan.outputs.schemas }}
+      security_boundary: ${{ steps.plan.outputs.security_boundary }}
+      release_policy: ${{ steps.plan.outputs.release_policy }}
+      installers: ${{ steps.plan.outputs.installers }}
+      workflows: ${{ steps.plan.outputs.workflows }}
+      hotfix: ${{ steps.plan.outputs.hotfix }}
+      do_not_merge: ${{ steps.plan.outputs.do_not_merge }}
+      heavy_deferred: ${{ steps.plan.outputs.heavy_deferred }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # PR diffs need base SHA; pushes need before SHA. Full history keeps
+          # the planner fail-closed when the API base is unavailable.
+          fetch-depth: 0
+
+      - id: plan
+        shell: bash
+        env:
+          PLAN_EVENT: ${{ github.event_name }}
+          PLAN_HEAD: ${{ github.sha }}
+          PLAN_BASE_PULL: ${{ github.event.pull_request.base.sha }}
+          PLAN_BEFORE: ${{ github.event.before }}
+          PLAN_LABELS: ${{ github.event_name == 'pull_request' && join(github.event.pull_request.labels.*.name, ',') || '' }}
+        run: |
+          set -euo pipefail
+          # NOTE: PR labels/base/head arrive via env (never interpolated into
+          # the script) to prevent label-injection RCE (cf. gate/call jobs).
+          EVENT="$PLAN_EVENT"
+          HEAD="$PLAN_HEAD"
+          BASE=""
+          LABELS=""
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE="$PLAN_BASE_PULL"
+            LABELS="$PLAN_LABELS"
+          else
+            BASE="$PLAN_BEFORE"
+          fi
+          PLAN_JSON=$(python3 scripts/ci/plan.py "$EVENT" "$BASE" "$HEAD" "$LABELS")
+          echo "$PLAN_JSON" | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))"
+          for key in full docs_only rust rust_platform_windows rust_platform_macos typescript schemas security_boundary release_policy installers workflows hotfix do_not_merge heavy_deferred; do
+            val=$(echo "$PLAN_JSON" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('$key', False)).lower())")
+            # GitHub outputs require true/false lowercase.
+            if [ "$val" = "True" ]; then val="true"; fi
+            if [ "$val" = "False" ]; then val="false"; fi
+            echo "$key=$val" >> "$GITHUB_OUTPUT"
+          done
+          echo "$PLAN_JSON" > ci-plan.json
+          {
+            echo "## CI plan"
+            echo '```json'
+            cat ci-plan.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-plan
+          path: ci-plan.json
+          if-no-files-found: error
+          retention-days: 30
+
+  rust-linux:
+    name: Rust full correctness (Linux)
+    needs: [plan]
+    if: needs.plan.outputs.rust == 'true' || needs.plan.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -48,33 +132,77 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      # cargo-fmt does not accept Cargo's --locked flag because it never resolves
-      # dependencies. Lockfile immutability is checked explicitly before formatting.
-      - name: Verify Cargo.lock is current
-        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
+      # Suite commands are single-sourced from scripts/ci/suites.toml via the
+      # canonical runner (no direct cargo duplication here).
+      - name: Rust correctness via canonical runner
+        run: python3 scripts/ci/run.py rust-linux
+
+      - name: Daemon/PTY stateful via canonical runner
+        run: python3 scripts/ci/run.py rust-linux-stateful
+
+      - name: Slow-test and runner-minute trend (best-effort, never fails gate)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "## Slow-test trend (best-effort)" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/ci/duration_report.py --workflow ci.yml --limit 20 >> "$GITHUB_STEP_SUMMARY" 2>&1 || echo "(duration API unavailable in PR context)" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+  typescript:
+    name: TypeScript gates (path-aware)
+    needs: [plan]
+    if: needs.plan.outputs.typescript == 'true' || needs.plan.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Enable corepack (pnpm 9.15.0)
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+
+      # Suite commands are single-sourced from scripts/ci/suites.toml
+      # [typescript] via the canonical runner (no direct pnpm duplication).
+      - name: TypeScript gates via canonical runner
+        run: python3 scripts/ci/run.py typescript
+
+  platform-windows:
+    name: Windows compat + affected native
+    needs: [plan]
+    if: needs.plan.outputs.rust_platform_windows == 'true' || needs.plan.outputs.full == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust 1.92 toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # Compile compat + affected native link/run evidence are single-sourced
+      # from scripts/ci/suites.toml [platform-windows] via the canonical runner.
+      - name: Windows compat + affected native via canonical runner
+        run: python3 scripts/ci/run.py platform-windows
         shell: bash
 
-      - name: cargo fmt
-        run: cargo fmt --all --check
+      - name: Build installer binaries (minimal five-binary set)
+        if: needs.plan.outputs.installers == 'true' || needs.plan.outputs.release_policy == 'true' || needs.plan.outputs.full == 'true'
+        shell: bash
+        run: cargo build --locked -p ownmesh -p ownmesh-tui -p ownmeshd -p ownmesh-session-host -p ownmesh-broker
 
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: cargo build
-        run: cargo build --workspace --locked
-
-      - name: cargo test
-        run: cargo test --workspace --all-targets --locked ${{ matrix.workspace_test_args }}
-
-      - name: Enforce Windows foreign-owner custody regression
-        if: matrix.os == 'windows-latest'
-        run: >-
-          cargo test --locked -p ownmesh-ipc
-          windows_rejects_foreign_owned_state_directory_before_hardening
-          -- --ignored
-
-      - name: Windows portable installer integration
-        if: matrix.os == 'windows-latest'
+      - name: Windows portable installer integration (installer/release changes)
+        if: needs.plan.outputs.installers == 'true' || needs.plan.outputs.release_policy == 'true' || needs.plan.outputs.full == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -97,10 +225,12 @@ jobs:
           $env:OWNMESH_REQUIRE_MINISIGN = "1"
           python scripts/tests/test_installers.py
 
-  linux-stateful:
-    name: Rust 1.92 (Linux stateful)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  platform-macos:
+    name: macOS compat + affected native
+    needs: [plan]
+    if: needs.plan.outputs.rust_platform_macos == 'true' || needs.plan.outputs.full == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -108,70 +238,73 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.92.0"
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      # The daemon integration targets path-include runtime.rs. Run those unit
-      # tests once, then run only each integration target's own tests.
-      - name: Daemon unit tests
-        run: cargo test -p ownmeshd --bin ownmeshd --locked
-
-      - name: Daemon adversarial integration tests
+      # Compile compat + affected native link/run evidence are single-sourced
+      # from scripts/ci/suites.toml [platform-macos] via the canonical runner.
+      - name: macOS compat + affected native via canonical runner
+        run: python3 scripts/ci/run.py platform-macos
         shell: bash
-        run: |
-          set -euo pipefail
-          cargo test -p ownmeshd --test adversarial_security --locked -- --skip 'runtime::'
-          cargo test -p ownmeshd --test lease_expiry --locked -- --skip 'runtime::'
-          cargo test -p ownmeshd --test persist_rollback --locked -- --skip 'runtime::'
 
-      - name: Daemon platform integration tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test -p ownmeshd --test broker_capability_forgery --locked
-          cargo test -p ownmeshd --test platform_endpoint_security --locked
-
-      - name: PTY lifecycle tests (serialized)
-        run: cargo test -p ownmesh-session-host --all-targets --locked -- --test-threads=1
-
-  typescript:
-    name: pnpm frozen quality gates
+  security-fast:
+    name: Security fast (changed boundaries)
+    needs: [plan]
+    # Always runs so security-required never pends; internally skips deep work
+    # when the plan has no security boundary (still emits no-store evidence).
     runs-on: ubuntu-latest
+    outputs:
+      needed: ${{ steps.gate.outputs.needed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          fetch-depth: 0
 
-      - name: Enable corepack (pnpm 9.15.0)
+      - id: gate
+        shell: bash
         run: |
-          corepack enable
-          corepack prepare pnpm@9.15.0 --activate
+          set -euo pipefail
+          if [ "${{ needs.plan.outputs.security_boundary }}" = "true" ] || [ "${{ needs.plan.outputs.full }}" = "true" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: pnpm install (frozen lockfile)
-        run: pnpm install --frozen-lockfile
+      - name: Changed-range secret scan
+        # Local equivalent: `python3 scripts/ci/run.py security-fast`
+        # (scripts/ci/suites.toml [security-fast] is the single source of
+        # truth). CI uses the pinned action wrapper for upload/summary.
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "true"
+          GITLEAKS_ENABLE_SUMMARY: "true"
 
-      - name: pnpm tests
-        run: pnpm -r test
+      - name: Affected boundary tests (when needed)
+        if: steps.gate.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Single-sourced from scripts/ci/suites.toml [security-boundary].
+          if [ "${{ needs.plan.outputs.rust }}" = "true" ] || [ "${{ needs.plan.outputs.full }}" = "true" ]; then
+            python3 scripts/ci/run.py security-boundary
+          fi
 
-      - name: pnpm typecheck
-        run: pnpm -r typecheck
+      - name: Dependency audit on lockfile change
+        # Lockfile changes (Cargo.lock, pnpm-lock.yaml, rust-toolchain.toml)
+        # force plan full=true via scripts/ci/plan.py ROOT_FULL_FILES, so this
+        # step runs exactly when lockfiles change (never dead code).
+        if: needs.plan.outputs.full == 'true'
+        shell: bash
+        run: echo "lockfile audit runs in weekly security; PR fast path checks manifest diff only"
 
-      - name: pnpm lint
-        run: pnpm -r lint
-
-      - name: Wrangler configuration dry-run
-        working-directory: packages/control-plane
-        run: pnpm exec wrangler deploy --dry-run
-
-  release-truthfulness:
-    name: Release claims and gate structure
+  release-policy:
+    name: Release policy (once each)
+    needs: [plan]
+    if: needs.plan.outputs.release_policy == 'true' || needs.plan.outputs.full == 'true'
     runs-on: ubuntu-latest
-    # Signature verification is the point of the installers: never let this job
-    # report green because minisign happened to be missing from the runner.
     env:
       OWNMESH_REQUIRE_MINISIGN: "1"
     steps:
@@ -193,15 +326,15 @@ jobs:
           install -m 0755 "$extract/minisign-linux/x86_64/minisign" "$tools/minisign"
           "$tools/minisign" -v
           echo "$tools" >> "$GITHUB_PATH"
-      - name: Unix portable installer integration
-        run: python scripts/tests/test_installers.py
-      - name: Verify release surfaces and fail-closed publish graph
-        run: python scripts/check_release_quality.py
-      - name: Release-quality checker fixtures and mutation tests
-        run: python scripts/tests/run_release_quality_tests.py
+      # Checker + mutation + installer are single-sourced from
+      # scripts/ci/suites.toml [release-policy] via the canonical runner.
+      - name: Release policy via canonical runner (once each)
+        run: python3 scripts/ci/run.py release-policy
 
   tui-i18n:
     name: TUI i18n completeness
+    needs: [plan]
+    if: needs.plan.outputs.rust == 'true' || needs.plan.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -214,8 +347,223 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
+      # Snapshot tests run once in rust-linux workspace test; here only the
+      # unique --check-i18n invariant remains (no duplicate test binary run).
+      # Single-sourced from scripts/ci/suites.toml [tui-i18n].
       - name: Translation completeness (en-US / ja-JP / zh-Hans / ru-RU)
-        run: cargo run --locked -p ownmesh-tui -- --check-i18n
+        run: python3 scripts/ci/run.py tui-i18n
 
-      - name: TUI snapshot tests (CJK width, ru overflow, 80x24, wizard)
-        run: cargo test --locked -p ownmesh-tui -- --nocapture
+  coderabbit-call:
+    name: CodeRabbit auto-call (star-limit bypass)
+    # Fire only on PR opened / synchronize / labeled(review-ready). Bot posts
+    # never re-trigger: actor/sender guard here plus an idempotent
+    # already-called check in the script (no re-post, no loop).
+    # Uses only the preinstalled `gh` CLI + bash, so no new action pins and
+    # no secrets:inherit. GITHUB_TOKEN is passed via env and never logged.
+    # Drafts are excluded: review call is (re-)issued on undraft via
+    # opened/synchronize/labeled(review-ready) after ready_for_review.
+    # NOTE: GitHub Actions expressions have no toLower()/toUpper() (that is
+    # Azure Pipelines). Use an exact match on the canonical lowercase label
+    # name; `github.event.label` is absent on opened/synchronize so the
+    # comparison evaluates to null == 'review-ready' (false) without error.
+    # Case-insensitive handling of the full label list lives in the bash
+    # script below (LABELS_LOWER) and in scripts/ci/plan.py.
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true && (github.event.action == 'opened' || github.event.action == 'synchronize' || (github.event.action == 'labeled' && github.event.label.name == 'review-ready')) && github.actor != 'coderabbitai[bot]' && github.event.sender.login != 'coderabbitai[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          ACTOR: ${{ github.actor }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          # Bot-loop guard (defense in depth; `if:` already excludes bots).
+          case "$ACTOR" in
+            *"[bot]"|coderabbitai) echo "coderabbit-call: bot actor, skipping"; exit 0 ;;
+          esac
+          if [ "${IS_DRAFT:-}" = "true" ]; then
+            echo "coderabbit-call: draft PR, skipping (call on undraft)"
+            exit 0
+          fi
+          # Star check: <10 stars has a manual-call restriction, so CI posts
+          # the call automatically. >=10 behaves identically (same auto-call).
+          # Fail-open: STARS is advisory only, so an API failure must not fail
+          # the job; log and continue with the default call body.
+          if ! STARS=$(gh api "repos/${REPO}" --jq .stargazers_count 2>/tmp/stars_err.txt); then
+            echo "coderabbit-call: star lookup failed, defaulting (fail-open): $(cat /tmp/stars_err.txt)"
+            STARS=""
+          fi
+          echo "coderabbit-call: stars=${STARS} pr=${PR_NUMBER} labels=${LABELS}"
+          # Label match is case-insensitive (plan.py lowercases labels too).
+          LABELS_LOWER=$(printf '%s' "$LABELS" | tr '[:upper:]' '[:lower:]')
+          case ",${LABELS_LOWER}," in
+            *,review-ready,*) BODY="@coderabbitai full review" ;;
+            *) BODY="@coderabbitai review" ;;
+          esac
+          # Idempotency: PR body already calls, or a prior auto-call comment
+          # exists -> do not re-post (prevents spam and bot loops).
+          # Full-review aware: a prior plain `review` call must not suppress
+          # the first `full review` (review-ready) call. Only a prior full
+          # review satisfies a full-review request; a plain request is
+          # satisfied by either.
+          if [[ "$BODY" == *"full review"* ]]; then
+            REVIEW_CALL_GREPR='@coderabbitai full review'
+          else
+            REVIEW_CALL_GREPR='@coderabbitai\( full\)\? review'
+          fi
+          PR_BODY=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')
+          if printf '%s' "$PR_BODY" | grep -qi "$REVIEW_CALL_GREPR"; then
+            echo "coderabbit-call: call already in PR body, skipping"
+            exit 0
+          fi
+          if gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '.[].body' | grep -qi "$REVIEW_CALL_GREPR"; then
+            echo "coderabbit-call: prior call comment exists, skipping"
+            exit 0
+          fi
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="$BODY" --jq '.html_url' >/dev/null
+          echo "coderabbit-call: posted ${BODY}"
+
+  coderabbit-gate:
+    name: CodeRabbit review gate (fail-closed)
+    # Always runs so `required` never pends; passes trivially off-PR.
+    # Read-only job (never posts): no bot loop possible here.
+    # Exemptions (documented, no silent bypass):
+    # - non-PR events (push/main): pass, nothing to gate.
+    # - draft PRs: pass (not mergeable yet; avoids false positives).
+    # - `do-not-merge` label: pass here; `required` still fails via the
+    #   plan do_not_merge flag so merge stays blocked with one clear signal.
+    # - `hotfix`: NO exemption (review gate still applies; hotfix only
+    #   reserves a future time-gate branch point in plan.py).
+    needs: [plan]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          LABELS: ${{ github.event_name == 'pull_request' && join(github.event.pull_request.labels.*.name, ',') || '' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "coderabbit-gate: non-PR event, passing"
+            exit 0
+          fi
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "coderabbit-gate: draft PR, passing (review required before undraft)"
+            exit 0
+          fi
+          # Label match is case-insensitive (plan.py parse_labels lowercases).
+          LABELS_LOWER=$(printf '%s' "$LABELS" | tr '[:upper:]' '[:lower:]')
+          case ",${LABELS_LOWER}," in
+            *,do-not-merge,*) echo "coderabbit-gate: do-not-merge passes here; required blocks merge"; exit 0 ;;
+          esac
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""' > /tmp/pr_body.txt
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate --jq '[.[].body] | join("\n")' > /tmp/pr_comments.txt
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate --jq '[.[] | "\(.user.login)\t\(.state)\t\(.submitted_at // "")"] | join("\n")' > /tmp/pr_reviews.txt
+          python3 - <<'PY'
+          import pathlib, re, sys
+          body = pathlib.Path("/tmp/pr_body.txt").read_text(encoding="utf-8", errors="replace")
+          comments = pathlib.Path("/tmp/pr_comments.txt").read_text(encoding="utf-8", errors="replace")
+          reviews = pathlib.Path("/tmp/pr_reviews.txt").read_text(encoding="utf-8", errors="replace")
+          call = re.compile(r"@coderabbitai(\s+full)?\s+review", re.IGNORECASE)
+          if call.search(body) or call.search(comments):
+              print("coderabbit-gate: call trace (@coderabbitai review) found")
+              sys.exit(0)
+          # Intent: this gate guarantees the review was *called* (call trace)
+          # or *posted* (bot review row below). It does NOT verify review
+          # content/approval depth; requiring an APPROVED verdict is
+          # explicitly out of scope (call guarantee only, fail-closed on
+          # missing call). See ADR/docs discussion.
+          # Strict bot match + submitted-state check: substring matching
+          # (e.g. "coderabbitai-fake") would let an impersonator pass.
+          for line in reviews.splitlines():
+              if not line.strip():
+                  continue
+              parts = line.split("\t")
+              login = parts[0].strip() if len(parts) > 0 else ""
+              state = parts[1].strip().upper() if len(parts) > 1 else ""
+              if login.lower() == "coderabbitai[bot]" and state in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"):
+                  print(f"coderabbit-gate: CodeRabbit review found ({login} state={state})")
+                  sys.exit(0)
+          print("coderabbit-gate: no @coderabbitai review call and no CodeRabbit review (fail-closed)", file=sys.stderr)
+          sys.exit(1)
+          PY
+
+  required:
+    name: CI / required
+    needs: [plan, rust-linux, typescript, platform-windows, platform-macos, release-policy, tui-i18n, coderabbit-gate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          # Needs context: success/skipped/failure/cancelled per job.
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          plan = needs.get("plan", {}).get("result", "success")
+          assert plan == "success", f"plan must succeed, got {plan}"
+          # Map plan booleans to required jobs. Skipped is allowed only when
+          # the plan did not need that tier.
+          plan_outputs = json.loads(os.environ.get("PLAN_OUTPUTS_JSON", "{}"))
+          # `do-not-merge` label blocks merge inside this aggregation (no new
+          # required context; main protection keeps exactly CI / required +
+          # CI / security-required).
+          assert plan_outputs.get("do_not_merge", "false") != "true", "do-not-merge label blocks merge"
+          # Heavy tiers stay nightly/weekly/release-only: every plan must set
+          # heavy_deferred:true as machine-readable proof (see plan.py).
+          assert plan_outputs.get("heavy_deferred", "false") == "true", "heavy_deferred must be true"
+          # Hotfix branch point: no time-based (e.g. 3h) gates exist today, so
+          # hotfix:true grants no exemption here. Future time-gate exemptions,
+          # if ever added, must branch explicitly on this flag.
+          # CodeRabbit gate is aggregated here (fail-closed): no new required
+          # context is added to branch protection.
+          gate = needs.get("coderabbit-gate", {}).get("result", "missing")
+          assert gate == "success", f"coderabbit-gate required but {gate}"
+          def need(name, plan_key):
+              result = needs.get(name, {}).get("result", "missing")
+              wanted = plan_outputs.get(plan_key, "true") == "true" or plan_outputs.get("full", "false") == "true"
+              # docs-only: no tier wanted; all skips allowed.
+              if plan_outputs.get("docs_only") == "true":
+                  wanted = False
+              if wanted:
+                  assert result == "success", f"{name} required but {result}"
+              else:
+                  assert result in ("success", "skipped"), f"{name} unexpected {result} when not needed"
+          need("rust-linux", "rust")
+          need("typescript", "typescript")
+          need("platform-windows", "rust_platform_windows")
+          need("platform-macos", "rust_platform_macos")
+          need("release-policy", "release_policy")
+          need("tui-i18n", "rust")
+          print("required: all needed jobs succeeded; unneeded skips allowed")
+          PY
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          PLAN_OUTPUTS_JSON: ${{ toJson(needs.plan.outputs) }}
+
+  security-required:
+    name: CI / security-required
+    needs: [plan, security-fast]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.plan.result }}" = "success"
+          test "${{ needs.security-fast.result }}" = "success"
+          echo "security-required: fast subset succeeded"

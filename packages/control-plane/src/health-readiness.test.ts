@@ -11,6 +11,11 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import worker, { __setTestStore } from "./index.ts";
 import {
+  MCP_CATALOG_VERSION,
+  mcpCatalogRevision,
+  PUBLISHED_MCP_TOOLS,
+} from "./mcp.ts";
+import {
   MemoryStore,
   SqlStore,
   type SqlDatabase,
@@ -556,13 +561,19 @@ test("missing required column on 0003/0004 table → schema_ready:false", async 
 test("missing 0002 objects → schema_ready:false and /health/ready 503", async () => {
   // 0001 only already covers absence; also verify after 0001 the 0002 keys are false
   // while applying 0002 alone (plus 0001) makes 0002 true and later keys false.
+  // 0023 resource binding is also required: oauth_auth_codes/device_codes stay
+  // false until 0023 is applied (fail-closed on a stale schema).
   const { store } = openStoreWith([
     "0001_init.sql",
     "0002_oauth_device_enrollment.sql",
   ]);
   const readiness = await store.schemaReadiness();
   assert.equal(readiness.schema_ready, false);
-  for (const k of M0002_SCHEMA_KEYS) assert.equal(readiness.checks[k], true, k);
+  assert.equal(readiness.checks.used_refresh_tokens, true);
+  assert.equal(readiness.checks.enrollment_challenges, true);
+  assert.equal(readiness.checks.schema_migrations, true);
+  assert.equal(readiness.checks.oauth_auth_codes, false);
+  assert.equal(readiness.checks.device_codes, false);
   for (const k of P0_SCHEMA_KEYS) assert.equal(readiness.checks[k], false, k);
   for (const k of MCP_SCHEMA_KEYS) assert.equal(readiness.checks[k], false, k);
 
@@ -579,8 +590,8 @@ test("missing 0002 objects → schema_ready:false and /health/ready 503", async 
       schema_checks: Record<string, boolean>;
     };
     assert.equal(body.schema_ready, false);
-    assert.equal(body.schema_checks.oauth_auth_codes, true);
-    assert.equal(body.schema_checks.device_codes, true);
+    assert.equal(body.schema_checks.oauth_auth_codes, false);
+    assert.equal(body.schema_checks.device_codes, false);
     assert.equal(body.schema_checks.devices_status, false);
   } finally {
     __setTestStore(null);
@@ -668,6 +679,43 @@ test("missing 0006 claimed_at column → schema_ready:false", async () => {
   assert.equal(readiness.checks.mcp_approval_transactions, true);
 });
 
+test("missing 0023 resource binding → schema_ready:false", async () => {
+  // 0023 adds `resource` to oauth_tokens / oauth_auth_codes /
+  // authorize_transactions / device_codes. Without it the tables exist but
+  // the probe must fail closed (never ready=true on a stale schema).
+  const files = allMigrationFiles().filter(
+    (f) => f !== "0023_oauth_resource_binding.sql",
+  );
+  const { store } = openStoreWith(files);
+  const readiness = await store.schemaReadiness();
+  assert.equal(readiness.schema_ready, false);
+  assert.equal(readiness.checks.oauth_tokens_refresh_lifetime, false);
+  assert.equal(readiness.checks.oauth_tokens_auth_code_redemption, false);
+  assert.equal(readiness.checks.oauth_auth_codes, false);
+  assert.equal(readiness.checks.device_codes, false);
+  assert.equal(readiness.checks.authorize_transactions, false);
+
+  __setTestStore(store);
+  try {
+    const res = await worker.fetch(
+      new Request("https://cp.test/health/ready"),
+      readyEnv(),
+      ctx,
+    );
+    assert.equal(res.status, 503);
+    const body = (await res.json()) as {
+      schema_ready: boolean;
+      schema_checks: Record<string, boolean>;
+    };
+    assert.equal(body.schema_ready, false);
+    assert.equal(body.schema_checks.oauth_auth_codes, false);
+    assert.equal(body.schema_checks.device_codes, false);
+    assert.equal(body.schema_checks.authorize_transactions, false);
+  } finally {
+    __setTestStore(null);
+  }
+});
+
 test("MemoryStore and SqlStore both report full 0002–0009 readiness", async () => {
   const mem = new MemoryStore();
   const memR = await mem.schemaReadiness();
@@ -727,7 +775,7 @@ test("runtime D1 failures become sanitized retryable 503 responses", async () =>
     __setTestStore(browserStore);
     const browser = await worker.fetch(
       new Request(
-        "http://127.0.0.1/oauth/authorize?response_type=code&client_id=client_missing&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector_platform_oauth_redirect&scope=ownmesh.read&state=secret-state&code_challenge=challenge&code_challenge_method=S256",
+        "http://127.0.0.1/oauth/authorize?response_type=code&client_id=client_missing&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector_platform_oauth_redirect&scope=ownmesh.read&state=secret-state&code_challenge=challenge&code_challenge_method=S256&resource=http%3A%2F%2F127.0.0.1%2Fmcp",
         {
         headers: { accept: "text/html" },
         },
@@ -747,4 +795,19 @@ test("runtime D1 failures become sanitized retryable 503 responses", async () =>
     __setTestStore(null);
     console.error = originalConsoleError;
   }
+});
+
+test("#158: /health mcp_catalog self-consistency (health自己整合性)", async () => {
+  const res = await worker.fetch(new Request("https://cp.test/health"), readyEnv(), ctx);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    mcp_catalog?: { revision?: unknown; version?: unknown; tools?: unknown };
+  };
+  assert.ok(body.mcp_catalog, "/health must include mcp_catalog");
+  // Baseline-pinned compat major: single type+value check (no duplicate assert).
+  // Cross-surface discovery comparison lives in mcp.test.ts
+  // ("MCP publishes one comparable catalog generation across every surface").
+  assert.ok(typeof body.mcp_catalog?.version === "number" && body.mcp_catalog?.version === MCP_CATALOG_VERSION);
+  assert.equal(body.mcp_catalog?.tools, PUBLISHED_MCP_TOOLS.length);
+  assert.equal(body.mcp_catalog?.revision, await mcpCatalogRevision());
 });

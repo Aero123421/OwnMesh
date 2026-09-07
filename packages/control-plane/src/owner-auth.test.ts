@@ -552,6 +552,7 @@ test("ChatGPT OAuth redirects to passkey login then accepts an owner session", a
     authorize.searchParams.set("code_challenge_method", "S256");
     authorize.searchParams.set("scope", "ownmesh.read offline_access");
     authorize.searchParams.set("state", "state_1");
+    authorize.searchParams.set("resource", `${ISSUER}/mcp`);
 
     const unauthenticated = await worker.fetch(new Request(authorize), authEnv, ctx);
     assert.equal(unauthenticated.status, 302);

@@ -1,10 +1,17 @@
 name: E2E loopback (nightly)
 
-# The real-binary × local workerd suites exercise the agent → control-plane →
+# Real-binary × local workerd suites exercise the agent → control-plane →
 # device path that unit tests stub out. They are slower and depend on workerd
-# starting locally, so they run on a schedule and on demand rather than gating
-# pull requests or releases. A failure here is a signal to investigate, not a
-# blocked merge.
+# starting locally, so they run on a schedule and on demand rather than as a
+# PR merge gate. A failure here is not a merge gate, but a blocking signal
+# that requires triage (see the triage job below and docs/ci-test-tiers.md
+# "Nightly/weekly ownership"); "PR passed so ignore" is forbidden.
+#
+# Responsibility boundary vs scale.yml (Issue #230):
+# - this workflow: multi-process E2E with real binaries + local workerd.
+# - scale.yml: production-boundary scale/soak (large FS/output/concurrency).
+# Release candidate E2E (release.yml) reuses exact packaged binaries via
+# OWNMESH_E2E_ARTIFACT_DIR and never rebuilds the workspace inside the job.
 
 on:
   schedule:
@@ -52,7 +59,41 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: E1 + E2/E3 workerd loopback suite
+        timeout-minutes: 30
         run: python scripts/tests/run_e2e_loopback_tests.py
 
       - name: E9 resumable transfer loopback
+        timeout-minutes: 20
         run: python scripts/tests/test_e9_workerd_transfer.py
+
+  # Failure triage is notification-only (no secrets, no issue write).
+  # On failure it publishes owner/due/Issue-template to the step summary
+  # and exposes them as job outputs for branch protection / dashboards.
+  # See docs/ci-test-tiers.md "Nightly/weekly ownership".
+  triage:
+    name: E2E failure triage (blocking signal)
+    needs: [workerd-loopback]
+    if: failure()
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.triage.outputs.owner }}
+      due: ${{ steps.triage.outputs.due }}
+      issue_title: ${{ steps.triage.outputs.issue_title }}
+    steps:
+      - id: triage
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'owner=@Aero123421' >> "$GITHUB_OUTPUT"
+          echo 'due=triage within 1 business day' >> "$GITHUB_OUTPUT"
+          echo 'issue_title=[e2e-loopback] nightly failure needs triage' >> "$GITHUB_OUTPUT"
+          {
+            echo "## E2E loopback failure triage (blocking, owner required)"
+            echo ""
+            echo "- Owner: @Aero123421 (per .github/CODEOWNERS; docs/ci-test-tiers.md nightly/weekly ownership)"
+            echo "- Due: triage within 1 business day; file an Issue before any retry or quarantine"
+            echo "- Issue template: title \`[e2e-loopback] <date> failure\`, body links this run URL"
+            echo "- Issue fields: owner, expiry (for quarantine only), nightly execution required"
+            echo "- Quarantine: prohibited by default; never applies to security/release gates"
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"

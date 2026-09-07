@@ -205,24 +205,22 @@ class CheckerMutationTests(unittest.TestCase):
 
     def test_mutation_unix_installer_gate_fails(self) -> None:
         def mutate(text: str) -> str:
-            needle = "python scripts/tests/test_installers.py"
-            first = text.find(needle)
-            second = text.find(needle, first + len(needle))
-            self.assertGreaterEqual(second, 0)
-            return (
-                text[:second]
-                + 'echo "installer integration skipped"'
-                + text[second + len(needle):]
+            needle = "scripts/tests/test_installers.py"
+            self.assertIn(needle, text)
+            return text.replace(
+                needle,
+                "scripts/tests/test_installers_SKIPPED.py",
+                1,
             )
 
-        with _Mutation(".github/workflows/ci.yml", mutate):
+        with _Mutation("scripts/ci/suites.toml", mutate):
             _must_fail("Unix installer integration removed")
 
     def test_mutation_continue_on_error_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "run: cargo test --workspace --all-targets --locked",
-                "continue-on-error: true\n        run: cargo test --workspace --all-targets --locked",
+                "run: python3 scripts/ci/run.py rust-linux",
+                "continue-on-error: true\n        run: python3 scripts/ci/run.py rust-linux",
                 1,
             )
 
@@ -232,29 +230,82 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_or_true_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "run: cargo fmt --all --check",
-                "run: cargo fmt --all --check || true",
+                "run: python3 scripts/ci/run.py rust-linux",
+                "run: python3 scripts/ci/run.py rust-linux || true",
                 1,
             )
 
         with _Mutation(".github/workflows/ci.yml", mutate):
             _must_fail("|| true")
 
-    # --- release graph ---------------------------------------------------
+    # --- release graph (exact-SHA eligibility, ADR 0022) ---
     def test_mutation_publish_always_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "needs: [ci-gate, security-gate, build, release-candidate-e2e, distribution-metadata]",
-                "needs: [ci-gate, security-gate, build, release-candidate-e2e, distribution-metadata]\n    if: always()",
+                "needs: [release-eligibility, release-gate-integrity, build, sbom-release, release-candidate-e2e, release-policy-final, distribution-metadata]",
+                "needs: [release-eligibility, release-gate-integrity, build, sbom-release, release-candidate-e2e, release-policy-final, distribution-metadata]\n    if: always()",
                 1,
             )
 
         with _Mutation(".github/workflows/release.yml", mutate):
             _must_fail("publish if: always()")
 
+    def test_mutation_reusable_ci_gate_reintroduced_fails(self) -> None:
+        def mutate(text: str) -> str:
+            return text.replace(
+                "  release-eligibility:",
+                "  ci-gate:\n    uses: ./.github/workflows/ci.yml\n\n  release-eligibility:",
+                1,
+            )
+
+        with _Mutation(".github/workflows/release.yml", mutate):
+            _must_fail("reusable CI re-run")
+
+    def test_mutation_eligibility_bypass_fails(self) -> None:
+        def mutate(text: str) -> str:
+            # Remove every eligibility edge (including the checked build job);
+            # mutating only the unchecked triage job would not prove the gate.
+            return text.replace(
+                "needs: [release-eligibility]",
+                "needs: []",
+            )
+
+        with _Mutation(".github/workflows/release.yml", mutate):
+            _must_fail("eligibility bypass")
+
+    def test_mutation_windows_full_test_reintroduced_fails(self) -> None:
+        def mutate(text: str) -> str:
+            return text.replace(
+                "cargo check --workspace --all-targets --locked",
+                "cargo test --workspace --all-targets --locked",
+                1,
+            )
+
+        with _Mutation("scripts/ci/suites.toml", mutate):
+            _must_fail("Windows full test reintroduced")
+
+    def test_mutation_scale_unignored_fails(self) -> None:
+        def mutate(text: str) -> str:
+            return text.replace(
+                '#[ignore = "scale:',
+                '#[test] // scale:',
+                1,
+            )
+
+        with _Mutation("crates/ownmesh-fs/tests/scale_directory.rs", mutate):
+            _must_fail("scale un-ignored")
+
     def test_mutation_checkout_credentials_fails(self) -> None:
         def mutate(text: str) -> str:
-            return text.replace("          persist-credentials: false\n", "", 1)
+            # Remove persist-credentials from the build job (counted set).
+            anchor = "  build:\n    name: Release build"
+            idx = text.find(anchor)
+            self.assertGreaterEqual(idx, 0)
+            tail = text[idx:]
+            needle = "          persist-credentials: false\n"
+            pos = tail.find(needle)
+            self.assertGreaterEqual(pos, 0)
+            return text[: idx + pos] + text[idx + pos + len(needle):]
 
         with _Mutation(".github/workflows/release.yml", mutate):
             _must_fail("checkout credentials persistence")
@@ -273,8 +324,12 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_secrets_inherit_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "uses: ./.github/workflows/security.yml",
-                "uses: ./.github/workflows/security.yml\n    secrets: inherit",
+                "secrets: inherit",
+                "secrets: inherit # probe",
+                1,
+            ) if "secrets: inherit" in text else text.replace(
+                "  release-eligibility:",
+                "  release-eligibility:\n    secrets: inherit",
                 1,
             )
 
@@ -283,15 +338,16 @@ class CheckerMutationTests(unittest.TestCase):
 
     def test_mutation_ci_gate_inline_steps_fails(self) -> None:
         def mutate(text: str) -> str:
-            # break reusable-workflow-only contract
+            # Eligibility must remain a steps job; replacing it with a reusable
+            # call reintroduces the old duplicate-CI trust model.
             return text.replace(
-                "uses: ./.github/workflows/ci.yml",
-                "runs-on: ubuntu-latest\n    steps:\n      - run: echo hi",
+                "scripts/ci/release_eligibility.py",
+                "./.github/workflows/ci.yml",
                 1,
             )
 
         with _Mutation(".github/workflows/release.yml", mutate):
-            _must_fail("ci-gate inline steps")
+            _must_fail("eligibility replaced by reusable CI")
 
     # --- surface registry ------------------------------------------------
     def test_mutation_surface_count_fails(self) -> None:
@@ -380,11 +436,11 @@ class CheckerMutationTests(unittest.TestCase):
 
     def test_mutation_security_events_on_sbom_fails(self) -> None:
         def mutate(text: str) -> str:
-            # give sbom job security-events:write (forbidden)
-            old = "  sbom:\n    name:"
-            new = "  sbom:\n    permissions:\n      security-events: write\n    name:"
+            # give sbom-weekly job security-events:write (forbidden)
+            old = "  sbom-weekly:\n    name:"
+            new = "  sbom-weekly:\n    permissions:\n      security-events: write\n    name:"
             if old not in text:
-                raise AssertionError("sbom job anchor not found")
+                raise AssertionError("sbom-weekly job anchor not found")
             return text.replace(old, new, 1)
 
         with _Mutation(".github/workflows/security.yml", mutate):
@@ -398,12 +454,58 @@ class CheckerMutationTests(unittest.TestCase):
         with _Mutation("crates/ownmesh/src/commands/privileged.rs", mutate):
             _must_fail("broker fallback_install")
 
+    # --- label-driven CI / CodeRabbit gate ---------------------------------
+    def test_mutation_coderabbit_gate_removed_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = "tui-i18n, coderabbit-gate]"
+            self.assertIn(needle, text)
+            return text.replace(needle, "tui-i18n]", 1)
+
+        with _Mutation(".github/workflows/ci.yml", mutate):
+            _must_fail("coderabbit-gate removed from required")
+
+    def test_mutation_label_branch_broken_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = "def parse_labels(raw"
+            self.assertIn(needle, text)
+            return text.replace(needle, "def broken_branch(raw", 1)
+
+        with _Mutation("scripts/ci/plan.py", mutate):
+            _must_fail("plan label branch removed")
+
+    def test_mutation_coderabbit_permission_escalation_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = "pull-requests: write"
+            self.assertIn(needle, text)
+            return text.replace(needle, "contents: write", 1)
+
+        with _Mutation(".github/workflows/ci.yml", mutate):
+            _must_fail("coderabbit-call permission escalation")
+
     def test_mutation_exec_local_fallback_ad_fails(self) -> None:
         def mutate(text: str) -> str:
             return text + '\n// probe "using local daemon"\n'
 
         with _Mutation("crates/ownmesh/src/commands/exec.rs", mutate):
             _must_fail("exec local daemon ad")
+
+    def test_mutation_missing_suite_section_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = "[platform-windows]"
+            self.assertIn(needle, text)
+            return text.replace(needle, "[platform-windows-removed]", 1)
+
+        with _Mutation("scripts/ci/suites.toml", mutate):
+            _must_fail("missing platform-windows suite section")
+
+    def test_mutation_typescript_typecheck_removed_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = '  "pnpm -r typecheck",\n'
+            self.assertIn(needle, text)
+            return text.replace(needle, "", 1)
+
+        with _Mutation("scripts/ci/suites.toml", mutate):
+            _must_fail("typescript typecheck removed")
 
 
 if __name__ == "__main__":

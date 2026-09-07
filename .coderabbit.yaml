@@ -1,0 +1,90 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: ja-JP
+tone_instructions: "簡潔・具体的・影響と修正方向つき。好み指摘禁止。"
+
+reviews:
+  profile: chill
+  # Single merge blocker is CI's coderabbit-gate (checks the @coderabbitai
+  # call trace or a posted CodeRabbit review). CodeRabbit's own
+  # request-changes stays advisory (false) so there is exactly one gate and
+  # no dual-blocking confusion. Set to true only if the team decides
+  # CodeRabbit findings must block independently of CI.
+  request_changes_workflow: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+
+  path_filters:
+    - "!**/target/**"
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/coverage/**"
+    - "!**/vendor/**"
+    - "!**/generated/**"
+
+  path_instructions:
+    - path: "**"
+      instructions: |
+        正しさ・セキュリティ・回帰・信頼性・データ整合性・互換性・テスト不足・具体的な保守低下を優先する。
+        formattingのみをblockにしない。
+    - path: "packages/control-plane/src/**"
+      instructions: |
+        OAuth/MCP・認可・exact action binding・冪等・リプレイ保護・fail-closed、D1/DO永続化・race・partial failureを重点確認する。
+    - path: "crates/ownmesh-policy/**"
+      instructions: |
+        Security boundaryとして扱い、認可・権限昇格・token/session・入力検証・secret露出を重点確認する。
+    - path: "crates/ownmesh-ipc/**"
+      instructions: |
+        Security boundaryとして扱い、認可・権限昇格・token/session・入力検証・secret露出を重点確認する。
+    - path: "crates/ownmesh-identity/**"
+      instructions: |
+        Security boundaryとして扱い、認可・権限昇格・token/session・入力検証・secret露出を重点確認する。
+    - path: "crates/ownmesh-broker/**"
+      instructions: |
+        Security boundaryとして扱い、認可・権限昇格・token/session・入力検証・secret露出を重点確認する。
+    - path: "crates/ownmesh-protocol/**"
+      instructions: |
+        Security boundaryとして扱い、認可・権限昇格・token/session・入力検証・secret露出を重点確認する。
+    - path: "packages/control-plane/migrations/**"
+      instructions: |
+        既存データ互換・data loss・transaction・rollback・再実行・partial failureを重点確認する。
+    - path: "crates/ownmesh-fs/**"
+      instructions: |
+        filesystem custody・権限・atomicity・partial write・path traversalを重点確認する。
+    - path: "crates/ownmesh-exec/**"
+      instructions: |
+        filesystem custody・権限・atomicity・partial write・path traversalを重点確認する。
+    - path: "crates/ownmesh-transfer/**"
+      instructions: |
+        filesystem custody・権限・atomicity・partial write・path traversalを重点確認する。
+    - path: "crates/ownmesh-persist/**"
+      instructions: |
+        filesystem custody・権限・atomicity・partial write・path traversalを重点確認する。
+    - path: "release/**"
+      instructions: |
+        署名・SBOM・provenance・checksum・release gateの欠落・緩和を重点確認する。mandatory gate化は別途Rulesetで行う。
+    - path: "scripts/**"
+      instructions: |
+        署名・SBOM・provenance・checksum・release gateの欠落・緩和を重点確認する。mandatory gate化は別途Rulesetで行う。
+    - path: "packaging/**"
+      instructions: |
+        署名・SBOM・provenance・checksum・release gateの欠落・緩和を重点確認する。mandatory gate化は別途Rulesetで行う。
+    - path: "installers/**"
+      instructions: |
+        署名・SBOM・provenance・checksum・release gateの欠落・緩和を重点確認する。mandatory gate化は別途Rulesetで行う。
+    - path: ".github/workflows/**"
+      instructions: |
+        署名・SBOM・provenance・checksum・release gateの欠落・緩和を重点確認する。mandatory gate化は別途Rulesetで行う。
+
+  pre_merge_checks:
+    title:
+      mode: warning
+      requirements: "変更内容が分かる簡潔なタイトルにする。"
+    description:
+      mode: warning
+      requirements: "変更内容・影響・検証が分かる説明にする。"
+    issue_assessment:
+      mode: warning

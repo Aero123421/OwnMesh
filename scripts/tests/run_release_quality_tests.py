@@ -1,54 +1,42 @@
 #!/usr/bin/env python3
-"""Runner for release-quality checker unit + mutation tests.
+"""Checker mutation suite only (Issue #230 Phase 3).
 
-Invoked from CI (release-truthfulness job) and locally via:
+Responsibility split (no glob rediscovery):
+- `python scripts/tests/test_installers.py` runs installer integration once.
+- `python scripts/check_release_quality.py` runs the live checker once.
+- This runner runs ONLY the checker unit/mutation tests
+  (`test_mutations.py`, `test_action_pins.py`, `test_release_evidence.py`).
+
+Invoked from CI (release-policy job) and locally via:
 
     python scripts/tests/run_release_quality_tests.py
 """
 
 from __future__ import annotations
 
-import subprocess
 import sys
 import unittest
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
-ROOT = TESTS_DIR.parents[1]
-CHECKER = ROOT / "scripts" / "check_release_quality.py"
 
 
 def main() -> int:
-    failures = 0
-
-    # 1. Live repository must satisfy the checker.
-    print("==> check_release_quality (live repo)")
-    live = subprocess.run(
-        [sys.executable, str(CHECKER)],
-        cwd=str(ROOT),
-        check=False,
-    )
-    if live.returncode != 0:
-        print("FAIL: live checker", file=sys.stderr)
-        failures += 1
-    else:
-        print("PASS: live checker")
-
-    # 2. Fixture + mutation tests under scripts/tests/.
-    print("==> unittest discover scripts/tests")
+    print("==> checker mutation suite only (no installer/checker rediscovery)")
     loader = unittest.TestLoader()
-    suite = loader.discover(str(TESTS_DIR), pattern="test_*.py")
+    suite = unittest.TestSuite()
+    # Explicit module list: never glob-discover installer/E2E tests here.
+    for module in ("test_mutations", "test_action_pins", "test_release_evidence"):
+        try:
+            suite.addTests(loader.loadTestsFromName(module))
+        except Exception as exc:  # fail-closed
+            print(f"FAIL: cannot load {module}: {exc}", file=sys.stderr)
+            return 1
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
-        print("FAIL: unittest discover", file=sys.stderr)
-        failures += 1
-    else:
-        print("PASS: unittest discover")
-
-    if failures:
-        print(f"release-quality test runner failed ({failures} step(s))", file=sys.stderr)
+        print("FAIL: checker mutation suite", file=sys.stderr)
         return 1
-    print("release-quality test runner passed")
+    print("release-quality mutation suite passed")
     return 0
 
 

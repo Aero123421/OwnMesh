@@ -41,10 +41,12 @@ import {
   MCP_SYNC_WAIT_MS,
   MCP_TOOLS,
   mcpCatalogRevision,
+  MCP_CATALOG_VERSION,
   parseMcpMaxTimeoutMs,
   PUBLISHED_MCP_TOOLS,
 } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
+import { isRetryableStorageError } from "./d1-errors.ts";
 import { createOperationStoreResolver } from "./operation-store.ts";
 import { checkBudget } from "./quota-guard.ts";
 import {
@@ -629,6 +631,7 @@ async function handleFetch(
         // an operator can compare a client snapshot without a bearer token.
         mcp_catalog: {
           revision: await mcpCatalogRevision(),
+          version: MCP_CATALOG_VERSION,
           tools: PUBLISHED_MCP_TOOLS.length,
         },
       });
@@ -790,7 +793,7 @@ async function handleFetch(
       return handleAuthorize(authRequest, store, issuer, { principal: principal || undefined, allowDevBypass: bypass }, { budget: await checkBudget(store, env) });
     }
     if (url.pathname === "/oauth/token" && request.method === "POST") {
-      return handleToken(request, store, { budget: await checkBudget(store, env) });
+      return handleToken(request, store, { budget: await checkBudget(store, env), issuer });
     }
     if (url.pathname === "/oauth/revoke" && request.method === "POST") {
       return handleRevoke(request, store);
@@ -1087,13 +1090,22 @@ async function handleFetch(
 }
 
 function isD1UnavailableError(error: unknown): boolean {
+  // SHOULD-1: delegate storage identity to the centralized predicate (no bare
+  // timeout/quota substrings; constraint/invalid/unknown stay fail-closed and
+  // rethrow). MissingD1Error is kept here because it is a binding-missing
+  // configuration error, not a classified D1 message, yet the public
+  // readiness contract still reports it as 503 storage_unavailable.
   if (error instanceof MissingD1Error) return true;
-  const name = error instanceof Error ? error.name : "";
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return /D1(?:Database)?Error/i.test(name) || /\bD1_ERROR\b|\bD1 database\b/i.test(message);
+  return isRetryableStorageError(error);
 }
 
 function storageUnavailableResponse(request: Request): Response {
+  // SHOULD-3 note: this generic fallback keeps a fixed 60s hint and no
+  // reset_at on purpose. It covers every route without a budget context
+  // (REST, HTML browser flows, device REST); precise budget-reset Retry-After
+  // lives in the OAuth/MCP degraded envelopes (oauth.ts/mcp.ts via
+  // retryAfterSecondsForReset). Unifying here would either invent a reset_at
+  // this shape has no field for or couple generic HTML to D1 budget internals.
   const pathname = new URL(request.url).pathname;
   const headers = {
     "cache-control": "no-store",

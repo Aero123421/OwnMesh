@@ -40,6 +40,12 @@ function messageOf(error: unknown): string {
  * Patterns are intentionally generic: D1 surfaces quota/busy errors with
  * evolving text, so an unrecognized message falls through to `unknown`
  * (fail-closed) instead of being misreported.
+ *
+ * Bare-word guards (Issue #227 SHOULD): never match lone `quota` / `timeout`
+ * substrings — validation messages, option names (`timeout_ms`), or user
+ * content can contain those words without any storage failure. Only compound
+ * storage phrases (e.g. `quota exceeded`, `timed out`, `database timeout`)
+ * classify; anything else stays `unknown` and callers rethrow fail-closed.
  */
 export function classifyD1Error(error: unknown): D1ErrorCategory {
   const message = messageOf(error).toLowerCase();
@@ -48,7 +54,11 @@ export function classifyD1Error(error: unknown): D1ErrorCategory {
     message.includes("row limit") ||
     message.includes("daily limit") ||
     message.includes("limit exceeded") ||
-    message.includes("quota") ||
+    message.includes("quota exceeded") ||
+    message.includes("quota exhausted") ||
+    message.includes("quota limit") ||
+    message.includes("exceeds quota") ||
+    message.includes("over quota") ||
     message.includes("too many writes")
   ) {
     return "quota_exceeded";
@@ -58,8 +68,14 @@ export function classifyD1Error(error: unknown): D1ErrorCategory {
     message.includes("database is locked") ||
     message.includes("database table is locked") ||
     message.includes("database is busy") ||
-    message.includes("timed out") ||
-    message.includes("timeout") ||
+    // Word-boundary timeout phrases only: `\b` prevents `timeout_ms` option
+    // names or validation text (`request timeout_ms invalid`) from
+    // misclassifying as a storage outage. Bare `timeout` is never matched.
+    /\btimed out\b/.test(message) ||
+    /\bdatabase timeout\b/.test(message) ||
+    /\bquery timeout\b/.test(message) ||
+    /\bstatement timeout\b/.test(message) ||
+    /\brequest timeout\b/.test(message) ||
     message.includes("temporarily unavailable") ||
     message.includes("service unavailable") ||
     message.includes("econnreset") ||
@@ -95,5 +111,53 @@ export function classifyD1Error(error: unknown): D1ErrorCategory {
   ) {
     return "invalid_query";
   }
+  // Generic D1 identity fallback: a bare `D1_ERROR` / `D1DatabaseError` /
+  // `D1 database` prefix without a more specific phrase above is a transient
+  // outage (e.g. `D1_ERROR: database unavailable` in fault-injection tests).
+  // Placed after constraint/invalid_query so a D1-wrapped logic bug (e.g.
+  // `D1_ERROR: UNIQUE constraint failed`) still classifies precisely.
+  if (
+    message.includes("d1_error") ||
+    message.includes("d1databaseerror") ||
+    message.includes("d1 database")
+  ) {
+    return "transient_unavailable";
+  }
   return "unknown";
+}
+
+/**
+ * Issue #227 SHOULD-1: single retryable-storage predicate.
+ *
+ * Retryable means the operation may succeed after the D1 daily-budget reset
+ * without credential rotation: `quota_exceeded` / `transient_unavailable` /
+ * `schema_missing`. `constraint_conflict` and `invalid_query` are caller bugs
+ * (never retryable), and `unknown` stays fail-closed (rethrow, never 503).
+ * All OAuth/MCP/index storage guards must use this instead of ad-hoc
+ * `timeout`/`quota` substring regexes.
+ */
+export function isRetryableStorageError(error: unknown): boolean {
+  const category = classifyD1Error(error);
+  return (
+    category === "quota_exceeded" ||
+    category === "transient_unavailable" ||
+    category === "schema_missing"
+  );
+}
+
+/**
+ * Issue #227 SHOULD-5: single reason classifier for degraded 503 envelopes.
+ * OAuth and MCP share the reason vocabulary; only the fallthrough differs
+ * because the transports differ (OAuth REST `temporarily_unavailable` vs
+ * MCP JSON-RPC `operation_store_unavailable`). Envelope shapes stay separate
+ * (see oauth.ts `oauthUnavailableEnvelope`, mcp.ts `mcpUnavailableData`).
+ */
+export function storageUnavailableReason(
+  category: D1ErrorCategory,
+  surface: "oauth" | "mcp",
+): string {
+  if (category === "quota_exceeded") return "d1_write_quota_exceeded";
+  if (category === "transient_unavailable") return "d1_unavailable";
+  if (category === "schema_missing") return "schema_not_ready";
+  return surface === "mcp" ? "operation_store_unavailable" : "oauth_temporarily_unavailable";
 }

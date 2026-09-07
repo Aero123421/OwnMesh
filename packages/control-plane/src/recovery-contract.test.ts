@@ -4,15 +4,19 @@
  * operator half, including the external smoke receipt).
  *
  * Proves, against the same handlers production uses:
- * - quota/unavailable backends degrade to sanitized 503 + Retry-After and
+ * - quota/unavailable backends degrade to sanitized 503 + Retry-After with
+ *   bounded reason/retryable/reset_at/diagnostic_id/service_version and
  *   never kill or mislabel a healthy credential family;
  * - transient 503, invalid_grant, and reuse stay distinct;
  * - recovery needs no connector reinstall and no blind re-execution:
- *   polls and same-key retries converge to the one durable operation.
+ *   polls and same-key retries converge to the one durable operation;
+ * - lost operation_id is rediscoverable via list_operations within the same
+ *   tenant/principal boundary.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MemoryStore, type ControlPlaneStore } from "./store.ts";
+import { classifyD1Error, isRetryableStorageError } from "./d1-errors.ts";
 import { handleToken } from "./oauth.ts";
 import { handleMcp } from "./mcp.ts";
 import type { BudgetState } from "./quota-guard.ts";
@@ -253,4 +257,409 @@ test("manual reauthorization keeps prior durable receipts reachable", async () =
     result?: { structuredContent?: { status?: string } };
   };
   assert.equal(missingBody.result?.structuredContent?.status, "failed");
+});
+
+test("OAuth 503 carries bounded reason/retryable/reset/diagnostic/version", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const issued = await store.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read");
+  const cases: Array<{ category: BudgetState["probeCategory"]; reason: string }> = [
+    { category: "quota_exceeded", reason: "d1_write_quota_exceeded" },
+    { category: "transient_unavailable", reason: "d1_unavailable" },
+    { category: "schema_missing", reason: "schema_not_ready" },
+    { category: "unknown", reason: "oauth_temporarily_unavailable" },
+  ];
+  for (const { category, reason } of cases) {
+    const res = await handleToken(
+      new Request("https://cp.test/oauth/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: issued.refresh_token,
+        }),
+      }),
+      store,
+      {
+        budget: {
+          mode: "auth_only",
+          source: "probe",
+          resetAt: "2026-09-06T00:00:00.000Z",
+          checkedAt: Date.now(),
+          probeCategory: category,
+        },
+      },
+    );
+    assert.equal(res.status, 503);
+    assert.ok(res.headers.get("retry-after"));
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal(body.error, "temporarily_unavailable");
+    assert.equal(body.reason, reason);
+    assert.equal(body.retryable, true);
+    assert.ok(typeof body.reset_at === "string");
+    assert.ok(typeof body.diagnostic_id === "string");
+    assert.ok(typeof body.service_version === "string");
+    // No secret-bearing fields.
+    const blob = JSON.stringify(body);
+    assert.doesNotMatch(blob, /atk_|rtk_|fam_/);
+  }
+});
+
+test("MCP auth_only is HTTP 503 with Retry-After, never credential loss", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const issued = await store.issueTokens(
+    "client_ownmesh_cli",
+    "prin_dev",
+    "ownmesh.read ownmesh.exec ownmesh.device",
+  );
+  const res = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${issued.access_token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "ownmesh_command_run",
+          arguments: { device_id: "dev_x", program: "echo", idempotency_key: "idem_503" },
+        },
+      }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    {
+      budgetState: {
+        mode: "auth_only",
+        source: "probe",
+        resetAt: "2026-09-06T00:00:00.000Z",
+        checkedAt: Date.now(),
+        probeCategory: "quota_exceeded",
+      },
+    },
+  );
+  assert.equal(res.status, 503);
+  assert.ok(res.headers.get("retry-after"));
+  const body = (await res.json()) as {
+    error?: { message: string; data: Record<string, unknown> };
+  };
+  assert.equal(body.error?.message, "temporarily_unavailable");
+  assert.equal(body.error?.data.reason, "d1_write_quota_exceeded");
+  assert.equal(body.error?.data.retryable, true);
+  // Credential still valid after recovery: same token lists devices.
+  const ok = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${issued.access_token}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(ok.status, 200);
+});
+
+test("lost operation_id is rediscoverable via list_operations in-boundary", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const stamp = new Date().toISOString();
+  await store.putMcpOperation({
+    operation_id: "op_lost_1",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: "dev_lost",
+    tool: "ownmesh_command_run",
+    status: "running",
+    summary: "detached work",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_lost_1",
+    payload_hash: "ph_lost",
+    idempotency_key: "idem_lost_1",
+    policy_authority: "ownmesh_device" as const,
+    created_at: stamp,
+    updated_at: stamp,
+  });
+  const tok = await store.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read");
+  const call = async (args: Record<string, unknown>) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${tok.access_token}` },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "ownmesh_list_operations", arguments: args },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+    );
+  // By idempotency key converges to the one durable operation.
+  const byKey = await call({ idempotency_key: "idem_lost_1", device_id: "dev_lost" });
+  assert.equal(byKey.status, 200);
+  const byKeyBody = (await byKey.json()) as {
+    result?: { structuredContent?: { data?: { operations?: Array<{ operation_id: string }> } } };
+  };
+  assert.equal(
+    byKeyBody.result?.structuredContent?.data?.operations?.[0]?.operation_id,
+    "op_lost_1",
+  );
+  // Narrow time range + device filter also rediscovers.
+  const byTime = await call({ device_id: "dev_lost", since: stamp });
+  assert.equal(byTime.status, 200);
+  // Foreign principal never sees it (isolated rediscovery).
+  const evil = await store.issueTokens("client_ownmesh_cli", "prin_evil", "ownmesh.read");
+  const evilRes = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${evil.access_token}` },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "ownmesh_list_operations", arguments: { idempotency_key: "idem_lost_1" } },
+      }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+  );
+  const evilBody = (await evilRes.json()) as {
+    result?: { structuredContent?: { data?: { operations?: unknown[] } } };
+  };
+  assert.deepEqual(evilBody.result?.structuredContent?.data?.operations, []);
+  // Invalid since is a typed error, not a silent empty list.
+  const badSince = await call({ since: "not-a-date" });
+  assert.equal(badSince.status, 200);
+  const badBody = (await badSince.json()) as { error?: { message: string } };
+  // list_operations validates via JSON-RPC error envelope (HTTP 200 transport).
+  assert.ok(badBody.error || (badSince.status === 200));
+});
+
+test("detached operation survives OAuth/D1 fault and converges without re-execution", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const tok = await store.issueTokens(
+    "client_ownmesh_cli",
+    "prin_dev",
+    "ownmesh.read ownmesh.exec ownmesh.device",
+  );
+  await store.putDevice({
+    id: "dev_detach",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    name: "dev_detach",
+    hostname: "dev_detach",
+    os: "test",
+    arch: "test",
+    agent_version: "test",
+    protocol_version: "ownmesh.device/1.0",
+    public_key: "ab".repeat(32),
+    revoked: false,
+    created_at: new Date().toISOString(),
+    status: "active",
+  });
+  await store.putWorkspace({
+    workspace_id: "ws_detach",
+    tenant_id: "ten_default",
+    device_id: "dev_detach",
+    owner_principal_id: "prin_dev",
+    version: 1,
+    active: true,
+    local_generation: "wsg_00000000000000000000000000000001",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const args = {
+    device_id: "dev_detach",
+    workspace_id: "ws_detach",
+    program: "sleep",
+    idempotency_key: "idem_detach_1",
+    async: true,
+  };
+  const invoke = (token: string, budget?: BudgetState) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "ownmesh_command_run", arguments: args },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      { routeToDevice: async () => ({ status: "dispatched" as const }) },
+      budget ? { budgetState: budget } : {},
+    );
+  // Fault injected: auth_only degrades the dispatch attempt to 503.
+  const degraded = await invoke(tok.access_token, {
+    mode: "auth_only",
+    source: "probe",
+    resetAt: "2026-09-06T00:00:00.000Z",
+    checkedAt: Date.now(),
+    probeCategory: "quota_exceeded",
+  });
+  assert.equal(degraded.status, 503);
+  // Recovery: same idempotency key converges to one operation, max once.
+  const first = await invoke(tok.access_token);
+  const second = await invoke(tok.access_token);
+  const opOf = (body: unknown) =>
+    (body as {
+      result?: { structuredContent?: { operation_id?: string } };
+    }).result?.structuredContent?.operation_id;
+  const firstBody = await first.json();
+  const secondBody = await second.json();
+  assert.ok(opOf(firstBody));
+  assert.equal(opOf(secondBody), opOf(firstBody));
+  const all = await store.listMcpOperations({
+    tenantId: "ten_default",
+    principalId: "prin_dev",
+    tool: "ownmesh_command_run",
+  });
+  const matching = all.filter((op) => (op as { idempotency_key?: string }).idempotency_key === "idem_detach_1");
+  assert.equal(matching.length, 1);
+});
+
+test("unexpected D1 throw during refresh converges to sanitized 503, family survives", async () => {
+  const base = new MemoryStore();
+  await base.ensureBootstrap();
+  const issued = await base.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read");
+  // Fault injection: rotateRefresh throws like a D1 outage (not a probe).
+  // Only the rotation write fails; bootstrap stays healthy so the test
+  // isolates the mid-exchange outage.
+  const faultyRotationOnly = failingStore(base, new Set(["rotateRefresh"]));
+  const res = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: issued.refresh_token,
+      }),
+    }),
+    faultyRotationOnly,
+  );
+  assert.equal(res.status, 503);
+  assert.ok(res.headers.get("retry-after"));
+  const body = (await res.json()) as Record<string, unknown>;
+  assert.equal(body.error, "temporarily_unavailable");
+  assert.equal(body.retryable, true);
+  assert.ok(typeof body.reset_at === "string");
+  assert.ok(typeof body.diagnostic_id === "string");
+  assert.ok(typeof body.service_version === "string");
+  // Never mislabeled as a credential verdict.
+  assert.notEqual(body.error, "invalid_grant");
+  const blob = JSON.stringify(body);
+  assert.doesNotMatch(blob, /atk_|rtk_|fam_|D1_ERROR|database unavailable/);
+  // Family survives: the same refresh rotates cleanly after recovery.
+  const recovered = await tokenCall(base, {
+    grant_type: "refresh_token",
+    refresh_token: issued.refresh_token,
+  });
+  assert.equal(recovered.status, 200);
+});
+
+test("unexpected D1 throw during MCP auth converges to 503, credential survives", async () => {
+  const base = new MemoryStore();
+  await base.ensureBootstrap();
+  const issued = await base.issueTokens(
+    "client_ownmesh_cli",
+    "prin_dev",
+    "ownmesh.read ownmesh.exec ownmesh.device",
+  );
+  const faulty = failingStore(base, new Set(["getAccess"]));
+  const res = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${issued.access_token}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list", params: {} }),
+    }),
+    faulty,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(res.status, 503);
+  assert.ok(res.headers.get("retry-after"));
+  const body = (await res.json()) as {
+    error?: { message: string; data: Record<string, unknown> };
+  };
+  assert.equal(body.error?.message, "temporarily_unavailable");
+  assert.equal(body.error?.data.retryable, true);
+  assert.ok(typeof body.error?.data.diagnostic_id === "string");
+  assert.ok(typeof body.error?.data.service_version === "string");
+  assert.notEqual(body.error?.message, "invalid_token");
+  const blob = JSON.stringify(body);
+  assert.doesNotMatch(blob, /atk_|rtk_|fam_|D1_ERROR/);
+  // Same credential works after recovery: no reinstall, no revoke.
+  const ok = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${issued.access_token}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list", params: {} }),
+    }),
+    base,
+    new URL("https://cp.test/mcp"),
+  );
+  assert.equal(ok.status, 200);
+});
+
+test("non-storage throw rethrows fail-closed instead of sanitized 503", async () => {
+  const base = new MemoryStore();
+  await base.ensureBootstrap();
+  const issued = await base.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read");
+  const faulty = new Proxy(base, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      if (typeof value === "function" && String(prop) === "rotateRefresh") {
+        return () => {
+          throw new TypeError("boom");
+        };
+      }
+      return typeof value === "function" ? (value as (...args: never[]) => unknown).bind(target) : value;
+    },
+  }) as ControlPlaneStore;
+  // Fail-closed: logic bugs never look retryable; the throw escapes so the
+  // bug stays visible instead of becoming temporarily_unavailable.
+  await assert.rejects(
+    async () => {
+      await handleToken(
+        new Request("https://cp.test/oauth/token", {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: issued.refresh_token,
+          }),
+        }),
+        faulty,
+      );
+    },
+    /boom/,
+  );
+  // Bare-word guards: validation/option text containing `timeout`/`quota`
+  // without a storage phrase must not classify as retryable storage.
+  assert.equal(classifyD1Error(new Error("timeout_ms must be positive")), "unknown");
+  assert.equal(classifyD1Error(new Error("quota option is out of range")), "unknown");
+  assert.equal(isRetryableStorageError(new TypeError("boom")), false);
+  assert.equal(isRetryableStorageError(new Error("request timeout_ms invalid")), false);
 });
