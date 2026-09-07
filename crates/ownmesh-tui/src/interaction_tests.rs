@@ -217,11 +217,29 @@ fn repeat_and_release_events_do_not_confirm_or_submit_actions() {
     let (_dir, mut app, rt) = fixture();
     app.open_setup_wizard();
     app.wizard.step = WizardStep::Welcome;
+    app.wizard.control_plane_url = "https://mesh.example.test".into();
     handle_key(&mut app, press(KeyCode::Enter), &rt);
-    assert_eq!(app.wizard.step, WizardStep::Language);
-    handle_key(&mut app, repeat(KeyCode::Enter), &rt);
-    assert_eq!(app.wizard.step, WizardStep::Language);
-    assert!(app.take_pending_setup().is_none());
+    assert_eq!(app.wizard.step, WizardStep::Server);
+    for step in [
+        WizardStep::Server,
+        WizardStep::Language,
+        WizardStep::Preset,
+        WizardStep::Confirm,
+    ] {
+        assert_eq!(app.wizard.step, step);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            handle_key(
+                &mut app,
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+                &rt,
+            );
+            assert_eq!(app.wizard.step, step);
+            assert!(app.take_pending_setup().is_none());
+        }
+        if step != WizardStep::Confirm {
+            handle_key(&mut app, press(KeyCode::Enter), &rt);
+        }
+    }
     app.overlay = Overlay::None;
     app.goto_screen(Screen::Approvals);
     app.set_approvals_from_json(&serde_json::json!({
