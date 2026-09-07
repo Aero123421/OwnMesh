@@ -130,10 +130,7 @@ fn main() -> StdExitCode {
 fn run(cli: Cli) -> Result<(), ExitCode> {
     // fetch_status() ensures the layout, so reject a non-TTY *before* calling
     // it. One-shot status output remains usable from pipes and scripts.
-    if !cli.status
-        && !cli.once
-        && (!std::io::stdin().is_tty() || !std::io::stdout().is_tty())
-    {
+    if !cli.status && !cli.once && (!std::io::stdin().is_tty() || !std::io::stdout().is_tty()) {
         eprintln!(
             "ownmesh-tui requires an interactive terminal; stdin/stdout are not TTYs. \
              Use `ownmesh-tui --status` for non-interactive output."
@@ -690,7 +687,8 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent) {
 }
 
 fn repeatable_key(app: &App, code: KeyCode) -> bool {
-    if app.palette.open || (app.overlay == Overlay::Wizard && app.wizard.step == WizardStep::Server) {
+    if app.palette.open || (app.overlay == Overlay::Wizard && app.wizard.step == WizardStep::Server)
+    {
         return matches!(
             code,
             KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Up | KeyCode::Down
@@ -988,7 +986,7 @@ fn run_approval_cli(pending: &PendingApproval, timeout: Duration) -> ApprovalCli
     let ownmesh = sibling_ownmesh_path(&current);
     if !ownmesh.is_file() {
         return ApprovalCliOutcome::Failed;
-    }
+    };
 
     let Ok(mut child) = Command::new(ownmesh)
         .args(approval_cli_args(pending))

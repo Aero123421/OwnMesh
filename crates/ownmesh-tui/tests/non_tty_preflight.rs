@@ -39,8 +39,16 @@ fn piped_startup_does_not_create_any_layout_directories() {
     let output = child.wait_with_output().expect("collect TUI output");
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requires an interactive terminal"), "{stderr}");
+    assert!(
+        stderr.contains("requires an interactive terminal"),
+        "{stderr}"
+    );
     assert!(stderr.contains("ownmesh-tui --status"), "{stderr}");
     assert!(output.stdout.is_empty());
-    assert_eq!(std::fs::read_dir(base.path()).expect("read fixture").count(), 0);
+    assert_eq!(
+        std::fs::read_dir(base.path())
+            .expect("read fixture")
+            .count(),
+        0
+    );
 }
