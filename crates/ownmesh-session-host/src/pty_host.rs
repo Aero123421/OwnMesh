@@ -2265,10 +2265,7 @@ mod tests {
         );
         let command = PtyCommand {
             program: "/bin/sh".into(),
-            args: vec![
-                "-c".into(),
-                "sleep 30 & printf '%s\\n' \"$!\"; wait".into(),
-            ],
+            args: vec!["-c".into(), "sleep 30 & printf '%s\\n' \"$!\"; wait".into()],
             cwd: None,
             env: vec![],
         };
