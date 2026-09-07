@@ -986,7 +986,7 @@ fn run_approval_cli(pending: &PendingApproval, timeout: Duration) -> ApprovalCli
     let ownmesh = sibling_ownmesh_path(&current);
     if !ownmesh.is_file() {
         return ApprovalCliOutcome::Failed;
-    };
+    }
 
     let Ok(mut child) = Command::new(ownmesh)
         .args(approval_cli_args(pending))
