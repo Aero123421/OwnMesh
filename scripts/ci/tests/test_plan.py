@@ -4,6 +4,8 @@ The planner must never silently skip a required gate. Every test below
 asserts that an adversarial or malformed input falls back to full.
 """
 
+import ast
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -152,6 +154,97 @@ class LabelBranchingTests(unittest.TestCase):
 
 
 class GateStrictMatchTests(unittest.TestCase):
+    @staticmethod
+    def _evaluate_ci_condition(expression, **context):
+        """Evaluate the supported GitHub expression subset from ci.yml.
+
+        This deliberately evaluates the checked-in job condition against an
+        event matrix, rather than asserting that action names occur somewhere
+        in comments or unrelated workflow sections.
+        """
+        references = {
+            "github.event_name": context["event_name"],
+            "github.event.pull_request.draft": context["draft"],
+            "github.event.action": context["action"],
+            "github.event.label.name": context["label"],
+            "github.actor": context["actor"],
+            "github.event.sender.login": context["sender"],
+        }
+        for reference, value in sorted(references.items(),
+                                       key=lambda item: -len(item[0])):
+            expression = expression.replace(reference, repr(value))
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        expression = re.sub(r"\btrue\b", "True", expression)
+        expression = re.sub(r"\bfalse\b", "False", expression)
+        tree = ast.parse(expression, mode="eval").body
+
+        def visit(node):
+            if isinstance(node, ast.BoolOp):
+                values = [visit(value) for value in node.values]
+                if isinstance(node.op, ast.And):
+                    return all(values)
+                if isinstance(node.op, ast.Or):
+                    return any(values)
+            if isinstance(node, ast.Compare):
+                left = visit(node.left)
+                for operation, comparator in zip(node.ops, node.comparators):
+                    right = visit(comparator)
+                    if isinstance(operation, ast.Eq) and left != right:
+                        return False
+                    if isinstance(operation, ast.NotEq) and left == right:
+                        return False
+                    left = right
+                return True
+            if isinstance(node, ast.Constant):
+                return node.value
+            raise AssertionError(f"unsupported CI expression node: {node!r}")
+
+        return bool(visit(tree))
+
+    def test_ci_call_event_matrix(self):
+        ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8")
+        condition_lines = [
+            line.strip()[len("if: "):]
+            for line in ci.splitlines()
+            if line.strip().startswith("if: github.event_name")
+        ]
+        self.assertEqual(len(condition_lines), 1)
+        condition = condition_lines[0]
+        cases = [
+            ({"event_name": "pull_request", "action": "opened",
+              "draft": False, "label": "", "actor": "alice",
+              "sender": "alice"}, True),
+            ({"event_name": "pull_request", "action": "synchronize",
+              "draft": False, "label": "", "actor": "alice",
+              "sender": "alice"}, True),
+            ({"event_name": "pull_request", "action": "ready_for_review",
+              "draft": False, "label": "", "actor": "alice",
+              "sender": "alice"}, True),
+            ({"event_name": "pull_request", "action": "labeled",
+              "draft": False, "label": "review-ready", "actor": "alice",
+              "sender": "alice"}, True),
+            ({"event_name": "pull_request", "action": "labeled",
+              "draft": False, "label": "other", "actor": "alice",
+              "sender": "alice"}, False),
+            ({"event_name": "pull_request", "action": "ready_for_review",
+              "draft": True, "label": "", "actor": "alice",
+              "sender": "alice"}, False),
+            ({"event_name": "pull_request", "action": "ready_for_review",
+              "draft": False, "label": "", "actor": "coderabbitai[bot]",
+              "sender": "alice"}, False),
+            ({"event_name": "pull_request", "action": "ready_for_review",
+              "draft": False, "label": "", "actor": "alice",
+              "sender": "coderabbitai[bot]"}, False),
+            ({"event_name": "push", "action": "ready_for_review",
+              "draft": False, "label": "", "actor": "alice",
+              "sender": "alice"}, False),
+        ]
+        for context, expected in cases:
+            with self.subTest(context=context):
+                self.assertEqual(
+                    self._evaluate_ci_condition(condition, **context), expected)
+
     def test_ci_gate_uses_strict_bot_match(self):
         ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(
             encoding="utf-8")

@@ -2,8 +2,7 @@
 
 use crate::i18n::Lang;
 use ownmesh_config::{
-    load_config, load_policy, save_config, save_config_and_policy_transactional, save_policy,
-    InstanceConfig, OwnMeshPaths, PolicyFile,
+    load_config, load_policy, save_config_and_policy_transactional, InstanceConfig, OwnMeshPaths,
 };
 use ownmesh_policy::{full_access_has_no_hidden_restrictive_rules, preset_document, AccessPreset};
 
@@ -299,7 +298,7 @@ pub fn apply_setup_request(paths: &OwnMeshPaths, request: &SetupRequest) -> Resu
     Ok(())
 }
 
-/// Apply setup choices: write `config.toml` lang and `policy.toml` preset.
+/// Save preferences atomically, preserving policy overlays unless the preset changes.
 ///
 /// Full Access is saved without introducing hidden deny rules (policy crate semantics unchanged).
 ///
@@ -309,19 +308,19 @@ pub fn apply_setup_request(paths: &OwnMeshPaths, request: &SetupRequest) -> Resu
 pub fn apply_setup(paths: &OwnMeshPaths, lang: Lang, preset: AccessPreset) -> Result<(), String> {
     paths.ensure_layout().map_err(|e| e.to_string())?;
 
-    let mut cfg = load_config(paths).unwrap_or_default();
+    let mut cfg = load_config(paths).map_err(|e| e.to_string())?;
+    let mut policy = load_policy(paths).map_err(|e| e.to_string())?;
     cfg.lang = lang.bcp47().to_owned();
+    let current_preset = preset_from_wire(policy.preset.as_deref().unwrap_or("recommended"));
+    if current_preset != preset {
+        if preset == AccessPreset::Custom {
+            return Err("choose a built-in preset before replacing a custom policy".into());
+        }
+        policy.preset = Some(preset_wire_name(preset).into());
+        policy.rules.clear();
+    }
     cfg.validate().map_err(|e| e.to_string())?;
-    save_config(paths, &cfg).map_err(|e| e.to_string())?;
-
-    let policy = PolicyFile {
-        schema_version: 1,
-        preset: Some(preset_wire_name(preset).into()),
-        delegate_remote_mcp: false,
-        rules: Vec::new(),
-    };
     policy.validate().map_err(|e| e.to_string())?;
-    save_policy(paths, &policy).map_err(|e| e.to_string())?;
 
     // Conformance: Full Access must remain free of hidden restrictive rules.
     if preset == AccessPreset::FullAccess {
@@ -331,21 +330,86 @@ pub fn apply_setup(paths: &OwnMeshPaths, lang: Lang, preset: AccessPreset) -> Re
         }
     }
 
-    // Ensure round-trip load sees the preset.
-    let loaded = load_policy(paths).map_err(|e| e.to_string())?;
-    if loaded.preset.as_deref() != Some(preset_wire_name(preset)) {
-        return Err(format!(
-            "policy preset mismatch after save: {:?}",
-            loaded.preset
-        ));
-    }
+    save_config_and_policy_transactional(paths, &cfg, &policy).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ownmesh_config::{save_config, save_policy, PolicyFile};
     use tempfile::tempdir;
+
+    #[test]
+    fn settings_language_change_preserves_existing_rules_and_delegation() {
+        for preset in [AccessPreset::Custom, AccessPreset::Recommended] {
+            let dir = tempdir().unwrap();
+            let paths = OwnMeshPaths::for_base(dir.path());
+            paths.ensure_layout().unwrap();
+            let mut config = load_config(&paths).unwrap();
+            config.update.mode = "notify".into();
+            config.update.channel = "beta".into();
+            config.instances.push(InstanceConfig {
+                id: "primary".into(),
+                base_url: "https://mesh.example.test".into(),
+                display_name: Some("Primary".into()),
+            });
+            save_config(&paths, &config).unwrap();
+            let mut policy = PolicyFile::default();
+            policy.preset = Some(preset_wire_name(preset).into());
+            policy.delegate_remote_mcp = true;
+            policy.rules = vec![ownmesh_policy::PolicyRule {
+                id: "rule_keep_local".into(),
+                decision: ownmesh_policy::Decision::Deny,
+                priority: 10,
+                capability: "command.*".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: None,
+                program_equals: None,
+                when_tag: None,
+                description: None,
+            }];
+            save_policy(&paths, &policy).unwrap();
+            apply_setup(&paths, Lang::JaJp, preset).unwrap();
+            config.lang = "ja-JP".into();
+            assert_eq!(load_config(&paths).unwrap(), config);
+            assert_eq!(load_policy(&paths).unwrap(), policy);
+
+            apply_setup(&paths, Lang::RuRu, AccessPreset::FullAccess).unwrap();
+            let changed = load_policy(&paths).unwrap();
+            assert_eq!(changed.preset.as_deref(), Some("full_access"));
+            assert!(changed.rules.is_empty());
+            assert!(changed.delegate_remote_mcp);
+        }
+    }
+
+    #[test]
+    fn settings_rejects_corrupt_inputs_without_partial_writes() {
+        for corrupt_config in [true, false] {
+            let dir = tempdir().unwrap();
+            let paths = OwnMeshPaths::for_base(dir.path());
+            paths.ensure_layout().unwrap();
+            save_config(&paths, &load_config(&paths).unwrap()).unwrap();
+            save_policy(&paths, &PolicyFile::default()).unwrap();
+            let config_path = paths.config_dir.join("config.toml");
+            let policy_path = paths.config_dir.join("policy.toml");
+            std::fs::write(
+                if corrupt_config {
+                    &config_path
+                } else {
+                    &policy_path
+                },
+                "invalid = [",
+            )
+            .unwrap();
+            let before_config = std::fs::read(&config_path).unwrap();
+            let before_policy = std::fs::read(&policy_path).unwrap();
+            assert!(apply_setup(&paths, Lang::JaJp, AccessPreset::FullAccess).is_err());
+            assert_eq!(std::fs::read(&config_path).unwrap(), before_config);
+            assert_eq!(std::fs::read(&policy_path).unwrap(), before_policy);
+        }
+    }
 
     #[test]
     fn wizard_saves_all_four_presets_to_config() {

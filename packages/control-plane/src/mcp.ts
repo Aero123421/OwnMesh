@@ -2968,10 +2968,16 @@ export function makeEnvelope(
 }
 
 /** Paginate a string list and optionally truncate payload. */
+export type McpByteBudgetError = {
+  code: "budget_too_small";
+  max_bytes: number;
+  required_bytes: number;
+};
+
 export function paginateList(
   items: unknown[],
   opts: { cursor?: string; limit?: number; maxBytes?: number } = {},
-): { page: unknown[]; next_cursor: string | null; truncated: boolean } {
+): { page: unknown[]; next_cursor: string | null; truncated: boolean; error?: McpByteBudgetError } {
   const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
   let start = 0;
   if (opts.cursor) {
@@ -2982,29 +2988,52 @@ export function paginateList(
   let next: string | null =
     start + limit < items.length ? `cur_${start + limit}` : null;
   let truncated = false;
-  const maxBytes = opts.maxBytes ?? 64_000;
-  let encoded = JSON.stringify(slice);
-  if (encoded.length > maxBytes) {
+  const requestedMaxBytes = opts.maxBytes ?? 64_000;
+  const maxBytes = Number.isFinite(requestedMaxBytes)
+    ? Math.max(0, Math.floor(requestedMaxBytes))
+    : 64_000;
+  const encodedBytes = (value: unknown[]): number =>
+    new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  if (encodedBytes(slice) > maxBytes) {
+    if (slice.length === 0) {
+      return {
+        page: [],
+        next_cursor: null,
+        truncated: true,
+        error: { code: "budget_too_small", max_bytes: maxBytes, required_bytes: encodedBytes(slice) },
+      };
+    }
     // shrink until under budget
     let lo = 1;
     let hi = slice.length;
-    let best = slice.slice(0, 1);
+    let best: unknown[] = [];
     while (lo <= hi) {
       const mid = Math.floor((lo + hi) / 2);
       const cand = slice.slice(0, mid);
-      if (JSON.stringify(cand).length <= maxBytes) {
+      if (encodedBytes(cand) <= maxBytes) {
         best = cand;
         lo = mid + 1;
       } else {
         hi = mid - 1;
       }
     }
-    truncated = best.length < slice.length || next !== null || items.length > start + best.length;
-    next = `cur_${start + best.length}`;
-    if (start + best.length >= items.length && best.length === slice.length) {
-      // only truncated by bytes mid-page
-      if (best.length < items.length - start) next = `cur_${start + best.length}`;
+    // A single item can exceed the entire page budget. Return an explicit
+    // bounded error rather than emitting an oversized page or advancing a
+    // cursor past data the caller has not received.
+    if (best.length === 0 && slice.length > 0) {
+      return {
+        page: [],
+        next_cursor: null,
+        truncated: true,
+        error: {
+          code: "budget_too_small",
+          max_bytes: maxBytes,
+          required_bytes: encodedBytes(slice.slice(0, 1)),
+        },
+      };
     }
+    truncated = best.length < slice.length || next !== null || items.length > start + best.length;
+    next = start + best.length < items.length ? `cur_${start + best.length}` : null;
     return { page: best, next_cursor: next, truncated: true };
   }
   return { page: slice, next_cursor: next, truncated };
@@ -3014,14 +3043,34 @@ export function paginateList(
 export function truncateText(
   text: string,
   maxBytes = 64_000,
-): { text: string; truncated: boolean; next_cursor: string | null } {
-  if (text.length <= maxBytes) {
+): { text: string; truncated: boolean; next_cursor: string | null; error?: McpByteBudgetError } {
+  const budget = Number.isFinite(maxBytes) ? Math.max(0, Math.floor(maxBytes)) : 64_000;
+  const encoder = new TextEncoder();
+  if (encoder.encode(text).byteLength <= budget) {
     return { text, truncated: false, next_cursor: null };
   }
+  let kept = "";
+  let keptBytes = 0;
+  for (const codePoint of text) {
+    const codePointBytes = encoder.encode(codePoint).byteLength;
+    if (kept && keptBytes + codePointBytes > budget) break;
+    // A partial UTF-8 sequence is never a valid text result. Return an
+    // explicit error when even the first complete code point cannot fit.
+    if (!kept && codePointBytes > budget) {
+      return {
+        text: "",
+        truncated: true,
+        next_cursor: null,
+        error: { code: "budget_too_small", max_bytes: budget, required_bytes: codePointBytes },
+      };
+    }
+    kept += codePoint;
+    keptBytes += codePointBytes;
+  }
   return {
-    text: text.slice(0, maxBytes),
+    text: kept,
     truncated: true,
-    next_cursor: `cur_${maxBytes}`,
+    next_cursor: `cur_${keptBytes}`,
   };
 }
 
@@ -3054,6 +3103,21 @@ function mcpError(
   data?: unknown,
 ): Response {
   return json({ jsonrpc: "2.0", id: id ?? null, error: { code, message, data } });
+}
+
+function mcpByteBudgetError(
+  id: string | number | null | undefined,
+  error: McpByteBudgetError,
+  operationId?: string,
+): Response {
+  return mcpError(id, -32602, "max_bytes is too small for the first item", {
+    code: "OWNMESH_E_OUTPUT_BUDGET_TOO_SMALL",
+    message: "increase max_bytes to retrieve the first item",
+    retryable: false,
+    max_bytes: error.max_bytes,
+    required_bytes: error.required_bytes,
+    ...(operationId ? { operation_id: operationId } : {}),
+  });
 }
 
 function mcpProtectedResourceMetadataUrl(issuer: string): string | null {
@@ -3620,7 +3684,7 @@ async function retryPendingDispatchOnPoll(
   if (!(await boundCredentialGenerationCurrent(store, box.body))) {
     const reason = await boundAuthorityInvalidationReason(store, box.body.payload);
     return (await patchOp(
-      d1ops(store),
+      ops,
       tracker,
       tracked.operation_id,
       {
@@ -3646,7 +3710,7 @@ async function retryPendingDispatchOnPoll(
   };
   const leasedData = withDispatchOutbox(tracked.data || {}, leasedBox);
   const leased = await patchOp(
-    d1ops(store),
+    ops,
     tracker,
     tracked.operation_id,
     { data: leasedData, summary: "dispatch_retry_leased" },
@@ -3676,7 +3740,7 @@ async function retryPendingDispatchOnPoll(
     routed.status === "device_offline"
   ) {
     return (await patchOp(
-      d1ops(store),
+      ops,
       tracker,
       tracked.operation_id,
       {
@@ -3699,7 +3763,7 @@ async function retryPendingDispatchOnPoll(
   }
 
   return (await patchOp(
-    d1ops(store),
+    ops,
     tracker,
     tracked.operation_id,
     {
@@ -6119,11 +6183,13 @@ async function handleMcpCore(
     // ---- local control-plane tools (no device) ----
     if (name === "ownmesh_list_devices") {
       const devices = await store.listDevices(rec.principal);
-      const { page, next_cursor, truncated } = paginateList(devices, {
+      const pageResult = paginateList(devices, {
         cursor: args.cursor ? String(args.cursor) : undefined,
         limit: typeof args.limit === "number" ? args.limit : undefined,
         maxBytes: typeof args.max_bytes === "number" ? args.max_bytes : undefined,
       });
+      if (pageResult.error) return mcpByteBudgetError(id, pageResult.error);
+      const { page, next_cursor, truncated } = pageResult;
       // Probe only the bounded public page, never the full durable owner set.
       // Presence is display state and is not consulted by authorization.
       const devicesWithPresence = await Promise.all((page as DeviceRecord[]).map(async (device) => ({
@@ -6618,6 +6684,7 @@ async function handleMcpCore(
         transfers.push({ operation_id: candidate.operation_id, created_at: candidate.created_at || stored.created_at, ...publicTransferMeta(transfer) });
       }
       const page = paginateList(transfers, { cursor: typeof args.cursor === "string" ? args.cursor : undefined, limit: typeof args.limit === "number" ? args.limit : undefined });
+      if (page.error) return mcpByteBudgetError(id, page.error);
       const env = makeEnvelope({ operation_id: operationId, status: "completed", summary: `listed ${page.page.length} transfer(s)`, data: { transfers: page.page }, truncated: page.truncated, next_cursor: page.next_cursor, warnings: injectWarnings });
       await persistOp(store, tracker, { ...env, tool: name, principal: rec.principal, tenant_id: rec.tenant_id, created_at: nowIso(), updated_at: nowIso() });
       return mcpResult(id, toolContent(env));
@@ -6729,6 +6796,7 @@ async function handleMcpCore(
         cursor: typeof args.cursor === "string" ? args.cursor : undefined,
         limit: typeof args.limit === "number" ? args.limit : undefined,
       });
+      if (page.error) return mcpByteBudgetError(id, page.error);
       const env = makeEnvelope({
         operation_id: operationId,
         status: "completed",
@@ -7956,6 +8024,7 @@ async function handleMcpCore(
 
     if (detail.status === "completed" || detail.result !== undefined) {
       let data = (detail.result as Record<string, unknown>) || detail;
+      const durableResultData = data;
       if (name === "ownmesh_system_diagnose" && diagnosisDevice) {
         data = attachControlPlaneMcpOpsQuota(
           normalizeSystemDiagnosis(data, diagnosisDevice, "online"),
@@ -7964,6 +8033,7 @@ async function handleMcpCore(
       }
       let truncated = Boolean((data as { truncated?: boolean }).truncated);
       let next_cursor: string | null = null;
+      let outputBudgetError: McpByteBudgetError | undefined;
       // Preserve device-side byte/range cursors. Never re-slice base64 as text or
       // invent a character cursor unrelated to the file offset.
       const encoding =
@@ -7992,7 +8062,30 @@ async function handleMcpCore(
             String((data as { content: string }).content),
             typeof args.max_bytes === "number" ? args.max_bytes : 64_000,
           );
-          if (t.truncated) {
+          if (t.error || (t.truncated && deviceNextOffset != null)) {
+            outputBudgetError = t.error || {
+              code: "budget_too_small",
+              max_bytes: typeof args.max_bytes === "number" ? Math.max(0, Math.floor(args.max_bytes)) : 64_000,
+              // The device cursor is absolute for its already-windowed body;
+              // returning a shorter CP prefix would make that cursor skip
+              // bytes the caller has not received.
+              required_bytes: new TextEncoder().encode(String((data as { content: string }).content)).byteLength,
+            };
+            const budgetErrorMessage = deviceNextOffset != null
+              ? "increase max_bytes to preserve the device result cursor"
+              : "increase max_bytes to retrieve the first complete character";
+            data = {
+              error: {
+                code: "OWNMESH_E_OUTPUT_BUDGET_TOO_SMALL",
+                message: budgetErrorMessage,
+                retryable: false,
+                max_bytes: outputBudgetError.max_bytes,
+                required_bytes: outputBudgetError.required_bytes,
+              },
+            };
+            truncated = false;
+            next_cursor = null;
+          } else if (t.truncated) {
             data = { ...data, content: t.text, truncated: true };
             truncated = true;
             if (next_cursor == null) next_cursor = t.next_cursor;
@@ -8005,9 +8098,54 @@ async function handleMcpCore(
           limit: typeof args.limit === "number" ? args.limit : undefined,
           maxBytes: typeof args.max_bytes === "number" ? args.max_bytes : undefined,
         });
-        data = { ...data, entries: p.page };
-        truncated = truncated || p.truncated;
-        next_cursor = p.next_cursor;
+        if (p.error) {
+          outputBudgetError = p.error;
+          data = {
+            error: {
+              code: "OWNMESH_E_OUTPUT_BUDGET_TOO_SMALL",
+              message: "increase max_bytes to retrieve the first item",
+              retryable: false,
+              max_bytes: p.error.max_bytes,
+              required_bytes: p.error.required_bytes,
+            },
+          };
+          truncated = false;
+          next_cursor = null;
+        } else {
+          data = { ...data, entries: p.page };
+          truncated = truncated || p.truncated;
+          next_cursor = p.next_cursor;
+        }
+      }
+      if (outputBudgetError) {
+        // The device side effect already completed. Persist its authoritative
+        // result intact so a later poll by operation_id can replay the bounded
+        // result; the current response gets only the sanitized budget error.
+        await finalizeRoutedOp(ops, tracker, operationId, {
+          status: "completed",
+          summary: String(detail.summary || `${name} completed`),
+          data: durableResultData,
+          truncated: Boolean((durableResultData as { truncated?: boolean }).truncated),
+          next_cursor: deviceNextOffset != null && Number.isFinite(Number(deviceNextOffset))
+            ? `off_${Math.max(0, Math.floor(Number(deviceNextOffset)))}`
+            : null,
+          session_id: detail.session_id
+            ? String(detail.session_id)
+            : typeof (durableResultData as { session_id?: unknown }).session_id === "string"
+              ? String((durableResultData as { session_id: string }).session_id)
+              : null,
+          device_id: deviceId,
+          correlation_id: correlation,
+          warnings: injectWarnings,
+          approval_required: false,
+        });
+        // Keep the operation id available to the caller through the durable
+        // poll path without exposing the oversized result in this response.
+        return mcpByteBudgetError(
+          id,
+          outputBudgetError,
+          String(detail.operation_id || operationId),
+        );
       }
       const env = makeEnvelope({
         operation_id: String(detail.operation_id || operationId),

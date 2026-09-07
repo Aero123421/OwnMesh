@@ -38,6 +38,7 @@ import {
   boundPrincipalAuthorityCurrent,
   PUBLISHED_MCP_TOOLS,
   __setGetOperationWaiterCapForTest,
+  type OperationRouter,
 } from "./mcp.ts";
 import {
   applyMcpOperationResult,
@@ -1176,6 +1177,30 @@ test("paginateList and truncateText helpers", () => {
   assert.equal(t.next_cursor, "cur_4");
 });
 
+test("pagination budgets count UTF-8 bytes and reject oversized first items", () => {
+  const emoji = "😀";
+  const page = paginateList([emoji, "second"], { limit: 2, maxBytes: 5 });
+  // The first item alone is 8 JSON bytes. Return a typed error rather than
+  // silently dropping it or emitting a page over the requested budget.
+  assert.deepEqual(page.page, []);
+  assert.equal(page.error?.code, "budget_too_small");
+  assert.equal(page.error?.required_bytes, 8);
+  assert.equal(page.next_cursor, null);
+  assert.equal(page.truncated, true);
+  assert.equal(paginateList([emoji], { maxBytes: 1 }).error?.code, "budget_too_small");
+  assert.equal(paginateList([], { maxBytes: 1 }).error?.required_bytes, 2);
+
+  const text = truncateText("😀a", 3);
+  assert.equal(text.text, "");
+  assert.equal(text.error?.code, "budget_too_small");
+  assert.equal(text.error?.required_bytes, 4);
+  assert.equal(text.next_cursor, null);
+  const complete = truncateText("😀a", 4);
+  assert.equal(complete.text, "😀");
+  assert.equal(new TextEncoder().encode(complete.text).byteLength, 4);
+  assert.equal(complete.next_cursor, "cur_4");
+});
+
 test("list_devices supports cursor pagination", async () => {
   const { store, token } = await authed();
   for (let i = 0; i < 5; i++) {
@@ -1275,6 +1300,35 @@ test("read tool routes through DeviceRoom to agent and returns completed", async
   assert.ok(Array.isArray((sc.data as { entries: string[] }).entries));
   const text = body.result!.content[0]!.text;
   assert.deepEqual(JSON.parse(text), sc, "legacy JSON TextContent must match structuredContent");
+});
+
+test("read output keeps absolute device cursors aligned with UTF-8 budgets", async () => {
+  const { store, token } = await authed();
+  const deviceId = "dev_mcp_read_utf8_cursor";
+  await store.putDevice({
+    id: deviceId, tenant_id: "ten_default", principal_id: "prin_dev", name: "desk",
+    hostname: "desk", os: "test", arch: "test", agent_version: "test",
+    protocol_version: "ownmesh.device/1.0", public_key: "cd".repeat(32), revoked: false,
+    created_at: new Date().toISOString(), status: "active",
+  });
+  const router: OperationRouter = {
+    async routeToDevice() {
+      return {
+        status: "routed_to_device",
+        detail: { status: "completed", result: { content: "あい", next_offset: 6 } },
+      };
+    },
+  };
+  const { body } = await callTool(store, token, "ownmesh_fs_read", {
+    device_id: deviceId, workspace_id: null, path: "/utf8.txt", max_bytes: 3,
+  }, router);
+  assert.equal(body.error?.code, -32602);
+  const budgetError = body.error?.data as { code: string; operation_id: string };
+  assert.equal(budgetError.code, "OWNMESH_E_OUTPUT_BUDGET_TOO_SMALL");
+  assert.ok(budgetError.operation_id);
+  const retained = await store.getMcpOperation(budgetError.operation_id);
+  assert.equal(retained?.status, "completed");
+  assert.equal((retained?.data as { content: string }).content, "あい");
 });
 
 test("write tool → device ask → approval_required with approval_url", async () => {

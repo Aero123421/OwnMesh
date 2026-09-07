@@ -4590,9 +4590,13 @@ export class OperationRoom {
       get: <T = unknown>(key: string) => backing.get<T>(key) as Promise<T | undefined>,
       put: (key: string, value: unknown) => backing.put(key, value).then(() => undefined),
       delete: (key: string) => backing.delete(key),
-      list: async (prefix: string, limit = 128) => {
+      list: async (prefix: string, limit = 128, startAfter?: string) => {
         if (typeof backing.list !== "function") return [];
-        const entries = await backing.list({ prefix, limit });
+        const entries = await backing.list({
+          prefix,
+          limit,
+          ...(startAfter ? { startAfter } : {}),
+        });
         return [...entries.keys()];
       },
     };
@@ -4608,7 +4612,7 @@ export class OperationRoom {
     await this.storage().put(OP_ROOM_TENANT_KEY, tenantId);
   }
 
-  private schedulePrune(delayMs = OP_ROOM_PRUNE_ALARM_DELAY_MS): void {
+  private async schedulePrune(delayMs = OP_ROOM_PRUNE_ALARM_DELAY_MS): Promise<void> {
     try {
       const storage = this.state.storage as unknown as {
         setAlarm?: (t: number) => Promise<void>;
@@ -4627,7 +4631,7 @@ export class OperationRoom {
         }
         await setAlarm(Date.now() + delayMs);
       };
-      void schedule().catch(() => undefined);
+      await schedule();
     } catch {
       // Alarm is best-effort hygiene; TTL rows stay readable until pruned.
     }
@@ -4639,11 +4643,15 @@ export class OperationRoom {
     try {
       const stats = await this.log().prune(this.tenantId);
       // Backlog remains: follow up soon instead of waiting a full interval.
-      if (stats.deleted + stats.compacted + stats.indexesReaped > 0) {
-        this.schedulePrune(60_000);
+      if (stats.hasMore) {
+        await this.schedulePrune(60_000);
+      } else if (stats.hasRows) {
+        await this.schedulePrune();
       }
     } catch {
-      // Next alarm retries; alarms must never throw operation state away.
+      // Ensure a transient storage/list failure gets a bounded retry even
+      // when this alarm was the only future wake-up for an idle tenant.
+      await this.schedulePrune(60_000);
     }
   }
 
@@ -4699,11 +4707,11 @@ export class OperationRoom {
           if (!op) return json({ error: "invalid_operation" }, { status: 400 });
           if (body.action === "claim") {
             const claimed = await log.claim(op);
-            this.schedulePrune();
+            await this.schedulePrune();
             return json({ outcome: claimed.outcome, op: claimed.op });
           }
           await log.put(op);
-          this.schedulePrune();
+          await this.schedulePrune();
           return json({});
         }
         case "get": {
