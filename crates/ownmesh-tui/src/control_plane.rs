@@ -6,7 +6,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use ownmesh_config::{validate_control_plane_base_url, OwnMeshPaths};
 use ownmesh_diagnostics::redact_text;
-use ownmesh_identity::{load_human_refresh_token, PreferredSecretStore, DEFAULT_KEYCHAIN_SERVICE};
+use ownmesh_identity::{
+    load_human_refresh_token, store_human_refresh_token, PreferredSecretStore, SecretStore,
+    SecretString, DEFAULT_KEYCHAIN_SERVICE,
+};
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -147,14 +150,13 @@ pub async fn fetch_device_inventory(paths: &OwnMeshPaths) -> Result<DeviceInvent
     if token_resp.status().is_redirection() {
         bail!("token endpoint refused an HTTP redirect");
     }
+    if !token_resp.status().is_success() {
+        bail!("authentication required");
+    }
     let token_bytes = read_bounded(token_resp).await?;
     let token_json: serde_json::Value =
         serde_json::from_slice(&token_bytes).context("parse token response")?;
-    let access = token_json
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("authentication required"))?;
+    let access = accept_refreshed_access_token(&store, &token_json)?;
 
     let list_resp = http
         .get(format!("{issuer}/v1/devices"))
@@ -188,6 +190,27 @@ pub async fn fetch_device_inventory(paths: &OwnMeshPaths) -> Result<DeviceInvent
         })
         .collect();
     Ok(DeviceInventory::Loaded { devices, truncated })
+}
+
+/// Persist rotation before using the access token, even if inventory later fails.
+fn accept_refreshed_access_token<'a>(
+    store: &dyn SecretStore,
+    response: &'a serde_json::Value,
+) -> Result<&'a str> {
+    let access = response
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow!("authentication required"))?;
+    if let Some(rotated) = response.get("refresh_token") {
+        let rotated = rotated
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| anyhow!("invalid refresh token response"))?;
+        store_human_refresh_token(store, &SecretString::new(rotated))
+            .context("save rotated refresh token")?;
+    }
+    Ok(access)
 }
 
 #[must_use]
@@ -280,6 +303,80 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ownmesh_identity::{
+        IdentityError, IdentityResult, MemorySecretStore, SecretBytes, SecretPurpose,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn inventory_refresh_persists_each_rotated_token() {
+        let store = MemorySecretStore::default();
+        store_human_refresh_token(&store, &SecretString::new("refresh_old")).unwrap();
+        for rotated in ["refresh_second", "refresh_third"] {
+            let response = json!({"access_token": "access_test", "refresh_token": rotated});
+            assert_eq!(
+                accept_refreshed_access_token(&store, &response).unwrap(),
+                "access_test"
+            );
+            assert_eq!(
+                load_human_refresh_token(&store).unwrap().unwrap().expose(),
+                rotated
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_refresh_preserves_token_when_rotation_is_omitted() {
+        let store = MemorySecretStore::default();
+        store_human_refresh_token(&store, &SecretString::new("refresh_old")).unwrap();
+        accept_refreshed_access_token(&store, &json!({"access_token": "access_test"})).unwrap();
+        assert_eq!(
+            load_human_refresh_token(&store).unwrap().unwrap().expose(),
+            "refresh_old"
+        );
+    }
+
+    #[test]
+    fn inventory_refresh_rejects_invalid_responses_without_replacing_token() {
+        let store = MemorySecretStore::default();
+        store_human_refresh_token(&store, &SecretString::new("refresh_old")).unwrap();
+        for response in [
+            json!({"refresh_token": "refresh_new"}),
+            json!({"access_token": "", "refresh_token": "refresh_new"}),
+            json!({"access_token": "access_test", "refresh_token": ""}),
+            json!({"access_token": "access_test", "refresh_token": null}),
+            json!({"access_token": "access_test", "refresh_token": 123}),
+        ] {
+            assert!(accept_refreshed_access_token(&store, &response).is_err());
+            assert_eq!(
+                load_human_refresh_token(&store).unwrap().unwrap().expose(),
+                "refresh_old"
+            );
+        }
+    }
+
+    struct UnwritableStore;
+
+    impl SecretStore for UnwritableStore {
+        fn store(&self, _: SecretPurpose, _: &SecretBytes) -> IdentityResult<()> {
+            Err(IdentityError::Keystore("test storage unavailable".into()))
+        }
+        fn load(&self, _: SecretPurpose) -> IdentityResult<Option<SecretBytes>> {
+            Ok(None)
+        }
+        fn delete(&self, _: SecretPurpose) -> IdentityResult<()> {
+            Ok(())
+        }
+        fn backend_name(&self) -> &'static str {
+            "unwritable-test"
+        }
+    }
+
+    #[test]
+    fn inventory_refresh_stops_if_rotated_token_cannot_be_saved() {
+        let response = json!({"access_token": "access_test", "refresh_token": "refresh_new"});
+        assert!(accept_refreshed_access_token(&UnwritableStore, &response).is_err());
+    }
 
     #[test]
     fn format_row_marks_local_device_and_bounds_fields() {

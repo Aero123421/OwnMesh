@@ -140,6 +140,28 @@ test("DeviceOperationLog prune mirrors retention semantics", async () => {
   );
 });
 
+test("DeviceOperationLog prune cursor reaches expired rows after a fresh lexical prefix", async () => {
+  const storage = new InMemoryDeviceOpStorage();
+  const log = new DeviceOperationLog(storage, 100);
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+
+  // A bounded pass must not keep rescanning this fresh key and starve the
+  // expired rows that sort after it.
+  await log.put(makeOp("op_a_fresh"));
+  await log.put({ ...makeOp("op_b_expired", ""), status: "failed", idempotency_key: null, created_at: old, updated_at: old });
+  await log.put({ ...makeOp("op_c_expired", ""), status: "failed", idempotency_key: null, created_at: old, updated_at: old });
+
+  const first = await log.prune("ten_ops", Date.now(), 1);
+  assert.equal(first.deleted, 0);
+  const second = await log.prune("ten_ops", Date.now(), 1);
+  assert.equal(second.deleted, 1);
+  assert.equal(await log.get("op_b_expired", "ten_ops"), null);
+  const third = await log.prune("ten_ops", Date.now(), 1);
+  assert.equal(third.deleted, 1);
+  assert.equal(await log.get("op_c_expired", "ten_ops"), null);
+  assert.equal(first.hasMore, true);
+});
+
 test("HybridOperationStore falls back to D1 for pre-cutover rows", async () => {
   const base = new MemoryStore();
   await base.ensureBootstrap();
@@ -221,24 +243,36 @@ test("resolver routes by mode, bindings, and cutover cursor", async () => {
 
 function fakeDoState() {
   const rows = new Map<string, unknown>();
+  let alarm: number | null = null;
   return {
     rows,
+    get alarm() {
+      return alarm;
+    },
+    set alarm(value: number | null) {
+      alarm = value;
+    },
     storage: {
       get: async (key: string) => rows.get(key),
       put: async (key: string, value: unknown) => {
         rows.set(key, value);
       },
       delete: async (key: string) => rows.delete(key),
-      list: async (opts: { prefix: string; limit?: number }) => {
+      list: async (opts: { prefix: string; limit?: number; startAfter?: string }) => {
         const out = new Map<string, unknown>();
         for (const key of [...rows.keys()].sort()) {
           if (key.startsWith(opts.prefix)) {
+            if (opts.startAfter && key <= opts.startAfter) continue;
             out.set(key, rows.get(key));
             if (out.size >= (opts.limit ?? 128)) break;
           }
         }
         return out;
       },
+      setAlarm: async (at: number) => {
+        alarm = at;
+      },
+      getAlarm: async () => alarm,
     },
     blockConcurrencyWhile: async (fn: () => Promise<void>) => {
       await fn();
@@ -315,6 +349,24 @@ test("OperationRoom endpoint round-trips claims with tenant-bound auth", async (
   assert.equal(((await opRoomCall(room, "ten_ops", "get", { operation_id: "op_ep_1" })).json.op as {
     status: string;
   }).status, "completed");
+});
+
+test("OperationRoom keeps a normal retention alarm after a no-op fresh scan", async () => {
+  const state = fakeDoState();
+  const room = new OperationRoom(
+    state as unknown as DurableObjectState,
+    { SESSION_SECRET: OP_SECRET, MCP_OPS_MAX_PER_TENANT: "100" },
+  );
+  const claimed = await opRoomCall(room, "ten_alarm", "claim", {
+    op: { ...makeOp("op_alarm_fresh"), tenant_id: "ten_alarm" },
+  });
+  assert.equal(claimed.status, 200);
+
+  // The prior alarm fired; the fresh row is not eligible yet. The room must
+  // still arrange the normal interval so it is revisited after its TTL.
+  state.alarm = null;
+  await room.alarm();
+  assert.ok(state.alarm && state.alarm > Date.now());
 });
 
 test("OperationRoomStore client surfaces room errors without inventing state", async () => {  const calls: Array<{ tenant: string; action: string }> = [];
