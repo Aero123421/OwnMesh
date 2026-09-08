@@ -11,6 +11,31 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn rejects_legacy_and_mixed_multi_file_headers_without_writing() {
+    let dir = tempdir().unwrap();
+    let ws = WorkspaceRoot::new(dir.path(), false).unwrap();
+    let before = b"alpha\nbeta\n";
+    for first in ["", "diff --git a/note.txt b/note.txt\n"] {
+        for second in ["", "diff --git a/other.txt b/other.txt\n"] {
+            for separator in ["", "\n", "index 1234567..7654321 100644\n"] {
+                write_file(&ws, "note.txt", before).unwrap();
+                let diff = format!(
+                    "{first}--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n{separator}{second}--- a/other.txt\n+++ b/other.txt\n@@ -2 +2 @@\n-beta\n+BETA\n"
+                );
+                assert!(
+                    matches!(
+                        apply_unified_diff(&ws, "note.txt", &diff, None),
+                        Err(FsError::Patch(_))
+                    ),
+                    "accepted multiple file patches: {diff:?}"
+                );
+                assert_eq!(read_file(&ws, "note.txt", 1024).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
 fn inserts_after_zero_length_old_range() {
     let dir = tempdir().unwrap();
     let ws = WorkspaceRoot::new(dir.path(), false).unwrap();

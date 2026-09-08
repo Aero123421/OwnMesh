@@ -186,6 +186,10 @@ class GateStrictMatchTests(unittest.TestCase):
                 if isinstance(node.op, ast.Or):
                     return any(values)
             if isinstance(node, ast.Compare):
+                for operation in node.ops:
+                    if not isinstance(operation, (ast.Eq, ast.NotEq)):
+                        raise AssertionError(
+                            f"unsupported CI comparison operator: {operation!r}")
                 left = visit(node.left)
                 for operation, comparator in zip(node.ops, node.comparators):
                     right = visit(comparator)
@@ -200,6 +204,14 @@ class GateStrictMatchTests(unittest.TestCase):
             raise AssertionError(f"unsupported CI expression node: {node!r}")
 
         return bool(visit(tree))
+
+    def test_ci_condition_rejects_unsupported_comparisons(self):
+        context = dict(event_name="pull_request", draft=False, action="opened",
+                       label="", actor="owner", sender="owner")
+        for expression in ("1 > 0", "'a' in 'abc'", "2 == 3 < 4"):
+            with self.subTest(expression=expression):
+                with self.assertRaises(AssertionError):
+                    self._evaluate_ci_condition(expression, **context)
 
     def test_ci_call_event_matrix(self):
         ci = (Path(__file__).parents[3] / ".github/workflows/ci.yml").read_text(

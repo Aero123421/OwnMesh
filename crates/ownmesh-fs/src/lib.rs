@@ -1518,12 +1518,13 @@ fn parse_unified_diff_hunks(diff_text: &str) -> FsResult<Vec<DiffHunk>> {
     let mut lines = diff_text.split_inclusive('\n').peekable();
     let mut saw_file_header = false;
     let mut file_headers = 0usize;
+    let mut old_file_headers = 0usize;
 
     while let Some(line) = lines.next() {
         let metadata = line.strip_suffix('\n').unwrap_or(line);
         if metadata.starts_with("diff --git ") {
             file_headers = file_headers.saturating_add(1);
-            if file_headers > 1 {
+            if file_headers > 1 || old_file_headers > 0 || !hunks.is_empty() {
                 return Err(FsError::Patch(
                     "multi-file unified diffs are not supported; patch one path at a time".into(),
                 ));
@@ -1531,7 +1532,17 @@ fn parse_unified_diff_hunks(diff_text: &str) -> FsResult<Vec<DiffHunk>> {
             saw_file_header = true;
             continue;
         }
-        if metadata.starts_with("--- ") || metadata.starts_with("+++ ") {
+        if metadata.starts_with("--- ") {
+            old_file_headers = old_file_headers.saturating_add(1);
+            if old_file_headers > 1 || !hunks.is_empty() {
+                return Err(FsError::Patch(
+                    "multi-file unified diffs are not supported; patch one path at a time".into(),
+                ));
+            }
+            saw_file_header = true;
+            continue;
+        }
+        if metadata.starts_with("+++ ") {
             saw_file_header = true;
             continue;
         }
