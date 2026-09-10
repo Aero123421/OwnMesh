@@ -17,7 +17,7 @@
     "_comment": "test stays unit-only; typecheck runs once via pnpm -r typecheck in scripts/ci/suites.toml [typescript] (single source, no duplication)"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
+    "@types/node": "^26.5.0",
     "typescript": "^5.7.2"
   }
 }
