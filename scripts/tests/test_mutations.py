@@ -473,6 +473,27 @@ class CheckerMutationTests(unittest.TestCase):
         with _Mutation("scripts/ci/plan.py", mutate):
             _must_fail("plan label branch removed")
 
+    def test_mutation_plan_set_level_aggregation_fails(self) -> None:
+        # Issue #246: reverting per-path classification to set-level `any
+        # known` aggregation lets a known path mask an unknown one, so the
+        # checker must reject it.
+        def mutate(text: str) -> str:
+            needle = (
+                "        owner = _classify_non_docs_path(f)\n"
+                "        if owner is None:\n"
+                '            return with_label_metadata(full_plan("unknown path (fail-closed)", labels), labels)\n'
+                "        tiers |= owner"
+            )
+            self.assertIn(needle, text)
+            return text.replace(
+                needle,
+                "        tiers |= _classify_non_docs_path(f) or set()",
+                1,
+            )
+
+        with _Mutation("scripts/ci/plan.py", mutate):
+            _must_fail("planner set-level fail-open regression")
+
     def test_mutation_coderabbit_permission_escalation_fails(self) -> None:
         def mutate(text: str) -> str:
             needle = "pull-requests: write"

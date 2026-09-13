@@ -264,6 +264,10 @@ def main() -> int:
     # --- Label-driven CI + CodeRabbit gate (fail-closed, least privilege) ---
     plan_py = read("scripts/ci/plan.py")
     require_text(plan_py, "def parse_labels", "plan label input")
+    require_text(plan_py, "def _classify_non_docs_path", "plan per-path classifier")
+    require_text(plan_py, "owner = _classify_non_docs_path(f)", "plan classifies every path")
+    require_text(plan_py, "if owner is None:", "plan unknown path forces full per path")
+    require_text(plan_py, "tiers |= owner", "plan unions only classified paths")
     require_text(plan_py, "LABEL_REVIEW_READY", "plan review-ready label")
     require_text(plan_py, "LABEL_HOTFIX", "plan hotfix label")
     require_text(plan_py, "LABEL_DO_NOT_MERGE", "plan do-not-merge label")
@@ -325,6 +329,7 @@ def main() -> int:
     require_text(suites, "scripts/tests/test_installers.py", "installer once in suites.toml")
     require_text(suites, "scripts/check_release_quality.py", "live checker once in suites.toml")
     require_text(suites, "scripts/tests/run_release_quality_tests.py", "mutation suite once in suites.toml")
+    require_text(suites, "scripts/ci/tests", "planner unit suite once in suites.toml")
     # The canonical runner must dispatch every suite CI invokes.
     for suite_name in (
         "rust-linux",
