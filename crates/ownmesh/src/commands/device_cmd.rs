@@ -6,6 +6,7 @@ use crate::auth::{
     update_device_metadata, AuthSession, DeviceInfo, SessionPaths,
 };
 use crate::cli::{Cli, DeviceCmd};
+use crate::commands::ipc_util::notify_running_daemon_agent_reload;
 use ownmesh_domain::ExitCode;
 use ownmesh_identity::PreferredSecretStore;
 use serde_json::json;
@@ -75,6 +76,11 @@ pub fn run_enroll(cli: &Cli) -> Result<(), ExitCode> {
             println!("  connect:     {}", result.connect_path);
             println!("  device key:  stored in OS keychain (private key never printed)");
         }
+        // Issue #248: wake a daemon that was already running before this
+        // enrollment so the Agent route connects without a manual restart.
+        // Best-effort and bounded; enrollment success is already printed and a
+        // service that starts later reads the credential at boot.
+        notify_running_daemon_agent_reload().await;
         Ok(())
     })
 }
@@ -288,6 +294,13 @@ fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
         let ctx = authed_context(cli).await?;
+        // The local device may be identified by the session or by the stored
+        // credential when the session file was reset/lost.
+        let local_device = ctx.session.device_id.as_deref() == Some(id)
+            || ownmesh_identity::load_device_credential(&ctx.store)
+                .ok()
+                .flatten()
+                .is_some_and(|credential| credential.device_id == id);
         let ok = revoke_device(
             &ctx.http,
             &ctx.session.issuer,
@@ -307,6 +320,13 @@ fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
             println!("Device revoked: {id}");
         } else {
             println!("Device revoke returned ok=false for {id}");
+        }
+        if ok && local_device {
+            // Issue #248: a revoked local device must not keep a live credential
+            // that retries forever. Drop it and let the running daemon disable
+            // the route (best-effort; the next service start would find none).
+            let _ = ownmesh_identity::delete_device_credential(&ctx.store);
+            notify_running_daemon_agent_reload().await;
         }
         if ok {
             Ok(())
@@ -332,7 +352,7 @@ fn run_rotate_key(cli: &Cli) -> Result<(), ExitCode> {
     })?;
 
     // Best-effort re-enroll so the control plane learns the new public key.
-    let reenrolled = try_reenroll_after_rotate(cli);
+    let (reenrolled, reload_needed) = try_reenroll_after_rotate(cli);
 
     if cli.json {
         println!(
@@ -358,15 +378,28 @@ fn run_rotate_key(cli: &Cli) -> Result<(), ExitCode> {
             println!("  note: run `ownmesh device enroll` to register the new public key");
         }
     }
+    // Issue #248: switch a running daemon to the new device identity after the
+    // success output. Best-effort and bounded.
+    if reload_needed {
+        if let Ok(rt) = runtime() {
+            rt.block_on(async {
+                notify_running_daemon_agent_reload().await;
+            });
+        }
+    }
     Ok(())
 }
 
-fn try_reenroll_after_rotate(cli: &Cli) -> Option<String> {
-    let rt = runtime().ok()?;
+fn try_reenroll_after_rotate(cli: &Cli) -> (Option<String>, bool) {
+    let Some(rt) = runtime().ok() else {
+        return (None, false);
+    };
     rt.block_on(async {
-        let ctx = authed_context(cli).await.ok()?;
+        let Some(ctx) = authed_context(cli).await.ok() else {
+            return (None, false);
+        };
         if ctx.session.issuer.is_empty() {
-            return None;
+            return (None, false);
         }
         match enroll_device(
             &ctx.http,
@@ -378,10 +411,10 @@ fn try_reenroll_after_rotate(cli: &Cli) -> Option<String> {
         )
         .await
         {
-            Ok(r) => Some(r.device_id),
+            Ok(r) => (Some(r.device_id), true),
             Err(err) => {
                 eprintln!("warning: re-enroll after rotate failed: {err}");
-                None
+                (None, false)
             }
         }
     })
