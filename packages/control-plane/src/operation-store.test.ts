@@ -11,8 +11,9 @@ import {
   OperationRoomStore,
   createOperationStoreResolver,
   resolveOperationStoreMode,
+  type OperationStore,
 } from "./operation-store.ts";
-import { MemoryStore } from "./store.ts";
+import { MemoryStore, MCP_OPS_RESULT_TTL_MS } from "./store.ts";
 import { internalDoHeaders } from "./util.ts";
 import { OperationRoom } from "./device-room.ts";
 
@@ -193,8 +194,12 @@ test("resolver routes by mode, bindings, and cutover cursor", async () => {
 
   const noBindings = createOperationStoreResolver({ OWNMESH_OPERATION_STORE: "device_do" }, base);
   assert.equal(noBindings.mode, "device_do");
-  // No OPERATION_ROOM/SESSION_SECRET -> safe D1 fallback.
-  assert.equal((await noBindings.forTenant("ten_ops", "prin_ops")).auditCovered, false);
+  // Issue #243: no OPERATION_ROOM/SESSION_SECRET -> unknown authority -> fail
+  // closed instead of silently degrading to D1.
+  await assert.rejects(
+    noBindings.forTenant("ten_ops", "prin_ops"),
+    /operation_authority_temporarily_unavailable:binding_missing/,
+  );
 
   const fakeRoom = { idFromName: () => ({}), get: () => ({ fetch: async () => new Response("{}") }) };
   const roomEnv = {
@@ -207,16 +212,183 @@ test("resolver routes by mode, bindings, and cutover cursor", async () => {
   const before = await resolver.forTenant("ten_ops", "prin_ops");
   assert.equal(before.ops.backend, "d1");
   assert.equal(before.auditCovered, false);
-  // Cutover cursor routes to the room (fresh tenant avoids the 60s isolate cache).
+  // Cutover cursor routes to the room.
   await base.setOperationStoreCutover("ten_cut", new Date().toISOString());
   const after = await resolver.forTenant("ten_cut", "prin_ops");
   assert.equal(after.ops.backend, "operation-room");
   assert.equal(after.auditCovered, true);
-  // Explicit per-tenant escape hatch back to D1.
+  // Explicit per-tenant escape hatch with an empty room -> D1 authority.
   await base.setOperationStoreCutover("ten_escape", "d1");
   const escaped = await resolver.forTenant("ten_escape", "prin_ops");
   assert.equal(escaped.ops.backend, "d1");
   assert.equal(escaped.auditCovered, false);
+});
+
+class UnreadableCutoverStore extends MemoryStore {
+  override async getOperationStoreCutover(_tenantId: string): Promise<string | null> {
+    throw new Error("D1_ERROR: database temporarily unavailable");
+  }
+}
+
+function makeOpFor(tenantId: string, id: string, key = `idem_${id}`) {
+  return { ...makeOp(id, key), tenant_id: tenantId };
+}
+
+function fakeOperationStore(overrides: Partial<OperationStore>): OperationStore {
+  const base: OperationStore = {
+    backend: "d1",
+    claim: async () => {
+      throw new Error("claim_unused");
+    },
+    get: async () => null,
+    getByIdempotency: async () => null,
+    getByCorrelation: async () => null,
+    put: async () => {},
+    transition: async () => null,
+    update: async () => null,
+  };
+  return { ...base, ...overrides };
+}
+
+function fakeRoomNamespace(room: OperationRoom) {
+  return {
+    idFromName: (name: string) => ({ name }),
+    get: (_id: unknown) => ({
+      fetch: (request: Request) => room.fetch(request),
+    }),
+  };
+}
+
+test("resolver fails closed when the cutover cursor cannot be read", async () => {
+  const base = new UnreadableCutoverStore();
+  const env = {
+    OWNMESH_OPERATION_STORE: "device_do",
+    OPERATION_ROOM: {
+      idFromName: () => ({}),
+      get: () => ({ fetch: async () => new Response("{}") }),
+    },
+    SESSION_SECRET: OP_SECRET,
+  };
+  const resolver = createOperationStoreResolver(env, base);
+  await assert.rejects(
+    resolver.forTenant("ten_ops", "prin_ops"),
+    /operation_authority_temporarily_unavailable:cutover_unreadable/,
+  );
+});
+
+test("rollback with room rows blocks claims but keeps DO reads and transitions", async () => {
+  const state = fakeDoState();
+  const room = new OperationRoom(
+    state as unknown as DurableObjectState,
+    { SESSION_SECRET: OP_SECRET, MCP_OPS_MAX_PER_TENANT: "100" },
+  );
+  const namespace = fakeRoomNamespace(room);
+  const base = new MemoryStore();
+  await base.ensureBootstrap();
+  // Cut over, claim a room-only row, then roll the cursor back to 'd1'.
+  await base.setOperationStoreCutover("ten_roll", new Date().toISOString());
+  const roomStore = new OperationRoomStore(
+    { OPERATION_ROOM: namespace, SESSION_SECRET: OP_SECRET },
+    "ten_roll",
+    "prin_ops",
+  );
+  const claimed = await roomStore.claim(makeOpFor("ten_roll", "op_roll_1"));
+  assert.equal(claimed.outcome, "created");
+  await base.setOperationStoreCutover("ten_roll", "d1");
+
+  const resolver = createOperationStoreResolver(
+    { OWNMESH_OPERATION_STORE: "device_do", OPERATION_ROOM: namespace, SESSION_SECRET: OP_SECRET },
+    base,
+  );
+  const resolved = await resolver.forTenant("ten_roll", "prin_ops");
+  assert.equal(resolved.ops.backend, "d1");
+  assert.equal(resolved.auditCovered, false);
+  // DO-only rows stay readable.
+  assert.equal((await resolved.ops.get("op_roll_1"))?.status, "pending");
+  assert.equal(
+    (await resolved.ops.getByIdempotency({
+      principalId: "prin_ops",
+      tenantId: "ten_roll",
+      deviceId: "dev_ops",
+      idempotencyKey: "idem_op_roll_1",
+    }))?.operation_id,
+    "op_roll_1",
+  );
+  // New ownership fails closed until the room is drained/reconciled.
+  await assert.rejects(
+    resolved.ops.claim(makeOpFor("ten_roll", "op_roll_2")),
+    /operation_authority_temporarily_unavailable:rollback_pending/,
+  );
+  // In-flight terminal transitions still reach the room row.
+  const terminal = await resolved.ops.transition("op_roll_1", { status: "completed" }, ["pending"]);
+  assert.equal(terminal?.status, "completed");
+  assert.equal((await roomStore.get("op_roll_1"))?.status, "completed");
+});
+
+test("claim fence rejects a store resolved before a cutover lands", async () => {
+  const base = new MemoryStore();
+  await base.ensureBootstrap();
+  const env = {
+    OWNMESH_OPERATION_STORE: "device_do",
+    OPERATION_ROOM: {
+      idFromName: () => ({}),
+      get: () => ({
+        fetch: async () => new Response(JSON.stringify({ has_rows: false })),
+      }),
+    },
+    SESSION_SECRET: OP_SECRET,
+  };
+  const resolver = createOperationStoreResolver(env, base);
+  const resolved = await resolver.forTenant("ten_fence", "prin_ops");
+  assert.equal(resolved.ops.backend, "d1");
+  // Cut over after resolution: the cached store must not claim to D1.
+  await base.setOperationStoreCutover("ten_fence", new Date().toISOString());
+  await assert.rejects(
+    resolved.ops.claim(makeOpFor("ten_fence", "op_fence_1")),
+    /operation_authority_temporarily_unavailable:authority_changed/,
+  );
+});
+
+test("Hybrid dual ownership is detected instead of silently resolved", async () => {
+  const roomOp = makeOpFor("ten_conf", "op_owner_room");
+  const d1Op = makeOpFor("ten_conf", "op_owner_d1");
+  const primary = fakeOperationStore({
+    backend: "operation-room",
+    claim: async () => ({ outcome: "created" as const, op: roomOp }),
+    get: async () => roomOp,
+    getByIdempotency: async () => roomOp,
+    getByCorrelation: async () => roomOp,
+  });
+  let fallbackLookups = 0;
+  const fallback = fakeOperationStore({
+    claim: async () => ({ outcome: "created" as const, op: d1Op }),
+    get: async () => null,
+    getByIdempotency: async () => {
+      fallbackLookups += 1;
+      // Pre-claim check misses; post-create fence observes the concurrent
+      // D1 owner that landed during cutover propagation.
+      return fallbackLookups === 1 ? null : d1Op;
+    },
+  });
+  const hybrid = new HybridOperationStore(primary, fallback);
+  await assert.rejects(hybrid.claim(roomOp), /operation_authority_conflict:claim/);
+
+  const dualPrimary = fakeOperationStore({
+    backend: "operation-room",
+    getByIdempotency: async () => roomOp,
+  });
+  const dualFallback = fakeOperationStore({
+    getByIdempotency: async () => d1Op,
+  });
+  await assert.rejects(
+    new HybridOperationStore(dualPrimary, dualFallback).getByIdempotency({
+      principalId: "prin_ops",
+      tenantId: "ten_conf",
+      deviceId: "dev_ops",
+      idempotencyKey: "idem_op_owner_room",
+    }),
+    /operation_authority_conflict:idempotency/,
+  );
 });
 
 function fakeDoState() {
@@ -239,6 +411,46 @@ function fakeDoState() {
         }
         return out;
       },
+    },
+    blockConcurrencyWhile: async (fn: () => Promise<void>) => {
+      await fn();
+    },
+  };
+}
+
+/** Issue #244: fake SQLite-backed DO state with durable alarm support. */
+function fakeDoStateWithAlarms() {
+  const rows = new Map<string, unknown>();
+  let alarmAt: number | null = null;
+  const storage = {
+    get: async (key: string) => rows.get(key),
+    put: async (key: string, value: unknown) => {
+      rows.set(key, value);
+    },
+    delete: async (key: string) => rows.delete(key),
+    list: async (opts: { prefix: string; limit?: number; startAfter?: string }) => {
+      const out = new Map<string, unknown>();
+      for (const key of [...rows.keys()].sort()) {
+        if (!key.startsWith(opts.prefix)) continue;
+        if (opts.startAfter && key <= opts.startAfter) continue;
+        out.set(key, rows.get(key));
+        if (out.size >= (opts.limit ?? 128)) break;
+      }
+      return out;
+    },
+    setAlarm: async (at: number) => {
+      alarmAt = at;
+    },
+    getAlarm: async () => alarmAt,
+    deleteAlarm: async () => {
+      alarmAt = null;
+    },
+  };
+  return {
+    rows,
+    storage,
+    get alarmAt() {
+      return alarmAt;
     },
     blockConcurrencyWhile: async (fn: () => Promise<void>) => {
       await fn();
@@ -391,4 +603,203 @@ test("Hybrid over a real OperationRoom covers claim, poll, and terminal flows", 
 
   // Duplicate put across authorities is refused instead of shadowing.
   await assert.rejects(hybrid.put(makeOp("op_legacy_e2e")), /mcp_operation_exists/);
+});
+
+test("prune advances past the front page to reach later expiries", async () => {
+  const storage = new InMemoryDeviceOpStorage();
+  const log = new DeviceOperationLog(storage, 100);
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+  await log.put(makeOp("a_live_1"));
+  await log.put(makeOp("a_live_2"));
+  await log.put({
+    ...makeOp("z_expired", ""),
+    status: "failed",
+    idempotency_key: null,
+    created_at: old,
+    updated_at: old,
+  });
+  let deleted = 0;
+  let passes = 0;
+  // Batch smaller than the live prefix: only cursors can reach the back.
+  while (deleted === 0 && passes < 5) {
+    const stats = await log.prune("ten_ops", Date.now(), 2);
+    deleted += stats.deleted;
+    passes += 1;
+  }
+  assert.equal(deleted, 1);
+  assert.equal(await log.get("z_expired", "ten_ops"), null);
+  // Live rows survive with intact occupancy.
+  assert.ok(await log.get("a_live_1", "ten_ops"));
+  assert.ok(await log.get("a_live_2", "ten_ops"));
+});
+
+test("prune compacts front-page terminals and still reaches the back", async () => {
+  const storage = new InMemoryDeviceOpStorage();
+  const log = new DeviceOperationLog(storage, 100);
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+  // Keyed expired terminal compacts to a tombstone in the front page.
+  await log.put({ ...makeOp("a_keyed_terminal"), status: "completed", created_at: old, updated_at: old });
+  await log.put({
+    ...makeOp("z_keyless_terminal", ""),
+    status: "failed",
+    idempotency_key: null,
+    created_at: old,
+    updated_at: old,
+  });
+  let deleted = 0;
+  let compacted = 0;
+  for (let pass = 0; pass < 4 && deleted === 0; pass += 1) {
+    const stats = await log.prune("ten_ops", Date.now(), 1);
+    deleted += stats.deleted;
+    compacted += stats.compacted;
+  }
+  assert.equal(compacted, 1);
+  assert.equal(deleted, 1);
+  assert.equal((await log.get("a_keyed_terminal", "ten_ops"))?.status, "tombstone");
+  assert.equal(await log.get("z_keyless_terminal", "ten_ops"), null);
+});
+
+test("orphan correlation index is reaped despite healthy idempotency entries", async () => {
+  const storage = new InMemoryDeviceOpStorage();
+  const log = new DeviceOperationLog(storage, 1000);
+  // More healthy idempotency entries than the old shared 64-check budget, so
+  // the pre-fix scanner starves correlation cleanup on every pass.
+  for (let i = 0; i < 70; i += 1) {
+    await log.put(makeOp(`op_idem_${String(i).padStart(2, "0")}`));
+  }
+  await storage.put("dxcorr:v1:ten_ops:cor_orphan", "op_missing");
+  let reaped = 0;
+  for (let pass = 0; pass < 3 && reaped === 0; pass += 1) {
+    reaped += (await log.prune("ten_ops")).indexesReaped;
+  }
+  assert.equal(reaped, 1);
+  assert.equal(await storage.get("dxcorr:v1:ten_ops:cor_orphan"), undefined);
+});
+
+test("prune carries the cycle's next expiry across pages", async () => {
+  const storage = new InMemoryDeviceOpStorage();
+  const log = new DeviceOperationLog(storage, 100);
+  const soon = new Date(Date.now() - MCP_OPS_RESULT_TTL_MS + 10 * 60_000).toISOString();
+  await log.put({
+    ...makeOp("a_terminal", ""),
+    status: "completed",
+    idempotency_key: null,
+    created_at: soon,
+    updated_at: soon,
+  });
+  await log.put(makeOp("b_live"));
+  await log.put(makeOp("c_live"));
+  const expected = Date.parse(soon) + MCP_OPS_RESULT_TTL_MS;
+  const first = await log.prune("ten_ops", Date.now(), 2);
+  assert.equal(first.hasMore, true);
+  assert.equal(first.nextExpiryMs, null, "mid-cycle pages must not arm the alarm");
+  const second = await log.prune("ten_ops", Date.now(), 2);
+  assert.equal(second.hasMore, false);
+  assert.equal(
+    second.nextExpiryMs,
+    expected,
+    "the wrapped cycle must remember the early page's expiry",
+  );
+  assert.equal(await storage.get("dxnext:v1:ten_ops"), undefined);
+});
+
+test("alarm reschedules at the next expiry after a zero-deletion pass", async () => {
+  const state = fakeDoStateWithAlarms();
+  const room = new OperationRoom(
+    state as unknown as DurableObjectState,
+    { SESSION_SECRET: OP_SECRET, MCP_OPS_MAX_PER_TENANT: "100" },
+  );
+  const claimed = await opRoomCall(room, "ten_alarm", "claim", {
+    op: makeOpFor("ten_alarm", "op_alarm_1", ""),
+  });
+  assert.equal(claimed.json.outcome, "created");
+  const rowKey = "dxop:v1:ten_alarm:op_alarm_1";
+  const row = state.rows.get(rowKey) as Record<string, unknown>;
+  state.rows.set(rowKey, {
+    ...row,
+    status: "failed",
+    idempotency_key: null,
+    updated_at: new Date(Date.now() - MCP_OPS_RESULT_TTL_MS + 60_000).toISOString(),
+  });
+  await room.alarm();
+  // Nothing prunable yet, but the next expiry must be on the schedule.
+  assert.ok((state.rows.get(rowKey) as Record<string, unknown>));
+  const scheduled = state.alarmAt;
+  assert.ok(scheduled !== null, "alarm must be rescheduled at the next expiry");
+  const delta = scheduled! - Date.now();
+  assert.ok(delta > 30_000 && delta <= 61_000, `unexpected alarm delta ${delta}`);
+  // Expiry reached: the next alarm deletes it without any new request.
+  state.rows.set(rowKey, {
+    ...(state.rows.get(rowKey) as Record<string, unknown>),
+    updated_at: new Date(Date.now() - MCP_OPS_RESULT_TTL_MS - 1_000).toISOString(),
+  });
+  await room.alarm();
+  assert.equal(state.rows.get(rowKey), undefined);
+});
+
+test("alarm retries with bounded backoff after a transient prune failure", async () => {
+  const state = fakeDoStateWithAlarms();
+  const room = new OperationRoom(
+    state as unknown as DurableObjectState,
+    { SESSION_SECRET: OP_SECRET, MCP_OPS_MAX_PER_TENANT: "100" },
+  );
+  await opRoomCall(room, "ten_retry", "get", { operation_id: "op_none" });
+  const originalList = state.storage.list;
+  let failures = 1;
+  state.storage.list = async (opts) => {
+    if (failures > 0) {
+      failures -= 1;
+      throw new Error("D1_ERROR: database temporarily unavailable");
+    }
+    return originalList(opts);
+  };
+  await room.alarm();
+  assert.ok(state.alarmAt !== null, "transient failure must schedule a retry");
+  const delta = state.alarmAt! - Date.now();
+  assert.ok(delta > 60_000 && delta <= 121_000, `unexpected retry delta ${delta}`);
+  // Recovery: the next alarm runs the prune without throwing.
+  await room.alarm();
+});
+
+test("alarm arms the carried cycle expiry and resets the carry", async () => {
+  const state = fakeDoStateWithAlarms();
+  const room = new OperationRoom(
+    state as unknown as DurableObjectState,
+    { SESSION_SECRET: OP_SECRET, MCP_OPS_MAX_PER_TENANT: "100" },
+  );
+  await opRoomCall(room, "ten_carry", "get", { operation_id: "op_none" });
+  // Simulate a mid-cycle page that saw a future expiry, then wrapped.
+  const expiry = Date.now() + 90_000;
+  state.rows.set("dxnext:v1:ten_carry", expiry);
+  await room.alarm();
+  assert.ok(state.alarmAt !== null, "carried expiry must arm the next alarm");
+  assert.ok(
+    Math.abs(state.alarmAt! - expiry) < 5_000,
+    `expected alarm near the carried expiry, got delta ${state.alarmAt! - Date.now()}`,
+  );
+  assert.equal(state.rows.get("dxnext:v1:ten_carry"), undefined, "cycle carry resets");
+});
+
+test("empty room schedules no alarm and a terminal transition schedules one", async () => {
+  const state = fakeDoStateWithAlarms();
+  const room = new OperationRoom(
+    state as unknown as DurableObjectState,
+    { SESSION_SECRET: OP_SECRET, MCP_OPS_MAX_PER_TENANT: "100" },
+  );
+  await opRoomCall(room, "ten_idle", "get", { operation_id: "op_none" });
+  await room.alarm();
+  assert.equal(state.alarmAt, null);
+  const claimed = await opRoomCall(room, "ten_idle", "claim", {
+    op: makeOpFor("ten_idle", "op_idle_1"),
+  });
+  await state.storage.deleteAlarm();
+  assert.equal(claimed.json.outcome, "created");  const terminal = await opRoomCall(room, "ten_idle", "transition", {
+    operation_id: "op_idle_1",
+    transition: { status: "completed", summary: "done" },
+    from_statuses: ["pending"],
+  });
+  assert.equal((terminal.json.op as { status: string }).status, "completed");
+  // The terminal write itself must schedule retention so its result TTL is
+  // enforced even if no further request touches the tenant.
+  assert.ok(state.alarmAt !== null, "terminal transition must schedule a prune");
 });

@@ -171,16 +171,39 @@ tenant operation room so operation rows leave the D1 budget:
 3. Set the flag: `wrangler secret put OWNMESH_OPERATION_STORE` is not
    needed — it is a plain var: `"OWNMESH_OPERATION_STORE": "device_do"`.
    Without a cutover cursor this changes nothing (safe to deploy first).
+   Warning: after any tenant is cut over, removing this var hands every
+   tenant back to D1 immediately (room-only operations become invisible).
+   Use the per-tenant cursor for rollback instead; the flag is not a
+   rollback switch.
 4. Cut one tenant over (UTC ISO time):
    `wrangler d1 execute DB --command "INSERT INTO operation_store_cutover
    (tenant_id, cutover_at) VALUES ('<tenant>', '<iso>') ON CONFLICT(tenant_id)
    DO UPDATE SET cutover_at = excluded.cutover_at"`.
    Pre-cutover rows stay readable via hybrid fallback; in-flight operations
-   converge on retry. Roll back with `cutover_at = 'd1'`. Note: the Worker
-   caches cutover cursors for up to 60s per isolate, so a rollback (or
-   cutover) propagates within about a minute; rows written to the room in
-   that window keep their room receipts as the trail.
-5. Watch `/health/ready` (`auth_write_ready`, `budget_mode`,
+   converge on retry. Every ownership write re-reads the cursor and fails
+   closed (retryable 503) if the authority flips between resolution and the
+   claim, and a create on one side re-checks the other side before returning,
+   so a concurrent dual owner stops rather than dispatching twice.
+5. Roll back with `cutover_at = 'd1'`. Rollback is a drain, not a flag flip:
+   while the tenant's operation room still holds rows, new claims answer
+   retryable `operation_authority_temporarily_unavailable:rollback_pending`
+   and reads/terminal transitions keep falling through to the room. A cursor
+   read failure and a missing `OPERATION_ROOM`/`SESSION_SECRET` binding also
+   fail closed instead of silently using D1.
+   The drain finishes when the room holds no rows and claims stop returning
+   `rollback_pending`. Terminal results compact to tombstones at the result
+   TTL (7 days) and tombstones are retained for the idempotency window
+   (30 days), so a tenant whose room held keyed terminals can stay in
+   `rollback_pending` for up to 30 days. Plan the rollback accordingly:
+   terminalize and let the room alarm prune, or treat the cursor flip as a
+   one-way decision for that tenant until the window closes. Do not delete
+   room rows by hand unless losing the idempotency receipts for those keys is
+   acceptable.
+   If a claim reports a non-retryable `operation_authority_conflict`, both
+   stores own the same key: stop, inspect the D1 row (`wrangler d1 execute`)
+   and the room row directly (MCP reads show only the current authority's
+   view), and remove exactly one owner before retrying.
+6. Watch `/health/ready` (`auth_write_ready`, `budget_mode`,
    `budget_reset_at`) and the MCP `OWNMESH_QUOTA_*` errors. `auth_only`
    means D1 writes are exhausted: MCP fails fast and OAuth answers 503
    `temporarily_unavailable` + `Retry-After` until the UTC-midnight reset.

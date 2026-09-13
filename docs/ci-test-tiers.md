@@ -36,6 +36,13 @@ real-binary, security deep/full-history/strict-SBOM) never run as PR gates.
 They stay nightly/weekly/release-only (see job map below). Enforced by
 `plan.py`, this document, and `scripts/check_release_quality.py`.
 
+Planner path rules (Issue #246): every non-docs path is classified
+individually; one unclassified path (new directory, renamed/odd file) forces
+`full` even when other known paths are present. Docs-only paths never
+contribute protocol/catalog/fixture tiers in mixed PRs — a markdown file
+named `protocol.md` does not make the Rust tier run. `packages/ownmesh-schema`
+counts as schema + TypeScript + Rust (the contracts Rust tests also enforce).
+
 ## CodeRabbit automated operation
 
 Manual `@coderabbitai` calls are no longer required (kept as a fallback):

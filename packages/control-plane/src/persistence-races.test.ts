@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
 import { sha256Hex } from "./util.ts";
 
-function openStore(): { store: SqlStore; db: DatabaseSync } {
+function openStore(): { store: SqlStore; db: DatabaseSync; adapter: SqlDatabase } {
   const db = new DatabaseSync(":memory:");
   const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
   for (const file of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(join(dir, file), "utf8"));
@@ -41,7 +41,7 @@ function openStore(): { store: SqlStore; db: DatabaseSync } {
     batchTail = result.then(() => undefined, () => undefined);
     return result;
   }};
-  return { store: new SqlStore(adapter, "sqlite"), db };
+  return { store: new SqlStore(adapter, "sqlite"), db, adapter };
 }
 
 function store(): SqlStore {
@@ -167,27 +167,6 @@ test("SQL enrollment challenge CAS activates once", async () => {
   assert.equal((await s.getDevice("dev_race"))?.status, "active");
 });
 
-test("SQL approved device code CAS permits exactly one concurrent consumer", async () => {
-  const s = store(); await s.ensureBootstrap();
-  await s.putDeviceCode({
-    device_code: "dcode_race",
-    user_code: "BCDF-GHJK",
-    client_id: "client_ownmesh_cli",
-    scope: "ownmesh.read",
-    verification_uri: "https://cp.test/oauth/device",
-    interval_sec: 5,
-    expires_at: Date.now() + 60_000,
-    status: "approved",
-    principal_id: "prin_dev",
-  });
-  const results = await Promise.all([
-    s.consumeApprovedDeviceCode("dcode_race", "client_ownmesh_cli"),
-    s.consumeApprovedDeviceCode("dcode_race", "client_ownmesh_cli"),
-  ]);
-  assert.equal(results.filter(Boolean).length, 1);
-  assert.equal((await s.getDeviceCode("dcode_race"))?.status, "consumed");
-});
-
 test("SQL device verification transaction CAS permits exactly one concurrent consumer", async () => {
   const s = store(); await s.ensureBootstrap();
   await s.putDeviceCode({
@@ -303,6 +282,262 @@ test("SQL store fails closed when db.batch is absent for atomic device paths", a
     () => s.rotateRefresh(issued.refresh_token),
     /requires db\.batch/,
   );
+});
+
+test("SQL device-code exchange is atomic and converges post-commit retries", async () => {
+  const { store: s, db } = openStore(); await s.ensureBootstrap();
+  await s.putDeviceCode({
+    device_code: "dcode_atomic",
+    user_code: "ATOM-IC01",
+    client_id: "client_ownmesh_cli",
+    scope: "ownmesh.read offline_access",
+    verification_uri: "https://cp.test/oauth/device",
+    interval_sec: 5,
+    expires_at: Date.now() + 60_000,
+    status: "approved",
+    principal_id: "prin_dev",
+  });
+  // Inject a failure in the receipt insert: the batch must roll back the
+  // token insert and the consume together (never a consumed grant without a
+  // token, never a token without a receipt).
+  db.exec(`CREATE TRIGGER fail_device_receipt
+    BEFORE INSERT ON device_code_exchange_receipts
+    BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;`);
+  await assert.rejects(
+    () => s.exchangeApprovedDeviceCode({ deviceCode: "dcode_atomic", clientId: "client_ownmesh_cli" }),
+    /receipt failure/,
+  );
+  const codeHash = await sha256Hex("dcode_atomic");
+  const afterFailure = db.prepare(
+    `SELECT status FROM device_codes WHERE device_code_hash = ?`,
+  ).get(codeHash) as { status: string };
+  assert.equal(afterFailure.status, "approved", "failed exchange must not consume the grant");
+  assert.equal(Number((db.prepare(
+    `SELECT COUNT(*) AS n FROM oauth_tokens WHERE client_id = 'client_ownmesh_cli'`,
+  ).get() as { n: number }).n), 0);
+  db.exec("DROP TRIGGER fail_device_receipt");
+
+  // Recovery: same approved grant exchanges successfully exactly once.
+  const redeemed = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_atomic",
+    clientId: "client_ownmesh_cli",
+  });
+  assert.equal(redeemed.status, "redeemed");
+  if (redeemed.status !== "redeemed") return;
+  const replayed = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_atomic",
+    clientId: "client_ownmesh_cli",
+  });
+  assert.equal(replayed.status, "replayed");
+  if (replayed.status !== "replayed") return;
+  assert.equal(replayed.token.access_token, redeemed.token.access_token);
+  assert.equal(replayed.token.refresh_token, redeemed.token.refresh_token);
+  assert.equal(
+    Number((db.prepare(
+      `SELECT COUNT(*) AS n FROM oauth_tokens WHERE refresh_family = ?`,
+    ).get(redeemed.token.refresh_family) as { n: number }).n),
+    1,
+    "retries must not mint a second token family",
+  );
+
+  // Once the bounded receipt window closes, a replay fails closed.
+  db.prepare(`DELETE FROM device_code_exchange_receipts WHERE device_code_hash = ?`).run(codeHash);
+  const expired = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_atomic",
+    clientId: "client_ownmesh_cli",
+  });
+  assert.equal(expired.status, "invalid_grant");
+});
+
+test("SQL device-code exchange has one winner under concurrency and enforces audience", async () => {
+  const { store: s, db } = openStore(); await s.ensureBootstrap();
+  await s.putDeviceCode({
+    device_code: "dcode_conc",
+    user_code: "CONC-UR01",
+    client_id: "client_ownmesh_cli",
+    scope: "ownmesh.read",
+    verification_uri: "https://cp.test/oauth/device",
+    interval_sec: 5,
+    expires_at: Date.now() + 60_000,
+    status: "approved",
+    principal_id: "prin_dev",
+  });
+  const results = await Promise.all([
+    s.exchangeApprovedDeviceCode({ deviceCode: "dcode_conc", clientId: "client_ownmesh_cli" }),
+    s.exchangeApprovedDeviceCode({ deviceCode: "dcode_conc", clientId: "client_ownmesh_cli" }),
+  ]);
+  const redeemed = results.filter((r) => r.status === "redeemed");
+  const replayed = results.filter((r) => r.status === "replayed");
+  assert.equal(redeemed.length, 1, "exactly one exchange wins");
+  assert.equal(replayed.length, 1, "the loser converges on the winner's receipt");
+  assert.equal(
+    replayed[0]?.token.access_token,
+    redeemed[0]?.token.access_token,
+  );
+  assert.equal(Number((db.prepare(
+    `SELECT COUNT(*) AS n FROM oauth_tokens WHERE refresh_family = ?`,
+  ).get(redeemed[0]?.token.refresh_family) as { n: number }).n), 1);
+
+  // A bound device code rejects a different audience without consuming.
+  await s.putDeviceCode({
+    device_code: "dcode_bound",
+    user_code: "BOUND-AU01",
+    client_id: "client_ownmesh_cli",
+    scope: "ownmesh.read",
+    verification_uri: "https://cp.test/oauth/device",
+    interval_sec: 5,
+    expires_at: Date.now() + 60_000,
+    status: "approved",
+    principal_id: "prin_dev",
+    resource: "https://cp.test/mcp",
+  });
+  const mismatch = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_bound",
+    clientId: "client_ownmesh_cli",
+    resource: "https://evil.test/mcp",
+  });
+  assert.equal(mismatch.status, "invalid_grant");
+  assert.equal((await s.getDeviceCode("dcode_bound"))?.status, "approved");
+  const wrongClient = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_bound",
+    clientId: "client_other",
+  });
+  assert.equal(wrongClient.status, "invalid_grant");
+  const bound = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_bound",
+    clientId: "client_ownmesh_cli",
+    resource: "https://cp.test/mcp",
+  });
+  assert.equal(bound.status, "redeemed");
+  if (bound.status === "redeemed") {
+    assert.equal(bound.token.resource, "https://cp.test/mcp");
+  }
+});
+
+test("SQL device-code replay rejects revoked, rotated, and family-revoked tokens", async () => {
+  const { store: s, db } = openStore(); await s.ensureBootstrap();
+  const seed = async (code: string, userCode: string) => {
+    await s.putDeviceCode({
+      device_code: code,
+      user_code: userCode,
+      client_id: "client_ownmesh_cli",
+      scope: "ownmesh.read offline_access",
+      verification_uri: "https://cp.test/oauth/device",
+      interval_sec: 5,
+      expires_at: Date.now() + 60_000,
+      status: "approved",
+      principal_id: "prin_dev",
+    });
+  };
+
+  // Explicit revoke of the issued refresh token.
+  await seed("dcode_revoked", "REVK-0001");
+  const revoked = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_revoked",
+    clientId: "client_ownmesh_cli",
+  });
+  assert.equal(revoked.status, "redeemed");
+  if (revoked.status !== "redeemed") return;
+  await s.revokeToken(revoked.token.refresh_token);
+  assert.equal(
+    (await s.exchangeApprovedDeviceCode({
+      deviceCode: "dcode_revoked",
+      clientId: "client_ownmesh_cli",
+    })).status,
+    "invalid_grant",
+  );
+
+  // Rotation marks the persisted row refresh_used; replay must not serve it.
+  await seed("dcode_used", "USED-0001");
+  const used = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_used",
+    clientId: "client_ownmesh_cli",
+  });
+  assert.equal(used.status, "redeemed");
+  if (used.status !== "redeemed") return;
+  assert.equal((await s.rotateRefresh(used.token.refresh_token)).ok, true);
+  assert.equal(
+    (await s.exchangeApprovedDeviceCode({
+      deviceCode: "dcode_used",
+      clientId: "client_ownmesh_cli",
+    })).status,
+    "invalid_grant",
+  );
+
+  // A revoked refresh family must not replay either.
+  await seed("dcode_family", "FAM-0001");
+  const family = await s.exchangeApprovedDeviceCode({
+    deviceCode: "dcode_family",
+    clientId: "client_ownmesh_cli",
+  });
+  assert.equal(family.status, "redeemed");
+  if (family.status !== "redeemed") return;
+  db.prepare(
+    `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+  ).run(family.token.refresh_family, new Date().toISOString());
+  assert.equal(
+    (await s.exchangeApprovedDeviceCode({
+      deviceCode: "dcode_family",
+      clientId: "client_ownmesh_cli",
+    })).status,
+    "invalid_grant",
+  );
+});
+
+test("SQL retention sweep clears expired device-code exchange receipts", async () => {
+  const { store: s, db } = openStore(); await s.ensureBootstrap();
+  await s.putDeviceCode({
+    device_code: "dcode_sweep",
+    user_code: "SWEP-0001",
+    client_id: "client_ownmesh_cli",
+    scope: "ownmesh.read",
+    verification_uri: "https://cp.test/oauth/device",
+    interval_sec: 5,
+    expires_at: Date.now() + 60_000,
+    status: "approved",
+    principal_id: "prin_dev",
+  });
+  assert.equal(
+    (await s.exchangeApprovedDeviceCode({
+      deviceCode: "dcode_sweep",
+      clientId: "client_ownmesh_cli",
+    })).status,
+    "redeemed",
+  );
+  db.prepare(
+    `UPDATE device_code_exchange_receipts SET expires_at = ? WHERE device_code_hash = ?`,
+  ).run(new Date(Date.now() - 1_000).toISOString(), await sha256Hex("dcode_sweep"));
+  const stats = await s.runRetentionSweep();
+  assert.ok(stats.receiptsCleaned >= 1);
+  assert.equal(
+    Number((db.prepare(
+      `SELECT COUNT(*) AS n FROM device_code_exchange_receipts`,
+    ).get() as { n: number }).n),
+    0,
+  );
+});
+
+test("SQL cutover-read failures are classified: absent table tolerated, transient rethrown", async () => {
+  const { store: s, adapter } = openStore();
+  await s.ensureBootstrap();
+  const transient = new SqlStore({
+    ...adapter,
+    prepare(query: string): SqlStatement {
+      if (query.includes("FROM operation_store_cutover")) {
+        throw new Error("D1_ERROR: database temporarily unavailable");
+      }
+      return adapter.prepare(query);
+    },
+  }, "sqlite");
+  await transient.ensureBootstrap();
+  await assert.rejects(
+    () => transient.getOperationStoreCutover("ten_x"),
+    /temporarily unavailable/,
+  );
+  // Pre-0022 schema (table absent) is the only tolerated failure.
+  const legacy = openStore();
+  legacy.db.exec("DROP TABLE operation_store_cutover");
+  assert.equal(await legacy.store.getOperationStoreCutover("ten_x"), null);
 });
 
 test("SQL expired refresh is invalid_grant and never reuse", async () => {

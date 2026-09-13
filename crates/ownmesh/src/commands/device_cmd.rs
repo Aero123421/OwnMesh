@@ -6,6 +6,7 @@ use crate::auth::{
     update_device_metadata, AuthSession, DeviceInfo, SessionPaths,
 };
 use crate::cli::{Cli, DeviceCmd};
+use crate::commands::ipc_util::notify_running_daemon_agent_reload;
 use ownmesh_domain::ExitCode;
 use ownmesh_identity::PreferredSecretStore;
 use serde_json::json;
@@ -75,6 +76,11 @@ pub fn run_enroll(cli: &Cli) -> Result<(), ExitCode> {
             println!("  connect:     {}", result.connect_path);
             println!("  device key:  stored in OS keychain (private key never printed)");
         }
+        // Issue #248: wake a daemon that was already running before this
+        // enrollment so the Agent route connects without a manual restart.
+        // Best-effort and bounded; enrollment success is already printed and a
+        // service that starts later reads the credential at boot.
+        notify_running_daemon_agent_reload().await;
         Ok(())
     })
 }
@@ -288,6 +294,7 @@ fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
         let ctx = authed_context(cli).await?;
+        let session_local = ctx.session.device_id.as_deref() == Some(id);
         let ok = revoke_device(
             &ctx.http,
             &ctx.session.issuer,
@@ -300,19 +307,68 @@ fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
             eprintln!("device revoke failed: {err}");
             ExitCode::DeviceOffline
         })?;
+
+        // Issue #248: local cleanup is part of revoke. The local device may be
+        // identified by the session or by the stored credential when the
+        // session file was reset/lost. A read or delete failure is reported as
+        // a partial (non-success) outcome, never silently treated as "not the
+        // local device".
+        let mut local_cleanup_error: Option<String> = None;
+        if ok {
+            match ownmesh_identity::load_device_credential(&ctx.store) {
+                Ok(Some(credential)) => {
+                    if session_local || credential.device_id == id {
+                        if let Err(err) = ownmesh_identity::delete_device_credential(&ctx.store) {
+                            local_cleanup_error =
+                                Some(format!("delete local device credential: {err}"));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    local_cleanup_error = Some(format!("read local device credential: {err}"));
+                }
+            }
+        }
+
+        if ok && local_cleanup_error.is_none() {
+            if cli.json {
+                println!("{}", json!({"schema_version": 1, "ok": true, "id": id}));
+                crate::commands::fail::note_envelope_emitted();
+            } else {
+                println!("Device revoked: {id}");
+            }
+            // Only a fully cleaned-up local revoke may disable a running route.
+            notify_running_daemon_agent_reload().await;
+            return Ok(());
+        }
+        if ok {
+            let detail = local_cleanup_error
+                .unwrap_or_else(|| "local device credential cleanup failed".to_owned());
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({
+                        "schema_version": 1,
+                        "ok": false,
+                        "revoked": true,
+                        "id": id,
+                        "error": detail,
+                    })
+                );
+                crate::commands::fail::note_envelope_emitted();
+            } else {
+                eprintln!("Device revoked remotely, but local cleanup failed: {detail}");
+            }
+            return Err(ExitCode::Internal);
+        }
         if cli.json {
-            println!("{}", json!({"schema_version": 1, "ok": ok, "id": id}));
+            println!("{}", json!({"schema_version": 1, "ok": false, "id": id}));
             crate::commands::fail::note_envelope_emitted();
-        } else if ok {
-            println!("Device revoked: {id}");
         } else {
             println!("Device revoke returned ok=false for {id}");
         }
-        if ok {
-            Ok(())
-        } else {
-            Err(ExitCode::Conflict)
-        }
+        Err(ExitCode::Conflict)
     })
 }
 
@@ -332,7 +388,7 @@ fn run_rotate_key(cli: &Cli) -> Result<(), ExitCode> {
     })?;
 
     // Best-effort re-enroll so the control plane learns the new public key.
-    let reenrolled = try_reenroll_after_rotate(cli);
+    let (reenrolled, reload_needed) = try_reenroll_after_rotate(cli);
 
     if cli.json {
         println!(
@@ -358,15 +414,28 @@ fn run_rotate_key(cli: &Cli) -> Result<(), ExitCode> {
             println!("  note: run `ownmesh device enroll` to register the new public key");
         }
     }
+    // Issue #248: switch a running daemon to the new device identity after the
+    // success output. Best-effort and bounded.
+    if reload_needed {
+        if let Ok(rt) = runtime() {
+            rt.block_on(async {
+                notify_running_daemon_agent_reload().await;
+            });
+        }
+    }
     Ok(())
 }
 
-fn try_reenroll_after_rotate(cli: &Cli) -> Option<String> {
-    let rt = runtime().ok()?;
+fn try_reenroll_after_rotate(cli: &Cli) -> (Option<String>, bool) {
+    let Some(rt) = runtime().ok() else {
+        return (None, false);
+    };
     rt.block_on(async {
-        let ctx = authed_context(cli).await.ok()?;
+        let Some(ctx) = authed_context(cli).await.ok() else {
+            return (None, false);
+        };
         if ctx.session.issuer.is_empty() {
-            return None;
+            return (None, false);
         }
         match enroll_device(
             &ctx.http,
@@ -378,10 +447,10 @@ fn try_reenroll_after_rotate(cli: &Cli) -> Option<String> {
         )
         .await
         {
-            Ok(r) => Some(r.device_id),
+            Ok(r) => (Some(r.device_id), true),
             Err(err) => {
                 eprintln!("warning: re-enroll after rotate failed: {err}");
-                None
+                (None, false)
             }
         }
     })

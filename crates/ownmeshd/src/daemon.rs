@@ -100,6 +100,15 @@ async fn run_async() -> Result<(), ExitCode> {
         .await
         .install_workspace_registry_notify(Arc::clone(&workspace_registry_notify));
 
+    // Issue #248: `ownmesh device enroll` wakes the transport supervisor so a
+    // daemon that started before enrollment picks up the credential without a
+    // manual service restart.
+    let agent_reload_notify = Arc::new(tokio::sync::Notify::new());
+    runtime
+        .lock()
+        .await
+        .install_agent_reload_notify(Arc::clone(&agent_reload_notify));
+
     // P1-E review (ADR 0011): surface the effective-sandbox condition that
     // makes OwnMesh custody validation unsound BEFORE the first state access.
     // A systemd `--user` unit that forces a user namespace (PrivateUsers=yes
@@ -143,30 +152,17 @@ async fn run_async() -> Result<(), ExitCode> {
     );
 
     let (transport_shutdown, transport_shutdown_rx) = watch::channel(false);
-    let transport_task = match agent_transport::configured_transport(
-        &paths,
-        &cfg,
-        Some(workspace_registry_notify),
-    ) {
-        Ok(Some(config)) => Some(tokio::spawn(agent_transport::run(
-            config,
-            Some(runtime),
-            transport_shutdown_rx,
-            Some(presence_tx),
-        ))),
-        Ok(None) => {
-            drop(presence_tx);
-            tracing::info!("no active enrolled device credential; remote Agent transport disabled");
-            None
-        }
-        Err(err) => {
-            drop(presence_tx);
-            // Fail closed for remote connectivity while keeping the local IPC
-            // boundary available for repair/re-enrollment.
-            tracing::error!(error = %err, "remote Agent transport configuration rejected");
-            None
-        }
-    };
+    // Issue #248: a supervisor owns the transport lifecycle so a credential
+    // that appears after startup (device enroll) enables the route without a
+    // service restart, and a changed credential is picked up on reload.
+    let transport_task = tokio::spawn(agent_transport::supervise(
+        paths.clone(),
+        Arc::clone(&runtime),
+        Arc::clone(&workspace_registry_notify),
+        presence_tx,
+        transport_shutdown_rx,
+        agent_reload_notify,
+    ));
 
     wait_for_shutdown().await?;
 
@@ -175,9 +171,8 @@ async fn run_async() -> Result<(), ExitCode> {
     server.request_shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(2), serve_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), cleanup_task).await;
-    if let Some(task) = transport_task {
-        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
-    }
+    // The supervisor may spend up to ~3s stopping a running transport.
+    let _ = tokio::time::timeout(Duration::from_secs(5), transport_task).await;
     tracing::info!("ownmeshd stopped");
     Ok(())
 }

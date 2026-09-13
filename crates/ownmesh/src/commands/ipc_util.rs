@@ -4,7 +4,9 @@ use crate::cli::Cli;
 use crate::commands::fail::fail;
 use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::{app_error, ClientIdentity, ClientOptions, Endpoint, IpcClient, IpcError};
+use ownmesh_ipc::{
+    app_error, methods, ClientIdentity, ClientOptions, Endpoint, IpcClient, IpcError,
+};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -17,9 +19,19 @@ pub const DAEMON_OFFLINE_HINT: &str =
 
 /// Build a short-lived client targeting the local daemon.
 pub fn connect_daemon(cli: &Cli) -> Result<(OwnMeshPaths, IpcClient), ExitCode> {
+    build_daemon_client()
+        .map_err(|(code, message, hint, exit)| fail(cli, code, message, hint, exit))
+}
+
+/// Stable diagnostics for a client-construction failure: code, message, hint,
+/// exit status.
+type DaemonClientError = (&'static str, String, Option<&'static str>, ExitCode);
+
+/// Silent variant of [`connect_daemon`] for best-effort notifications where
+/// emitting a failure envelope would corrupt the command's own output.
+fn build_daemon_client() -> Result<(OwnMeshPaths, IpcClient), DaemonClientError> {
     let paths = OwnMeshPaths::discover().map_err(|err| {
-        fail(
-            cli,
+        (
             "OWNMESH_E_CONFIG_PATH",
             format!("config path error: {err}"),
             None,
@@ -28,8 +40,7 @@ pub fn connect_daemon(cli: &Cli) -> Result<(OwnMeshPaths, IpcClient), ExitCode> 
     })?;
     let _ = paths.ensure_layout();
     let cfg = load_config(&paths).map_err(|err| {
-        fail(
-            cli,
+        (
             "OWNMESH_E_CONFIG_LOAD",
             format!("config load error: {err}"),
             Some("run `ownmesh config validate` to see what is wrong"),
@@ -47,35 +58,113 @@ pub fn connect_daemon(cli: &Cli) -> Result<(OwnMeshPaths, IpcClient), ExitCode> 
                 } else {
                     None
                 };
-                fail(
-                    cli,
+                (
                     "OWNMESH_E_SERVICE_ENDPOINT",
                     format!("service endpoint configuration error: {err}"),
                     hint,
                     ExitCode::UsageConfig,
                 )
             })?;
-    let client = IpcClient::new(
+    Ok((
+        paths.clone(),
+        build_client(paths, endpoint, Duration::from_secs(60), 3).map_err(|message| {
+            (
+                "OWNMESH_E_CLIENT_CREDENTIAL",
+                message,
+                None,
+                ExitCode::UsageConfig,
+            )
+        })?,
+    ))
+}
+
+/// Pure read of `service_socket.path` (no lock, no recovery, no create).
+/// Missing config means "use the default endpoint"; a read or parse failure is
+/// an error so a probe/notify never targets the wrong daemon silently.
+fn configured_socket_path_readonly(paths: &OwnMeshPaths) -> Result<Option<String>, ()> {
+    match std::fs::read_to_string(paths.config_file()) {
+        Ok(raw) => toml::from_str::<ownmesh_config::OwnMeshConfig>(&raw)
+            .map(|cfg| cfg.service_socket.path.clone())
+            .map_err(|_| ()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// Construct the IPC client (shared by the strict and probe builders).
+fn build_client(
+    paths: OwnMeshPaths,
+    endpoint: Endpoint,
+    request_timeout: Duration,
+    max_reconnect_attempts: u32,
+) -> Result<IpcClient, String> {
+    IpcClient::new(
         endpoint,
         paths.runtime_dir.clone(),
         ClientIdentity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
         ClientOptions {
-            request_timeout: Duration::from_secs(60),
-            max_reconnect_attempts: 3,
-            reconnect_base_delay: Duration::from_millis(50),
+            request_timeout,
+            max_reconnect_attempts,
+            reconnect_base_delay: Duration::from_millis(20),
         },
     )
     .with_client_credential_from_env_or_management_file(&paths.state_dir)
-    .map_err(|err| {
-        fail(
-            cli,
-            "OWNMESH_E_CLIENT_CREDENTIAL",
-            format!("client credential configuration error: {err}"),
-            None,
-            ExitCode::UsageConfig,
-        )
-    })?;
-    Ok((paths, client))
+    .map_err(|err| format!("client credential configuration error: {err}"))
+}
+
+/// Issue #248: bounded read-only probe of the daemon's live Agent route for
+/// display surfaces (`doctor`, `service status`). Returns `None` when the
+/// daemon is unreachable, the client cannot be built, the probe times out, or
+/// the route is not one of the known states — never fails the caller and never
+/// mutates the local layout.
+pub fn observe_agent_route(timeout: Duration) -> Option<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    rt.block_on(async {
+        let probe = async {
+            let client = build_daemon_probe_client(timeout)?;
+            let value = client.call(methods::ROUTE_STATUS, None).await.ok()?;
+            value
+                .get("route")
+                .and_then(Value::as_str)
+                .filter(|route| matches!(*route, "online" | "offline" | "disabled" | "unknown"))
+                .map(str::to_owned)
+        };
+        // The request timeout does not cover dial/hello, so bound the whole
+        // probe. Display surfaces must never hang on a wedged daemon.
+        tokio::time::timeout(timeout, probe).await.ok().flatten()
+    })
+}
+
+/// Build a client for read-only probes without creating or migrating local
+/// state (`ensure_layout` / blocking config lock are deliberately skipped).
+fn build_daemon_probe_client(request_timeout: Duration) -> Option<IpcClient> {
+    let paths = OwnMeshPaths::discover().ok()?;
+    let socket_path = configured_socket_path_readonly(&paths).ok()?;
+    let endpoint = Endpoint::configured_daemon(&paths.runtime_dir, socket_path.as_deref()).ok()?;
+    build_client(paths, endpoint, request_timeout, 1).ok()
+}
+
+/// Issue #248: ask a running daemon to re-read the enrolled device credential.
+///
+/// Best-effort by design: `device enroll` has already succeeded and must not
+/// fail or print an error envelope just because the user service is stopped
+/// (a later service start reads the credential at boot). Never sends or
+/// returns secret material.
+pub async fn notify_running_daemon_agent_reload() {
+    // Bounded end-to-end: client construction is a pure read and the whole
+    // request (including dial/hello) is wrapped, so a wedged daemon cannot
+    // delay the CLI's already-printed success.
+    let Some(client) = build_daemon_probe_client(Duration::from_secs(2)) else {
+        return;
+    };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.call(methods::AGENT_RELOAD, None),
+    )
+    .await;
 }
 
 /// Classify an IPC error into a stable code, message, hint, and exit status.

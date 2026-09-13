@@ -32,8 +32,8 @@ import { createStore, boundMcpOperationRecord, type ControlPlaneStore, type McpO
 import { DeviceOperationLog, type DeviceOpStorage } from "./device-op-store.ts";
 import {
   D1OperationStore,
-  HybridOperationStore,
-  OperationRoomStore,
+  OperationAuthorityUnavailableError,
+  createOperationStoreResolver,
   operationRoomOpsLimit,
   resolveOperationStoreMode,
   type OperationStore,
@@ -907,6 +907,20 @@ export class DeviceRoomRouter {
       }
     }
     return removed;
+  }
+
+  /**
+   * Issue #243: put pruned-but-unreconciled entries back after a failed
+   * reconcile so the next pass can still terminalize them instead of silently
+   * losing the pending obligation from the in-memory router. A newer entry for
+   * the same correlation is never clobbered.
+   */
+  restoreExpiredPending(expired: readonly PendingOperation[]): void {
+    for (const pending of expired) {
+      if (!this.pending.has(pending.correlation_id)) {
+        this.pending.set(pending.correlation_id, pending);
+      }
+    }
   }
 
   /**
@@ -2130,7 +2144,9 @@ export class DeviceRoom {
         try {
           await this.reconcileExpiredPending(expired);
           await this.persistNow();
-        } catch {
+        } catch (error) {
+          this.router.restoreExpiredPending(expired);
+          if (error instanceof OperationAuthorityUnavailableError) return;
           this.storageBroken = true;
           this.failClosedAll("storage unavailable", 1013);
         }
@@ -2198,38 +2214,21 @@ export class DeviceRoom {
    * Issue #224 (P2): operation authority for one tenant.
    * device_do + cutover -> Hybrid over the tenant OperationRoom with D1
    * fallback for pre-cutover rows; otherwise the D1 adapter (unchanged).
-   * Throws storage_unavailable when the device record cannot be read, so
-   * callers fail closed instead of routing to the wrong authority.
+   * Issue #243: resolution failures and rollback-pending states throw instead
+   * of silently routing to D1, so callers fail closed on unknown authority.
    */
   private async deviceOpStore(): Promise<{ ops: OperationStore; tenantId: string }> {
-    const d1 = new D1OperationStore(createStore(this.env));
-    if (resolveOperationStoreMode(this.env) !== "device_do") {
-      return { ops: d1, tenantId: "" };
-    }
     const store = createStore(this.env);
+    if (resolveOperationStoreMode(this.env) !== "device_do") {
+      return { ops: new D1OperationStore(store), tenantId: "" };
+    }
     const device = await store.getDevice(this.deviceId);
     if (!device) throw new Error("storage_unavailable:unknown_device");
-    // Same cutover gate as the Worker side: without a cursor this tenant
-    // stays D1-authoritative, so room paths can never fork authority.
-    let cutover: string | null = null;
-    try {
-      cutover = await store.getOperationStoreCutover(device.tenant_id);
-    } catch {
-      return { ops: d1, tenantId: device.tenant_id };
-    }
-    if (!cutover || cutover === "d1") return { ops: d1, tenantId: device.tenant_id };
-    const roomEnv = {
-      OPERATION_ROOM: this.env.OPERATION_ROOM,
-      SESSION_SECRET: this.env.SESSION_SECRET,
-    };
-    if (!roomEnv.OPERATION_ROOM || !roomEnv.SESSION_SECRET) return { ops: d1, tenantId: device.tenant_id };
-    return {
-      ops: new HybridOperationStore(
-        new OperationRoomStore(roomEnv, device.tenant_id, device.principal_id),
-        d1,
-      ),
-      tenantId: device.tenant_id,
-    };
+    const resolved = await createOperationStoreResolver(this.env, store).forTenant(
+      device.tenant_id,
+      device.principal_id,
+    );
+    return { ops: resolved.ops, tenantId: device.tenant_id };
   }
 
   /**
@@ -2237,23 +2236,15 @@ export class DeviceRoom {
    * Used on authenticated request paths carrying tenant claims.
    */
   private async tenantOpStore(tenantId: string, principalId: string): Promise<OperationStore> {
-    const d1 = new D1OperationStore(createStore(this.env));
-    if (resolveOperationStoreMode(this.env) !== "device_do" || !tenantId) return d1;
-    try {
-      const cutover = await createStore(this.env).getOperationStoreCutover(tenantId);
-      if (!cutover || cutover === "d1") return d1;
-    } catch {
-      return d1;
+    const store = createStore(this.env);
+    if (resolveOperationStoreMode(this.env) !== "device_do" || !tenantId) {
+      return new D1OperationStore(store);
     }
-    const roomEnv = {
-      OPERATION_ROOM: this.env.OPERATION_ROOM,
-      SESSION_SECRET: this.env.SESSION_SECRET,
-    };
-    if (!roomEnv.OPERATION_ROOM || !roomEnv.SESSION_SECRET) return d1;
-    return new HybridOperationStore(
-      new OperationRoomStore(roomEnv, tenantId, principalId),
-      d1,
+    const resolved = await createOperationStoreResolver(this.env, store).forTenant(
+      tenantId,
+      principalId,
     );
+    return resolved.ops;
   }
 
   private async restoreFromStorage(): Promise<void> {
@@ -2329,7 +2320,10 @@ export class DeviceRoom {
     let ops: OperationStore;
     try {
       ops = (await this.deviceOpStore()).ops;
-    } catch {
+    } catch (error) {
+      // Issue #243: a transient authority-resolution failure is retryable and
+      // leaves room state intact; never collapse it into a broken-storage path.
+      if (error instanceof OperationAuthorityUnavailableError) throw error;
       throw new Error("storage_unavailable");
     }
     for (const pending of expired) {
@@ -2579,7 +2573,8 @@ export class DeviceRoom {
     if (!this.env.DB) throw new Error("storage_unavailable");
     const store = createStore(this.env);
     // Issue #224 (P2): terminal fences read operation authority (room or D1).
-    const { ops } = await this.deviceOpStore().catch(() => {
+    const { ops } = await this.deviceOpStore().catch((error) => {
+      if (error instanceof OperationAuthorityUnavailableError) throw error;
       throw new Error("storage_unavailable");
     });
     let removed = false;
@@ -2674,7 +2669,8 @@ export class DeviceRoom {
   private async authoritativeTerminalCorrelations(correlations: string[]): Promise<string[]> {
     if (!this.env.DB || correlations.length === 0) return [];
     // Tenant-resolved operation authority (room or D1) for the fence check.
-    const { ops } = await this.deviceOpStore().catch(() => {
+    const { ops } = await this.deviceOpStore().catch((error) => {
+      if (error instanceof OperationAuthorityUnavailableError) throw error;
       throw new Error("storage_unavailable");
     });
     const terminalCorrelations: string[] = [];
@@ -2711,7 +2707,11 @@ export class DeviceRoom {
         try {
           await this.reconcileExpiredPending(expired);
           await this.persistNow();
-        } catch {
+        } catch (error) {
+          this.router.restoreExpiredPending(expired);
+          if (error instanceof OperationAuthorityUnavailableError) {
+            return json({ error: "storage_unavailable", hibernation: true }, { status: 503 });
+          }
           this.storageBroken = true;
           this.failClosedAll("storage unavailable", 1013);
           return json({ error: "storage_unavailable", hibernation: true }, { status: 503 });
@@ -2941,7 +2941,10 @@ export class DeviceRoom {
             });
           }
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof OperationAuthorityUnavailableError) {
+          return json({ error: "storage_unavailable" }, { status: 503 });
+        }
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return json({ error: "storage_unavailable" }, { status: 503 });
@@ -3094,6 +3097,7 @@ export class DeviceRoom {
           await this.reconcileExpiredPending(pruned);
           await this.persistNow();
         } catch {
+          this.router.restoreExpiredPending(pruned);
           return json({ error: "storage_unavailable" }, { status: 503 });
         }
       }
@@ -3429,7 +3433,9 @@ export class DeviceRoom {
       try {
         await this.reconcileExpiredPending(expiredBeforeMessage);
         await this.persistNow();
-      } catch {
+      } catch (error) {
+        this.router.restoreExpiredPending(expiredBeforeMessage);
+        if (error instanceof OperationAuthorityUnavailableError) return;
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;
@@ -3489,7 +3495,11 @@ export class DeviceRoom {
     if (result.ok && result.expired_pending && result.expired_pending.length > 0) {
       try {
         await this.reconcileExpiredPending(result.expired_pending);
-      } catch {
+      } catch (error) {
+        // Issue #243: transient authority resolution is retryable; keep the
+        // room usable instead of failing every socket closed.
+        this.router.restoreExpiredPending(result.expired_pending);
+        if (error instanceof OperationAuthorityUnavailableError) return;
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;
@@ -3502,7 +3512,8 @@ export class DeviceRoom {
           result.agent_ready_session_id,
           result.agent_pending_correlations || [],
         );
-      } catch {
+      } catch (error) {
+        if (error instanceof OperationAuthorityUnavailableError) return;
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;
@@ -3530,7 +3541,8 @@ export class DeviceRoom {
           session_id: result.operation_reconcile_request.session_id,
           frame: JSON.stringify(ack),
         };
-      } catch {
+      } catch (error) {
+        if (error instanceof OperationAuthorityUnavailableError) return;
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;
@@ -3548,7 +3560,8 @@ export class DeviceRoom {
       try {
         const store = createStore(this.env);
         // Issue #224 (P2): device results CAS into operation authority.
-        const { ops } = await this.deviceOpStore().catch(() => {
+        const { ops } = await this.deviceOpStore().catch((error) => {
+          if (error instanceof OperationAuthorityUnavailableError) throw error;
           throw new Error("storage_unavailable");
         });
         const pending = corr ? this.router.pending.get(corr) : undefined;
@@ -3600,6 +3613,9 @@ export class DeviceRoom {
           };
         }
       } catch (err) {
+        // Issue #243: a transient authority-resolution failure is retryable
+        // and leaves room state intact; do not close every socket for it.
+        if (err instanceof OperationAuthorityUnavailableError) return;
         // Store write failure: fail closed, no success forward.
         this.storageBroken = true;
         const detail = err instanceof Error ? err.message : String(err);
@@ -3730,7 +3746,9 @@ export class DeviceRoom {
     try {
       await this.reconcileExpiredPending(expired);
       await this.persistNow();
-    } catch {
+    } catch (error) {
+      this.router.restoreExpiredPending(expired);
+      if (error instanceof OperationAuthorityUnavailableError) return;
       this.storageBroken = true;
       this.failClosedAll("storage unavailable", 1013);
     }
@@ -4542,6 +4560,10 @@ export async function applyMcpOperationResult(
 const OP_ROOM_TENANT_KEY = "dxmeta:v1:tenant";
 /** Prune cadence after mutating writes (alarm coalesces; bounded work). */
 const OP_ROOM_PRUNE_ALARM_DELAY_MS = 5 * 60 * 1000;
+/** Follow-up delay while the resumable prune still has backlog (Issue #245). */
+const OP_ROOM_PRUNE_FOLLOWUP_MS = 60_000;
+/** Durable backoff after a transient prune failure (Issue #244). */
+const OP_ROOM_PRUNE_RETRY_MS = 120_000;
 
 const OP_STORE_ACTIONS = new Set([
   "claim",
@@ -4549,6 +4571,7 @@ const OP_STORE_ACTIONS = new Set([
   "get",
   "get_by_idempotency",
   "get_by_correlation",
+  "has_rows",
   "transition",
   "update",
 ]);
@@ -4591,8 +4614,22 @@ export class OperationRoom {
       put: (key: string, value: unknown) => backing.put(key, value).then(() => undefined),
       delete: (key: string) => backing.delete(key),
       list: async (prefix: string, limit = 128) => {
-        if (typeof backing.list !== "function") return [];
+        if (typeof backing.list !== "function") {
+          throw new Error("operation_authority_temporarily_unavailable:room_list_unavailable");
+        }
         const entries = await backing.list({ prefix, limit });
+        return [...entries.keys()];
+      },
+      // Issue #245: SQLite-backed DO storage resumes scans with startAfter.
+      listAfter: async (prefix: string, after: string, limit = 128) => {
+        if (typeof backing.list !== "function") {
+          throw new Error("operation_authority_temporarily_unavailable:room_list_unavailable");
+        }
+        const entries = await backing.list({
+          prefix,
+          limit,
+          ...(after ? { startAfter: after } : {}),
+        });
         return [...entries.keys()];
       },
     };
@@ -4608,43 +4645,60 @@ export class OperationRoom {
     await this.storage().put(OP_ROOM_TENANT_KEY, tenantId);
   }
 
-  private schedulePrune(delayMs = OP_ROOM_PRUNE_ALARM_DELAY_MS): void {
-    try {
-      const storage = this.state.storage as unknown as {
-        setAlarm?: (t: number) => Promise<void>;
-        getAlarm?: () => Promise<number | null>;
-      };
-      if (typeof storage.setAlarm !== "function") return;
-      const setAlarm = storage.setAlarm.bind(storage);
-      const getAlarm = typeof storage.getAlarm === "function"
-        ? storage.getAlarm.bind(storage)
-        : null;
-      const schedule = async () => {
-        // Do not postpone an already-pending earlier alarm under write load.
-        if (getAlarm) {
-          const current = await getAlarm().catch(() => null);
-          if (current !== null && current <= Date.now() + delayMs) return;
-        }
-        await setAlarm(Date.now() + delayMs);
-      };
-      void schedule().catch(() => undefined);
-    } catch {
-      // Alarm is best-effort hygiene; TTL rows stay readable until pruned.
+  /**
+   * Issue #244: retention continuation is explicit, not best-effort. Resolves
+   * `true` when an alarm is pending at/before the requested time, `false` when
+   * the platform has no alarm API (tests), and throws when `setAlarm` fails so
+   * the alarm handler can surface the failure instead of silently stopping.
+   */
+  private async schedulePrune(delayMs = OP_ROOM_PRUNE_ALARM_DELAY_MS): Promise<boolean> {
+    const storage = this.state.storage as unknown as {
+      setAlarm?: (t: number) => Promise<void>;
+      getAlarm?: () => Promise<number | null>;
+    };
+    if (typeof storage.setAlarm !== "function") return false;
+    const setAlarm = storage.setAlarm.bind(storage);
+    const getAlarm = typeof storage.getAlarm === "function"
+      ? storage.getAlarm.bind(storage)
+      : null;
+    // Do not postpone an already-pending earlier alarm under write load.
+    if (getAlarm) {
+      let current: number | null = null;
+      try {
+        current = await getAlarm();
+      } catch {
+        current = null;
+      }
+      if (current !== null && current <= Date.now() + delayMs) return true;
     }
+    await setAlarm(Date.now() + delayMs);
+    return true;
   }
 
   async alarm(): Promise<void> {
     await this.ready;
     if (!this.tenantId) return;
+    let stats: Awaited<ReturnType<DeviceOperationLog["prune"]>>;
     try {
-      const stats = await this.log().prune(this.tenantId);
-      // Backlog remains: follow up soon instead of waiting a full interval.
-      if (stats.deleted + stats.compacted + stats.indexesReaped > 0) {
-        this.schedulePrune(60_000);
-      }
+      stats = await this.log().prune(this.tenantId);
     } catch {
-      // Next alarm retries; alarms must never throw operation state away.
+      // Issue #244: never resolve into a stopped schedule. Durable bounded
+      // backoff; if even that fails, throw so the platform retries the alarm.
+      await this.schedulePrune(OP_ROOM_PRUNE_RETRY_MS);
+      return;
     }
+    // Backlog remains (more keys than one pass, or index scans unfinished):
+    // follow up soon until a full pass wrap.
+    if (stats.hasMore) {
+      await this.schedulePrune(OP_ROOM_PRUNE_FOLLOWUP_MS);
+      return;
+    }
+    // Nothing to do at all: pending rows only become prunable through a write
+    // (claim/put/transition/update), and those paths schedule their own pass.
+    if (stats.nextExpiryMs === null) return;
+    // Arm the carried cycle expiry directly; intervening writes can only move
+    // the next alarm earlier (schedulePrune never postpones an earlier one).
+    await this.schedulePrune(Math.max(1_000, stats.nextExpiryMs - Date.now()));
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -4699,11 +4753,11 @@ export class OperationRoom {
           if (!op) return json({ error: "invalid_operation" }, { status: 400 });
           if (body.action === "claim") {
             const claimed = await log.claim(op);
-            this.schedulePrune();
+            await this.schedulePrune().catch(() => false);
             return json({ outcome: claimed.outcome, op: claimed.op });
           }
           await log.put(op);
-          this.schedulePrune();
+          await this.schedulePrune().catch(() => false);
           return json({});
         }
         case "get": {
@@ -4736,6 +4790,9 @@ export class OperationRoom {
           }
           return json({ op: await log.getByCorrelation(body.correlation_id, tenantId) });
         }
+        case "has_rows": {
+          return json({ has_rows: await log.hasRows(tenantId) });
+        }
         case "transition": {
           if (typeof body.operation_id !== "string" || !body.operation_id) {
             return json({ error: "operation_id_required" }, { status: 400 });
@@ -4744,7 +4801,11 @@ export class OperationRoom {
           if (!transition) return json({ error: "invalid_transition" }, { status: 400 });
           const from = readStatuses(body.from_statuses);
           if (from === null) return json({ error: "invalid_from_statuses" }, { status: 400 });
-          return json({ op: await log.transition(body.operation_id, tenantId, transition, from) });
+          const op = await log.transition(body.operation_id, tenantId, transition, from);
+          // Issue #244: a terminal transition may create a future expiry even
+          // when the request path never claims again.
+          if (op) await this.schedulePrune().catch(() => false);
+          return json({ op });
         }
         case "update": {
           if (typeof body.operation_id !== "string" || !body.operation_id) {
@@ -4759,15 +4820,15 @@ export class OperationRoom {
               ? (body.expected_data as Record<string, unknown>)
               : null;
           if (expected === null) return json({ error: "invalid_expected_data" }, { status: 400 });
-          return json({
-            op: await log.update(
-              body.operation_id,
-              tenantId,
-              body.patch as Partial<McpOperationRecord>,
-              from,
-              expected,
-            ),
-          });
+          const op = await log.update(
+            body.operation_id,
+            tenantId,
+            body.patch as Partial<McpOperationRecord>,
+            from,
+            expected,
+          );
+          if (op) await this.schedulePrune().catch(() => false);
+          return json({ op });
         }
         default:
           return json({ error: "unknown_action" }, { status: 400 });

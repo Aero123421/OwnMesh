@@ -93,6 +93,16 @@ export function classifyD1Error(error: unknown): D1ErrorCategory {
   ) {
     return "schema_missing";
   }
+  // Issue #243: operation authority resolution failures (unreadable cutover
+  // cursor, missing room bindings, rollback pending) converge on the shared
+  // retryable 503 contract. A dual-owner conflict is NOT retryable: it is a
+  // stable state that needs operator reconciliation.
+  if (message.includes("operation_authority_conflict")) {
+    return "constraint_conflict";
+  }
+  if (message.includes("operation_authority_")) {
+    return "transient_unavailable";
+  }
   if (
     message.includes("unique constraint failed") ||
     message.includes("primary key") ||

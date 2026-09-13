@@ -24,7 +24,6 @@
 import {
   boundMcpOperationRecord,
   hasMcpIdempotencyReceipt,
-  isTerminalMcpStatus,
   mcpOpAgeMs,
   nowIso,
   MCP_OPS_MAINTENANCE_BATCH,
@@ -39,7 +38,13 @@ export interface DeviceOpStorage {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put(key: string, value: unknown): Promise<void>;
   delete(key: string): Promise<boolean | void>;
-  list?(prefix: string, limit?: number): Promise<string[]>;
+  list(prefix: string, limit?: number): Promise<string[]>;
+  /**
+   * Issue #245: resumable keyspace scan. Cloudflare Durable Object storage
+   * exposes `startAfter`; the cursor is durable so a bounded pass always
+   * moves forward instead of re-reading the same first page.
+   */
+  listAfter(prefix: string, after: string, limit?: number): Promise<string[]>;
 }
 
 const OP_PREFIX = "dxop:v1:";
@@ -49,6 +54,27 @@ const SEP = "\u0000";
 
 const CORR_PREFIX = "dxcorr:v1:";
 const COUNT_PREFIX = "dxcnt:v1:";
+const CURSOR_PREFIX = "dxcur:v1:";
+/** Issue #244: minimum future prune eligibility seen so far this cycle. */
+const NEXT_PREFIX = "dxnext:v1:";
+
+/** Independent index-scan budget per keyspace (Issue #245: no starvation). */
+const INDEX_SCAN_BUDGET = 32;
+
+type PruneScope = "ops" | "idem" | "corr";
+
+export type DeviceOpPruneStats = {
+  deleted: number;
+  compacted: number;
+  indexesReaped: number;
+  /** A keyspace still has unscanned keys: follow up soon. */
+  hasMore: boolean;
+  /**
+   * Earliest future time an already-scanned row becomes prunable. `null`
+   * when nothing scanned can expire without a new write (pending rows).
+   */
+  nextExpiryMs: number | null;
+};
 
 const TERMINAL_STATUSES = new Set([
   "completed",
@@ -72,6 +98,31 @@ function corrKey(tenantId: string, correlationId: string): string {
 
 function countKey(tenantId: string): string {
   return `${COUNT_PREFIX}${tenantId}`;
+}
+
+function cursorKey(tenantId: string, scope: PruneScope): string {
+  return `${CURSOR_PREFIX}${tenantId}:${scope}`;
+}
+
+function nextExpiryKey(tenantId: string): string {
+  return `${NEXT_PREFIX}${tenantId}`;
+}
+
+/**
+ * Issue #244/#245: the next time a scanned row becomes prunable without
+ * another write. `null` for pending rows: only a later terminal transition
+ * makes them eligible, and those paths schedule their own prune pass.
+ */
+function nextPruneEligibilityMs(op: McpOperationRecord): number | null {
+  const updated = Date.parse(op.updated_at || op.created_at || "");
+  if (!Number.isFinite(updated)) return null;
+  if (op.status === "tombstone") {
+    return updated + MCP_OPS_TOMBSTONE_TTL_MS;
+  }
+  if (TERMINAL_STATUSES.has(op.status)) {
+    return updated + MCP_OPS_RESULT_TTL_MS;
+  }
+  return null;
 }
 
 function cloneRecord(op: McpOperationRecord): McpOperationRecord {
@@ -162,6 +213,19 @@ export class DeviceOperationLog {
     const operationId = await this.storage.get<string>(corrKey(tenantId, correlationId));
     if (!operationId) return null;
     return this.get(operationId, tenantId);
+  }
+
+  /**
+   * Issue #243: bounded occupancy probe used by authority resolution when the
+   * cutover cursor says `d1` but a room drain cannot be assumed. Occupancy is
+   * unknown without a list surface, and unknown must fail closed.
+   */
+  async hasRows(tenantId: string): Promise<boolean> {
+    if (!this.storage.list) {
+      throw new Error("operation_authority_temporarily_unavailable:room_occupancy_unknown");
+    }
+    const keys = await this.storage.list(`${OP_PREFIX}${tenantId}:`, 1);
+    return keys.length > 0;
   }
 
   async claim(op: McpOperationRecord): Promise<DeviceOpClaimResult> {
@@ -276,24 +340,75 @@ export class DeviceOperationLog {
     await this.storage.put(countKey(op.tenant_id), Math.max(0, occupancy - 1));
   }
 
+  private async readCursor(tenantId: string, scope: PruneScope): Promise<string> {
+    const raw = await this.storage.get<unknown>(cursorKey(tenantId, scope));
+    return typeof raw === "string" ? raw : "";
+  }
+
+  private async writeCursor(tenantId: string, scope: PruneScope, value: string): Promise<void> {
+    const key = cursorKey(tenantId, scope);
+    const current = await this.storage.get<unknown>(key);
+    const existing = typeof current === "string" ? current : "";
+    if (existing === value) return;
+    if (value) {
+      await this.storage.put(key, value);
+    } else {
+      await this.storage.delete(key);
+    }
+  }
+
+  private async listAfter(prefix: string, after: string, limit: number): Promise<string[]> {
+    return this.storage.listAfter(prefix, after, limit);
+  }
+
+  private async readNextExpiry(tenantId: string): Promise<number | null> {
+    const raw = await this.storage.get<unknown>(nextExpiryKey(tenantId));
+    const value = typeof raw === "number" ? raw : Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  private async writeNextExpiry(tenantId: string, value: number | null): Promise<void> {
+    const key = nextExpiryKey(tenantId);
+    if (value === null) {
+      await this.storage.delete(key);
+      return;
+    }
+    await this.storage.put(key, value);
+  }
+
   /**
    * Bounded TTL prune for the room alarm. Mirrors D1 retention semantics:
    * expired tombstones and keyless terminals are deleted, expired keyed
-   * terminals compact to small idempotency receipts. A final bounded pass
-   * reaps dangling index entries from interrupted writes.
+   * terminals compact to small idempotency receipts. Each keyspace keeps its
+   * own durable cursor and budget so the back of the keyspace is reached over
+   * repeated passes (Issue #245). The earliest future expiry seen anywhere in
+   * the current scan cycle is carried durably across pages, so the alarm can
+   * arm it even when the final page holds only pending rows (Issue #244).
    */
   async prune(
     tenantId: string,
     now = Date.now(),
     limit = MCP_OPS_MAINTENANCE_BATCH,
-  ): Promise<{ deleted: number; compacted: number; indexesReaped: number }> {
-    const stats = { deleted: 0, compacted: 0, indexesReaped: 0 };
-    if (!this.storage.list) return stats;
-    const keys = await this.storage.list(`${OP_PREFIX}${tenantId}:`, Math.max(1, Math.min(512, limit * 2)));
-    let examined = 0;
+  ): Promise<DeviceOpPruneStats> {
+    const stats: DeviceOpPruneStats = {
+      deleted: 0,
+      compacted: 0,
+      indexesReaped: 0,
+      hasMore: false,
+      nextExpiryMs: null,
+    };
+    const batch = Math.max(1, Math.min(512, limit));
+    const carriedExpiry = await this.readNextExpiry(tenantId);
+    let pageExpiry: number | null = null;
+    const considerExpiry = (value: number | null): void => {
+      if (value === null) return;
+      pageExpiry = pageExpiry === null ? value : Math.min(pageExpiry, value);
+    };
+    const opPrefix = `${OP_PREFIX}${tenantId}:`;
+    const opCursor = await this.readCursor(tenantId, "ops");
+    const keys = await this.listAfter(opPrefix, opCursor, batch);
+    const opsComplete = keys.length < batch;
     for (const key of keys) {
-      if (examined >= limit) break;
-      examined += 1;
       const op = await this.storage.get<McpOperationRecord>(key);
       if (!op || op.tenant_id !== tenantId) continue;
       const age = mcpOpAgeMs(op, now);
@@ -303,7 +418,7 @@ export class DeviceOperationLog {
         stats.deleted += 1;
         continue;
       }
-      if (TERMINAL_STATUSES.has(op.status) && isTerminalMcpStatus(op.status) && age > MCP_OPS_RESULT_TTL_MS) {
+      if (TERMINAL_STATUSES.has(op.status) && age > MCP_OPS_RESULT_TTL_MS) {
         if (!keyed) {
           await this.deleteRow(op);
           stats.deleted += 1;
@@ -322,16 +437,44 @@ export class DeviceOperationLog {
           }),
         );
         stats.compacted += 1;
+        considerExpiry(now + MCP_OPS_TOMBSTONE_TTL_MS);
+        continue;
       }
+      considerExpiry(nextPruneEligibilityMs(op));
     }
+
+    let mergedExpiry = carriedExpiry;
+    if (pageExpiry !== null) {
+      mergedExpiry = mergedExpiry === null ? pageExpiry : Math.min(mergedExpiry, pageExpiry);
+    }
+    stats.hasMore = !opsComplete;
+    if (opsComplete) {
+      // The full keyspace was scanned across this cycle: report the cycle's
+      // earliest future eligibility (a past value means the backing row was
+      // removed elsewhere) and start a fresh cycle.
+      stats.nextExpiryMs =
+        mergedExpiry !== null && mergedExpiry > now ? mergedExpiry : null;
+      await this.writeCursor(tenantId, "ops", "");
+      await this.writeNextExpiry(tenantId, null);
+    } else {
+      // Carry progress to the next page before advancing the cursor: a crash
+      // between the two then repeats this page instead of forgetting it.
+      await this.writeNextExpiry(tenantId, mergedExpiry);
+      await this.writeCursor(tenantId, "ops", keys[keys.length - 1]);
+    }
+
     // Reap dangling index entries left by interrupted multi-key writes.
-    // Bounded: at most 64 index checks per prune pass.
-    let indexBudget = 64;
-    for (const prefix of [`${IDEM_PREFIX}${tenantId}${SEP}`, `${CORR_PREFIX}${tenantId}:`]) {
-      if (indexBudget <= 0) break;
-      const indexKeys = await this.storage.list(prefix, Math.min(64, indexBudget));
+    // Independent cursor + budget per keyspace so healthy idempotency entries
+    // can never starve correlation cleanup (or vice versa).
+    const indexPrefixes: Array<[PruneScope, string]> = [
+      ["idem", `${IDEM_PREFIX}${tenantId}${SEP}`],
+      ["corr", `${CORR_PREFIX}${tenantId}:`],
+    ];
+    for (const [scope, prefix] of indexPrefixes) {
+      const cursor = await this.readCursor(tenantId, scope);
+      const indexKeys = await this.listAfter(prefix, cursor, INDEX_SCAN_BUDGET);
+      const complete = indexKeys.length < INDEX_SCAN_BUDGET;
       for (const indexKey of indexKeys) {
-        if (indexBudget-- <= 0) break;
         const operationId = await this.storage.get<string>(indexKey);
         if (typeof operationId !== "string" || !operationId) {
           await this.storage.delete(indexKey);
@@ -344,6 +487,8 @@ export class DeviceOperationLog {
           stats.indexesReaped += 1;
         }
       }
+      await this.writeCursor(tenantId, scope, complete ? "" : indexKeys[indexKeys.length - 1]);
+      stats.hasMore = stats.hasMore || !complete;
     }
     return stats;
   }
@@ -374,5 +519,16 @@ export class InMemoryDeviceOpStorage implements DeviceOpStorage {
       }
     }
     return out.sort();
+  }
+
+  /** Issue #245: same lexicographic order as the production keyspace. */
+  async listAfter(prefix: string, after: string, limit = 128): Promise<string[]> {
+    const out: string[] = [];
+    for (const key of [...this.rows.keys()].sort()) {
+      if (!key.startsWith(prefix) || key <= after) continue;
+      out.push(key);
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 }

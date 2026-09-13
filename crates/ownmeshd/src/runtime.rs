@@ -706,6 +706,10 @@ pub struct DaemonRuntime {
     /// unit-test runtimes where no transport is wired; doctor and
     /// system.diagnose report `unknown` instead of guessing.
     route_presence: Option<watch::Receiver<ownmesh_ipc::AgentRoutePresence>>,
+    /// Issue #248: wake the transport supervisor to re-read the enrolled
+    /// device credential after `ownmesh device enroll`. `None` in unit-test
+    /// runtimes and when no supervisor is wired.
+    agent_reload_notify: Option<Arc<tokio::sync::Notify>>,
     /// Optional cancel signal for the currently executing remote command.
     /// Lives only for the duration of `dispatch_cancellable`.
     active_cancel: Option<watch::Receiver<bool>>,
@@ -1263,6 +1267,7 @@ impl DaemonRuntime {
             review_results,
             transition_recovery_running: false,
             route_presence: None,
+            agent_reload_notify: None,
             active_cancel: None,
             active_remote_operation_id: None,
             active_remote_expires_at_unix: None,
@@ -1766,6 +1771,22 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         self.route_presence = Some(receiver);
     }
 
+    /// Wire the transport supervisor's credential-reload trigger (Issue #248).
+    /// Absent in unit tests and when the daemon runs without a supervisor.
+    pub fn install_agent_reload_notify(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.agent_reload_notify = Some(notify);
+    }
+
+    /// Ask the transport supervisor to re-read the enrolled credential.
+    /// Fire-and-forget: the supervisor coalesces notifications and only reads
+    /// local state, so a lost wake-up is retried by the next enrollment or
+    /// service restart and cannot weaken a security boundary.
+    pub(crate) fn notify_agent_reload(&self) {
+        if let Some(notify) = &self.agent_reload_notify {
+            notify.notify_one();
+        }
+    }
+
     /// Live Agent-route presence string for system.diagnose facts (#141).
     pub(crate) fn agent_route_presence(&self) -> Option<&'static str> {
         self.route_presence.as_ref().map(|rx| rx.borrow().as_str())
@@ -2001,6 +2022,9 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::STATUS,
             methods::ROUTE_STATUS,
             methods::PING,
+            // Issue #248: reload only re-reads the local device credential and
+            // starts the transport; lockdown still denies every operation.
+            methods::AGENT_RELOAD,
             methods::GRANTS_LIST,
             methods::GRANTS_SHOW,
             ops_methods::SYSTEM_DIAGNOSE,
@@ -2035,6 +2059,8 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::GRANTS_SHOW,
             methods::GRANTS_REVOKE,
             methods::ROUTE_STATUS,
+            // Issue #248: credential reload never touches the op journal.
+            methods::AGENT_RELOAD,
             ops_methods::SYSTEM_DIAGNOSE,
             ops_methods::GIT_STATUS,
             ops_methods::GIT_DIFF,
@@ -6243,6 +6269,13 @@ path or install the tool so detection and execution agree",
         self.preflight_authenticated_dispatch(method, client)?;
         match method {
             methods::ROUTE_STATUS => Ok(self.handle_route_status()),
+            methods::AGENT_RELOAD => {
+                // Issue #248: authenticated local caller (management credential)
+                // asks the supervisor to re-read the enrolled credential. The
+                // response never carries credential material.
+                self.notify_agent_reload();
+                Ok(json!({ "schema_version": 1, "ok": true, "reload_requested": true }))
+            }
             methods::OPS_EXEC => self.handle_exec(params, client).await,
             methods::OPS_FS_LIST => self.handle_fs_list(params, client).await,
             methods::OPS_FS_STAT => self.handle_fs_stat(params, client).await,
@@ -8598,6 +8631,31 @@ mod device_binding_tests {
                 }
             ));
         }
+    }
+
+    /// Issue #248: an authenticated caller can wake the transport supervisor,
+    /// and the notification is not lost when the supervisor is not waiting.
+    #[tokio::test]
+    async fn agent_reload_dispatch_wakes_the_supervisor_notify() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        runtime.install_agent_reload_notify(Arc::clone(&notify));
+        let client = ClientIdentity::new("ownmesh", "test");
+
+        let value = runtime
+            .dispatch(methods::AGENT_RELOAD, None, &client)
+            .await
+            .expect("agent reload dispatch");
+        assert_eq!(
+            value.get("reload_requested").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(value.get("ok").and_then(Value::as_bool), Some(true));
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("reload notification must be delivered");
     }
 
     #[tokio::test]

@@ -9,8 +9,8 @@ Rules (fail-closed):
 - unknown path / planner error / base SHA unknown: full
 - `.github/workflows/**`, `scripts/ci/**`, root lock/toolchain/workspace files:
   full or maximum scope
-- `spec-bundle/schemas/**`, protocol/catalog/fixture changes:
-  Rust + TypeScript + schema compatibility
+- `spec-bundle/schemas/**`, `packages/ownmesh-schema/**`, protocol/catalog/fixture
+  changes: Rust + TypeScript + schema compatibility
 - security boundary map is conservative vs CODEOWNERS + SECURITY_REVIEW_CHECKLIST
 
 Never silently skip. `full=true` means every gate runs.
@@ -195,6 +195,49 @@ def plan_from_files(files: list[str] | None, labels: set[str] | None = None) -> 
     return plan_for_file_set(files, labels)
 
 
+def _classify_non_docs_path(f: str) -> set[str] | None:
+    """Tiers owned by one non-docs path; None = unclassified (fail closed).
+
+    Issue #246: classification is per path. Aggregating `any known` over the
+    whole file set let one known TypeScript path mask an unknown path, so
+    adding files could *reduce* required gates (non-monotone, fail-open).
+    """
+    tiers: set[str] = set()
+    protocol_like = any(
+        s in f for s in ("protocol", "catalog", "fixture", "spec-bundle/")
+    )
+    if f.startswith("crates/") or f in ("Cargo.toml", "Cargo.lock"):
+        tiers.add("rust")
+    if f.startswith(TS_PREFIXES):
+        tiers.add("typescript")
+    if f.startswith(SCHEMA_PREFIXES):
+        # Issue #246: schema changes are the TS half of contracts that Rust
+        # tests also enforce, so keep both implementations (and the OS/security
+        # gates rust implies) exactly like the pre-refactor aggregation did.
+        tiers.update(("rust", "typescript", "schemas"))
+    if protocol_like:
+        tiers.update(("rust", "typescript", "schemas"))
+    if f.startswith(WINDOWS_SENSITIVE):
+        tiers.add("windows")
+    if f.startswith(MACOS_SENSITIVE):
+        tiers.add("macos")
+    if f.startswith(SECURITY_PREFIXES):
+        tiers.add("security")
+    if f.startswith(RELEASE_PREFIXES):
+        tiers.add("release")
+    if f.startswith(INSTALLER_PREFIXES):
+        tiers.add("installers")
+    if f.startswith(".github/"):
+        tiers.add("workflows")
+    if not tiers:
+        return None
+    if "rust" in tiers:
+        # Conservative: any Rust change keeps the OS compile-compat gates and
+        # security-fast required (they run affected subsets, not deep suites).
+        tiers.update(("windows", "macos", "security"))
+    return tiers
+
+
 def plan_for_file_set(files: list[str], labels: set[str] | None = None) -> dict:
     # Canonical review-ready branch (single aggregation point; see
     # plan_from_files note). Normalized for case/whitespace robustness.
@@ -234,9 +277,6 @@ def plan_for_file_set(files: list[str], labels: set[str] | None = None) -> dict:
             "reason": "docs-only",
         }, labels)
 
-    def any_prefix(prefixes: tuple[str, ...]) -> bool:
-        return any(f.startswith(p) for f in files for p in prefixes)
-
     def any_exact(names: set[str]) -> bool:
         return any(f in names for f in files)
 
@@ -245,63 +285,29 @@ def plan_for_file_set(files: list[str], labels: set[str] | None = None) -> dict:
         return with_label_metadata(full_plan("workflow/planner change", labels), labels)
     if any_exact(ROOT_FULL_FILES):
         return with_label_metadata(full_plan("root lock/toolchain/workspace change", labels), labels)
-    # Unknown/empty-path safety: git may emit quoted/renamed paths; any path
-    # we cannot classify keeps full via the fallthrough below. Explicitly
-    # empty file names are impossible here (filtered), so proceed.
-
-    has_rust = any(f.startswith("crates/") or f == "Cargo.toml" or f == "Cargo.lock" for f in files)
-    has_ts = any_prefix(TS_PREFIXES)
-    has_schema = any_prefix(SCHEMA_PREFIXES)
-    # Protocol/catalog/fixture changes require both implementations + schema.
-    protocol_like = any(
-        s in f
-        for f in files
-        for s in ("protocol", "catalog", "fixture", "spec-bundle/")
-    )
-    if protocol_like or has_schema:
-        has_rust = True
-        has_ts = True
-
-    has_windows = any(f.startswith(p) for f in files for p in WINDOWS_SENSITIVE) or has_rust
-    # Windows/macOS compat always runs `cargo check` on Rust changes (cheap
-    # compile evidence); focused native tests run only on sensitive paths.
-    # The plan keeps the bool coarse; the job itself narrows to affected crates.
-    has_macos = any(f.startswith(p) for f in files for p in MACOS_SENSITIVE) or has_rust
-    has_security = any(f.startswith(p) for f in files for p in SECURITY_PREFIXES)
-    has_release = any(f.startswith(p) for f in files for p in RELEASE_PREFIXES)
-    has_installers = any(f.startswith(p) for f in files for p in INSTALLER_PREFIXES)
-    has_workflows = any(f.startswith(".github/") for f in files)
-
-    # Conservative: any Rust change keeps security-fast required (it runs the
-    # affected boundary subset, not the full deep suite). Pure TS-only changes
-    # still run security-fast only if they touch a security prefix.
-    if has_rust:
-        has_security = True
-
-    # Fail-closed: any non-docs file outside every known tier forces full.
-    # Without this, a new top-level directory or renamed path would silently
-    # produce an empty plan and let the aggregators allow all skips.
-    known = (
-        has_rust or has_ts or has_schema or has_windows or has_macos
-        or has_security or has_release or has_installers or has_workflows
-        or protocol_like
-    )
-    if files and not known:
-        return with_label_metadata(full_plan("unknown path (fail-closed)", labels), labels)
+    # Unknown-path safety: classify every non-docs path individually. One
+    # unclassified path (new directory, renamed/odd file) forces full even when
+    # other known paths are present (Issue #246).
+    tiers: set[str] = set()
+    for f in non_docs:
+        owner = _classify_non_docs_path(f)
+        if owner is None:
+            return with_label_metadata(full_plan("unknown path (fail-closed)", labels), labels)
+        tiers |= owner
 
     return with_label_metadata({
         "schema_version": SCHEMA_VERSION,
         "full": False,
         "docs_only": False,
-        "rust": has_rust,
-        "rust_platform_windows": has_windows,
-        "rust_platform_macos": has_macos,
-        "typescript": has_ts,
-        "schemas": has_schema,
-        "security_boundary": has_security,
-        "release_policy": has_release,
-        "installers": has_installers,
-        "workflows": has_workflows,
+        "rust": "rust" in tiers,
+        "rust_platform_windows": "windows" in tiers,
+        "rust_platform_macos": "macos" in tiers,
+        "typescript": "typescript" in tiers,
+        "schemas": "schemas" in tiers,
+        "security_boundary": "security" in tiers,
+        "release_policy": "release" in tiers,
+        "installers": "installers" in tiers,
+        "workflows": "workflows" in tiers,
         "reason": "path-filtered",
     }, labels)
 
