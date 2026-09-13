@@ -21,6 +21,7 @@
 import type { ControlPlaneStore, DeviceRecord, McpOperationRecord, McpOperationQuotaSnapshot, McpOperationTransition } from "./store.ts";
 import {
   D1OperationStore,
+  OperationAuthorityConflictError,
   type OperationStore,
   type ResolvedOperationStores,
 } from "./operation-store.ts";
@@ -5790,6 +5791,15 @@ export async function handleMcp(
     }
   }
   const response = await handleMcpCore(req, store, url, router, opts, context).catch((error: unknown) => {
+    // Issue #247/#243: a stable dual-owner conflict must not be disguised as a
+    // retryable storage outage (retrying cannot resolve it). Fail closed with
+    // a distinct, non-retryable code for operators.
+    if (error instanceof OperationAuthorityConflictError) {
+      return mcpError(context.body?.id ?? null, -32005, "operation authority conflict", {
+        code: "OWNMESH_E_OPERATION_AUTHORITY_CONFLICT",
+        retryable: false,
+      });
+    }
     // Issue #227 SHOULD-1: centralized retryable-storage predicate (no bare
     // timeout/quota substrings); non-storage rethrows fail-closed.
     if (isRetryableStorageError(error)) return mcpStorageUnavailable(context.body?.id ?? null, error);

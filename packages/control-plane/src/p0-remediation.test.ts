@@ -96,8 +96,18 @@ test("device verification requires authenticated one-time CSRF transaction and b
     method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: "dcode_secret", client_id: "cli" }),
   }), store);
-  const results = await Promise.all([exchange(), exchange()]);
-  assert.deepEqual(results.map((r) => r.status).sort(), [200, 400]);
+  // Issue #247: one atomic winner, and a concurrent/duplicate exchange
+  // converges on the same token pair instead of issuing a second family.
+  const [first, second] = await Promise.all([exchange(), exchange()]);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  const firstToken = (await first.json()) as { access_token: string };
+  const secondToken = (await second.json()) as { access_token: string };
+  assert.equal(firstToken.access_token, secondToken.access_token);
+  assert.equal(
+    [...store.tokensByAccess.values()].filter((t) => t.client_id === "cli").length,
+    1,
+  );
 
   await store.putDeviceCode({ device_code: "dcode_denied", user_code: "NPQR-STVW", client_id: "cli", scope: "ownmesh.read", verification_uri: "https://cp.test/oauth/device", interval_sec: 5, expires_at: Date.now() + 60_000, status: "pending" });
   const denyPage = await handleDeviceVerification(new Request("https://cp.test/oauth/device?user_code=NPQR-STVW", { headers: { "accept-language": "ja-JP" } }), store, { principal });

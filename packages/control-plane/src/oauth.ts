@@ -10,7 +10,7 @@
  *   flexibility (Issue #197)
  */
 
-import type { ControlPlaneStore } from "./store.ts";
+import type { ControlPlaneStore, DeviceCodeExchange } from "./store.ts";
 import { classifyD1Error, isRetryableStorageError, storageUnavailableReason } from "./d1-errors.ts";
 import { retryAfterSecondsForReset, utcResetIso, type BudgetState } from "./quota-guard.ts";
 import {
@@ -1371,29 +1371,45 @@ async function handleTokenWithStore(
     } else if (rec.resource !== undefined) {
       return json({ error: "invalid_target", error_description: "resource must match the device code audience" }, { status: 400 });
     }
-    const consumed = await store.consumeApprovedDeviceCode(deviceCode, requestedClient);
-    if (!consumed) return json({ error: "invalid_grant" }, { status: 400 });
-    const principal = consumed.principal_id!;
-    // Fail closed: unknown client or client/principal tenant mismatch is an
-    // invalid grant (never a 500 with binding detail). Retryable D1 throws
-    // delegate to the centralized isRetryableStorageError predicate (no ad-hoc
-    // timeout/quota substrings); the outer handleToken convergence maps them
-    // to the sanitized 503.
-    let tok;
+    let consumed: DeviceCodeExchange;
     try {
-      tok = await store.issueTokens(consumed.client_id, principal, consumed.scope, undefined, undefined, undefined, deviceExchangeResource ?? consumed.resource);
+      consumed = await store.exchangeApprovedDeviceCode({
+        deviceCode,
+        clientId: requestedClient,
+        ...(deviceExchangeResource !== undefined ? { resource: deviceExchangeResource } : {}),
+      });
     } catch (error) {
+      // Fail closed: retryable storage throws delegate to the centralized
+      // predicate (outer convergence -> sanitized 503); anything else is an
+      // invalid grant, never a 500 with binding detail.
       if (isRetryableStorageError(error)) throw error;
       return json({ error: "invalid_grant" }, { status: 400 });
     }
-    await store.appendAudit({
-      id: randomId("aud_"),
-      tenant_id: tok.tenant_id,
-      principal_id: principal,
-      kind: "oauth.device_code_token",
-      summary: "device_code exchanged",
-      created_at: nowIso(),
-    });
+    if (consumed.status === "invalid_grant") {
+      return json({ error: "invalid_grant" }, { status: 400 });
+    }
+    // Issue #247: consume + token issuance commit atomically. A post-commit
+    // retry returns `replayed` with the same token pair, so a transient error
+    // after commit no longer strands the grant. The audit row uses a
+    // deterministic id derived from the issued access token, so a retry after
+    // a retryable audit failure writes it exactly once (duplicate = success).
+    const tok = consumed.token;
+    const principal = tok.principal;
+    const auditId = `aud_${(await sha256Hex(`ownmesh.device-exchange.audit:${tok.access_token}`)).slice(0, 32)}`;
+    try {
+      await store.appendAudit({
+        id: auditId,
+        tenant_id: tok.tenant_id,
+        principal_id: principal,
+        kind: "oauth.device_code_token",
+        summary: "device_code exchanged",
+        created_at: nowIso(),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (!message.startsWith("audit_event_exists:")) throw error;
+      // Already audited by the original exchange: converge, never duplicate.
+    }
     return json({
       access_token: tok.access_token,
       ...(requireScope(tok.scope, "offline_access") ? { refresh_token: tok.refresh_token } : {}),

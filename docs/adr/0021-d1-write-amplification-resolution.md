@@ -132,6 +132,32 @@ to the issue's 300k/day operating target by tenant sharding.
 - New env surface: `OWNMESH_OPERATION_STORE`, `OWNMESH_DEGRADED_MODE`.
   Both fail safe to current behavior when unset or misspelled.
 
+## Amendment: fail-closed authority and rollback drain (Issue #243)
+
+The original cutover cursor treated `d1` as a plain escape hatch and degraded
+to D1 whenever the cursor read failed. That let a transient D1 read error or
+rollback split ownership between D1 and the room. Amended behavior:
+
+- Cursor read failures, missing `OPERATION_ROOM`/`SESSION_SECRET` bindings,
+  and a rollback-pending tenant produce retryable 503s
+  (`operation_authority_temporarily_unavailable:*`); the resolver never
+  silently switches authority.
+- Every ownership write (`claim`/`put`) re-reads the cursor and, for D1
+  authority, probes room occupancy (`has_rows`) before creating. A cutover or
+  rollback that lands after store resolution therefore fails the write closed
+  instead of forking owners.
+- Rollback (`cutover_at = 'd1'`) is a drain: while the room has rows, new
+  ownership is refused; reads and terminal transitions keep falling through to
+  the room so DO-only operations stay visible and converge. D1-only authority
+  resumes once the room is empty.
+- Hybrid and rollback reads detect two owners for one idempotency key or
+  correlation and stop with `operation_authority_conflict` instead of picking
+  a side whose side effects may be in flight. MCP surfaces that as a
+  non-retryable structured error; the deploy runbook covers reconciliation.
+  Rollback stays blocked while the room holds rows (including idempotency
+  tombstones, up to the 30-day window), so the runbook documents that drain
+  duration.
+
 ## Alternatives considered
 
 - Device-sharded rooms (issue sketch): rejected — id-only lookups would
