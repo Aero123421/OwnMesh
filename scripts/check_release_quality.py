@@ -329,7 +329,15 @@ def main() -> int:
     require_text(suites, "scripts/tests/test_installers.py", "installer once in suites.toml")
     require_text(suites, "scripts/check_release_quality.py", "live checker once in suites.toml")
     require_text(suites, "scripts/tests/run_release_quality_tests.py", "mutation suite once in suites.toml")
-    require_text(suites, "scripts/ci/tests", "planner unit suite once in suites.toml")
+    # Section-scoped and exact: a wrong -p pattern would make the discover
+    # command vacuously succeed (0 tests) and skip the planner unit suite.
+    release_policy_section = suite_section(suites, "release-policy")
+    require(release_policy_section != "", "release-policy section in suites.toml")
+    require(
+        "python3 -m unittest discover -s scripts/ci/tests -p test_plan.py"
+        in release_policy_section,
+        "planner unit suite exact command must live in [release-policy]",
+    )
     # The canonical runner must dispatch every suite CI invokes.
     for suite_name in (
         "rust-linux",

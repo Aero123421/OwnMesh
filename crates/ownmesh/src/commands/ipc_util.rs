@@ -79,10 +79,16 @@ fn build_daemon_client() -> Result<(OwnMeshPaths, IpcClient), DaemonClientError>
 }
 
 /// Pure read of `service_socket.path` (no lock, no recovery, no create).
-fn configured_socket_path_readonly(paths: &OwnMeshPaths) -> Option<String> {
-    let raw = std::fs::read_to_string(paths.config_file()).ok()?;
-    let cfg: ownmesh_config::OwnMeshConfig = toml::from_str(&raw).ok()?;
-    cfg.service_socket.path.clone()
+/// Missing config means "use the default endpoint"; a read or parse failure is
+/// an error so a probe/notify never targets the wrong daemon silently.
+fn configured_socket_path_readonly(paths: &OwnMeshPaths) -> Result<Option<String>, ()> {
+    match std::fs::read_to_string(paths.config_file()) {
+        Ok(raw) => toml::from_str::<ownmesh_config::OwnMeshConfig>(&raw)
+            .map(|cfg| cfg.service_socket.path.clone())
+            .map_err(|_| ()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
 }
 
 /// Construct the IPC client (shared by the strict and probe builders).
@@ -136,7 +142,7 @@ pub fn observe_agent_route(timeout: Duration) -> Option<String> {
 /// state (`ensure_layout` / blocking config lock are deliberately skipped).
 fn build_daemon_probe_client(request_timeout: Duration) -> Option<IpcClient> {
     let paths = OwnMeshPaths::discover().ok()?;
-    let socket_path = configured_socket_path_readonly(&paths);
+    let socket_path = configured_socket_path_readonly(&paths).ok()?;
     let endpoint = Endpoint::configured_daemon(&paths.runtime_dir, socket_path.as_deref()).ok()?;
     build_client(paths, endpoint, request_timeout, 1).ok()
 }

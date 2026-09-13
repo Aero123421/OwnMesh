@@ -269,11 +269,14 @@ new device credential, so the Agent route connects without
 `ownmesh service restart`. `ownmesh service status --json` reports
 `agent_route`, and `ownmesh doctor` reports `daemon.agent_route`:
 `disabled` means no credential is loaded (not yet enrolled), `offline` means
-the transport is configured but not connected, and `online` means the
-authenticated Agent route is live. When the daemon cannot be reached, the
-route is omitted (`null` in JSON) rather than guessed. Revoking the local
-device drops the stored device credential and disables the route (best-effort:
-a stopped daemon is corrected on its next start).
+the transport is configured but not connected, `online` means the
+authenticated Agent route is live, and `unknown` means the daemon has no
+transport presence wired (for example an older daemon). When the daemon cannot
+be reached, `ownmesh service status --json` reports `"agent_route": null` and
+`ownmesh doctor` omits the `daemon.agent_route` check line rather than
+guessing. Revoking the local device drops the stored device credential and
+disables the route (best-effort: a stopped daemon is corrected on its next
+start).
 
 ### Linux session lifetime (lingering)
 

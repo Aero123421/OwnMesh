@@ -910,6 +910,20 @@ export class DeviceRoomRouter {
   }
 
   /**
+   * Issue #243: put pruned-but-unreconciled entries back after a failed
+   * reconcile so the next pass can still terminalize them instead of silently
+   * losing the pending obligation from the in-memory router. A newer entry for
+   * the same correlation is never clobbered.
+   */
+  restoreExpiredPending(expired: readonly PendingOperation[]): void {
+    for (const pending of expired) {
+      if (!this.pending.has(pending.correlation_id)) {
+        this.pending.set(pending.correlation_id, pending);
+      }
+    }
+  }
+
+  /**
    * After an Agent becomes ready, redeliver durable pending operation.request
    * frames with fresh seq/message_id. Completed correlations are handled by the
    * Agent cache; in-flight side effects remain journal-deduped on the device.
@@ -2131,6 +2145,7 @@ export class DeviceRoom {
           await this.reconcileExpiredPending(expired);
           await this.persistNow();
         } catch (error) {
+          this.router.restoreExpiredPending(expired);
           if (error instanceof OperationAuthorityUnavailableError) return;
           this.storageBroken = true;
           this.failClosedAll("storage unavailable", 1013);
@@ -2693,6 +2708,7 @@ export class DeviceRoom {
           await this.reconcileExpiredPending(expired);
           await this.persistNow();
         } catch (error) {
+          this.router.restoreExpiredPending(expired);
           if (error instanceof OperationAuthorityUnavailableError) {
             return json({ error: "storage_unavailable", hibernation: true }, { status: 503 });
           }
@@ -3081,6 +3097,7 @@ export class DeviceRoom {
           await this.reconcileExpiredPending(pruned);
           await this.persistNow();
         } catch {
+          this.router.restoreExpiredPending(pruned);
           return json({ error: "storage_unavailable" }, { status: 503 });
         }
       }
@@ -3417,6 +3434,7 @@ export class DeviceRoom {
         await this.reconcileExpiredPending(expiredBeforeMessage);
         await this.persistNow();
       } catch (error) {
+        this.router.restoreExpiredPending(expiredBeforeMessage);
         if (error instanceof OperationAuthorityUnavailableError) return;
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
@@ -3480,6 +3498,7 @@ export class DeviceRoom {
       } catch (error) {
         // Issue #243: transient authority resolution is retryable; keep the
         // room usable instead of failing every socket closed.
+        this.router.restoreExpiredPending(result.expired_pending);
         if (error instanceof OperationAuthorityUnavailableError) return;
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
@@ -3728,6 +3747,7 @@ export class DeviceRoom {
       await this.reconcileExpiredPending(expired);
       await this.persistNow();
     } catch (error) {
+      this.router.restoreExpiredPending(expired);
       if (error instanceof OperationAuthorityUnavailableError) return;
       this.storageBroken = true;
       this.failClosedAll("storage unavailable", 1013);

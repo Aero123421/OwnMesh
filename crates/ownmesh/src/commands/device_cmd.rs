@@ -294,13 +294,7 @@ fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
         let ctx = authed_context(cli).await?;
-        // The local device may be identified by the session or by the stored
-        // credential when the session file was reset/lost.
-        let local_device = ctx.session.device_id.as_deref() == Some(id)
-            || ownmesh_identity::load_device_credential(&ctx.store)
-                .ok()
-                .flatten()
-                .is_some_and(|credential| credential.device_id == id);
+        let session_local = ctx.session.device_id.as_deref() == Some(id);
         let ok = revoke_device(
             &ctx.http,
             &ctx.session.issuer,
@@ -313,26 +307,68 @@ fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
             eprintln!("device revoke failed: {err}");
             ExitCode::DeviceOffline
         })?;
+
+        // Issue #248: local cleanup is part of revoke. The local device may be
+        // identified by the session or by the stored credential when the
+        // session file was reset/lost. A read or delete failure is reported as
+        // a partial (non-success) outcome, never silently treated as "not the
+        // local device".
+        let mut local_cleanup_error: Option<String> = None;
+        if ok {
+            match ownmesh_identity::load_device_credential(&ctx.store) {
+                Ok(Some(credential)) => {
+                    if session_local || credential.device_id == id {
+                        if let Err(err) = ownmesh_identity::delete_device_credential(&ctx.store) {
+                            local_cleanup_error =
+                                Some(format!("delete local device credential: {err}"));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    local_cleanup_error = Some(format!("read local device credential: {err}"));
+                }
+            }
+        }
+
+        if ok && local_cleanup_error.is_none() {
+            if cli.json {
+                println!("{}", json!({"schema_version": 1, "ok": true, "id": id}));
+                crate::commands::fail::note_envelope_emitted();
+            } else {
+                println!("Device revoked: {id}");
+            }
+            // Only a fully cleaned-up local revoke may disable a running route.
+            notify_running_daemon_agent_reload().await;
+            return Ok(());
+        }
+        if ok {
+            let detail = local_cleanup_error
+                .unwrap_or_else(|| "local device credential cleanup failed".to_owned());
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({
+                        "schema_version": 1,
+                        "ok": false,
+                        "revoked": true,
+                        "id": id,
+                        "error": detail,
+                    })
+                );
+                crate::commands::fail::note_envelope_emitted();
+            } else {
+                eprintln!("Device revoked remotely, but local cleanup failed: {detail}");
+            }
+            return Err(ExitCode::Internal);
+        }
         if cli.json {
-            println!("{}", json!({"schema_version": 1, "ok": ok, "id": id}));
+            println!("{}", json!({"schema_version": 1, "ok": false, "id": id}));
             crate::commands::fail::note_envelope_emitted();
-        } else if ok {
-            println!("Device revoked: {id}");
         } else {
             println!("Device revoke returned ok=false for {id}");
         }
-        if ok && local_device {
-            // Issue #248: a revoked local device must not keep a live credential
-            // that retries forever. Drop it and let the running daemon disable
-            // the route (best-effort; the next service start would find none).
-            let _ = ownmesh_identity::delete_device_credential(&ctx.store);
-            notify_running_daemon_agent_reload().await;
-        }
-        if ok {
-            Ok(())
-        } else {
-            Err(ExitCode::Conflict)
-        }
+        Err(ExitCode::Conflict)
     })
 }
 
