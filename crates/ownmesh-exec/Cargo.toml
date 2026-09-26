@@ -33,7 +33,7 @@ hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }
-nix = { version = "0.28", default-features = false, features = ["process"] }
+nix = { version = "0.31", default-features = false, features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
