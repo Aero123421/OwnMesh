@@ -220,6 +220,43 @@ test("batch GET fails closed without a payload hash; POST consumes each selected
   assert.equal(deliveries.sort().join(","), [first, "op_batch_ccc"].sort().join(","));
 });
 
+for (const multipart of [false, true]) {
+  test(`batch approval preserves repeated form transaction IDs (${multipart ? "multipart" : "URL encoded"})`, async () => {
+    const store = new MemoryStore();
+    await seed(store);
+    const ids = ["op_form_aaa", "op_form_bbb"];
+    for (const [index, id] of ids.entries()) {
+      await store.putMcpOperation(pendingOp(id, String(index + 1).repeat(64)));
+    }
+    const url = `${ISSUER}/approve?ids=${ids.join("&ids=")}`;
+    const principal = { id: "prin_dev", tenant_id: "ten_default" };
+    const page = await handleApprove(new Request(url), store, { issuer: ISSUER, principal });
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    const csrf = html.match(/name="csrf_token" value="([^"]+)"/)?.[1];
+    assert.ok(csrf);
+    const transactions = [...html.matchAll(/name="transaction_id" value="([^"]+)"/g)].map((match) => match[1]!);
+    assert.equal(transactions.length, ids.length);
+    const body = multipart ? new FormData() : new URLSearchParams();
+    body.append("decision", "approve");
+    body.append("csrf_token", csrf);
+    for (const id of transactions) body.append("transaction_id", id);
+    const deliveries: string[] = [];
+    const result = await handleApprove(new Request(url, {
+      method: "POST", headers: { origin: ISSUER, accept: "application/json" }, body,
+    }), store, {
+      issuer: ISSUER, principal, originAllowed: true,
+      routeToDevice: async (_deviceId, operation) => {
+        deliveries.push(String((operation.payload.arguments as { target_operation_id?: string }).target_operation_id));
+        return { status: "routed_to_device" };
+      },
+    });
+    assert.equal(result.status, 200, await result.clone().text());
+    assert.equal((await result.json() as { ok: boolean }).ok, true);
+    assert.deepEqual(deliveries.sort(), ids);
+  });
+}
+
 test("worker batch approve requires AUTH_PROVIDER fresh attestation bound to the commitment", async () => {
   const store = new MemoryStore();
   await seed(store);

@@ -6,6 +6,7 @@
 use crate::{FsError, FsResult, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -128,7 +129,13 @@ pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatu
     // Cap status capture well under the hard ceiling; porcelain is line-oriented.
     let (output, byte_truncated) = run_git_capped_in_context(
         &repo,
-        &["status", "--porcelain=v1", "-b", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain=v1",
+            "-b",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ],
         512 * 1024,
     )?;
     // Drop a trailing partial line when the byte cap cut mid-record so paging
@@ -211,7 +218,14 @@ pub fn git_head_oid(ws: &WorkspaceRoot, path: &Path) -> FsResult<String> {
 /// workspace, or when a `git` subprocess cannot be run successfully.
 pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage> {
     let repo = resolve_repo_context(ws, &opts.path)?;
-    let mut args: Vec<String> = vec!["diff".into(), "--no-color".into(), "--no-ext-diff".into()];
+    let mut args: Vec<String> = vec![
+        "diff".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        "--submodule=short".into(),
+        "--ignore-submodules=all".into(),
+    ];
     if opts.staged {
         args.push("--cached".into());
     }
@@ -507,6 +521,253 @@ struct RepoContext {
     cwd: PathBuf,
     root: PathBuf,
     git_dir: PathBuf,
+    view: SafeGitView,
+}
+
+/// Git's read operations can execute repository-configured filters. Keep the
+/// real HEAD/index/object identity, but replace shared config, attributes and
+/// refs with a private bounded view that contains no executable helpers.
+#[derive(Debug)]
+struct SafeGitView {
+    common: tempfile::TempDir,
+    objects: PathBuf,
+    index: PathBuf,
+}
+
+impl SafeGitView {
+    fn new(cwd: &Path, git_dir: &Path) -> FsResult<Self> {
+        let common_path = run_git(cwd, &["rev-parse", "--git-common-dir"])?;
+        let common_path = PathBuf::from(common_path.trim());
+        let original_common = if common_path.is_absolute() {
+            common_path
+        } else {
+            cwd.join(common_path)
+        };
+        let objects = dunce_object_dir(&original_common)?;
+        // These builtins inspect metadata only; neither invokes worktree
+        // conversion, diff drivers, hooks or submodule children.
+        let config = run_git(cwd, &["config", "--null", "--list"])?;
+        let refs = run_git(cwd, &["for-each-ref", "--format=%(objectname) %(refname)"])?;
+        // Resolve through Git's active ref backend: reftable HEAD files are
+        // deliberately invalid stubs. An unborn branch still has a symref.
+        let head = if let Ok(symbolic) = run_git(cwd, &["symbolic-ref", "--no-recurse", "HEAD"]) {
+            let name = symbolic.trim();
+            if !name.starts_with("refs/")
+                || name.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+            {
+                return Err(FsError::InvalidPath("invalid Git HEAD snapshot".into()));
+            }
+            format!("ref: {name}\n")
+        } else {
+            let oid = run_git(cwd, &["rev-parse", "--verify", "HEAD"])?;
+            let oid = oid.trim();
+            if !valid_git_oid(oid) {
+                return Err(FsError::InvalidPath("invalid Git HEAD snapshot".into()));
+            }
+            format!("{oid}\n")
+        };
+        let mut safe_config = String::new();
+        for entry in config.split_terminator('\0') {
+            let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+            if let Some((section, subsection, variable)) = safe_config_key(key) {
+                safe_config.push('[');
+                safe_config.push_str(section);
+                if let Some(subsection) = subsection {
+                    safe_config.push(' ');
+                    safe_config.push_str(&quote_git_config(subsection));
+                }
+                safe_config.push_str("]\n");
+                safe_config.push_str(variable);
+                safe_config.push_str(" = ");
+                safe_config.push_str(&quote_git_config(value));
+                safe_config.push('\n');
+            }
+        }
+        // Convert reftable/shared/worktree layouts into a files-based private
+        // ref snapshot. Never admit extensions.worktreeConfig or includes.
+        safe_config.push_str("[core]\nbare = false\n");
+        let mut packed_refs = String::from("# pack-refs with: sorted\n");
+        for line in refs.lines() {
+            let Some((oid, name)) = line.split_once(' ') else {
+                return Err(FsError::InvalidPath("invalid Git ref snapshot".into()));
+            };
+            if !matches!(oid.len(), 40 | 64)
+                || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !name.starts_with("refs/")
+                || name.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+            {
+                return Err(FsError::InvalidPath("invalid Git ref snapshot".into()));
+            }
+            packed_refs.push_str(line);
+            packed_refs.push('\n');
+        }
+        let common = tempfile::Builder::new()
+            .prefix("ownmesh-git-read-")
+            .tempdir()
+            .map_err(|source| FsError::Io { path: None, source })?;
+        let write = |name: &str, bytes: &[u8]| {
+            let path = common.path().join(name);
+            fs::write(&path, bytes).map_err(|source| FsError::Io {
+                path: Some(path),
+                source,
+            })
+        };
+        fs::create_dir(common.path().join("refs"))
+            .map_err(|source| FsError::Io { path: None, source })?;
+        fs::create_dir(common.path().join("info"))
+            .map_err(|source| FsError::Io { path: None, source })?;
+        write("config", safe_config.as_bytes())?;
+        write("packed-refs", packed_refs.as_bytes())?;
+        write("HEAD", head.as_bytes())?;
+        write("info/attributes", b"* -filter\n")?;
+        if let Some(exclude) = read_git_metadata(&original_common.join("info/exclude"))? {
+            write("info/exclude", &exclude)?;
+        }
+        if let Some(shallow) = read_git_metadata(&original_common.join("shallow"))? {
+            let text = std::str::from_utf8(&shallow)
+                .map_err(|_| FsError::InvalidPath("invalid Git shallow snapshot".into()))?;
+            if !text.lines().all(valid_git_oid) {
+                return Err(FsError::InvalidPath("invalid Git shallow snapshot".into()));
+            }
+            write("shallow", &shallow)?;
+        }
+        Ok(Self {
+            common,
+            objects,
+            index: git_dir.join("index"),
+        })
+    }
+}
+
+fn valid_git_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_git_metadata(path: &Path) -> FsResult<Option<Vec<u8>>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Refuse final symlinks and avoid blocking on repository FIFOs before
+        // validating the opened handle as an ordinary metadata file.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000 | 0x0200_0000); // open reparse point itself
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(FsError::Io {
+                path: Some(path.to_path_buf()),
+                source,
+            })
+        }
+    };
+    let metadata = file.metadata().map_err(|source| FsError::Io {
+        path: Some(path.to_path_buf()),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(FsError::NotAFile(path.to_path_buf()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(FsError::InvalidPath(
+                "Git metadata reparse point refused".into(),
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take((GIT_STDOUT_HARD_CAP + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| FsError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+    if bytes.len() > GIT_STDOUT_HARD_CAP {
+        return Err(FsError::InvalidPath(
+            "Git metadata exceeds capture ceiling".into(),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn dunce_object_dir(common: &Path) -> FsResult<PathBuf> {
+    let path = common.join("objects");
+    crate::dunce_canonicalize(&path).map_err(|source| FsError::Io {
+        path: Some(path),
+        source,
+    })
+}
+
+fn safe_config_key(key: &str) -> Option<(&str, Option<&str>, &str)> {
+    let (section, tail) = key.split_once('.')?;
+    match section {
+        "core"
+            if matches!(
+                tail,
+                "repositoryformatversion"
+                    | "filemode"
+                    | "ignorecase"
+                    | "symlinks"
+                    | "autocrlf"
+                    | "eol"
+                    | "quotepath"
+            ) =>
+        {
+            Some((section, None, tail))
+        }
+        "extensions" if tail == "objectformat" => Some((section, None, tail)),
+        "branch" | "remote" => {
+            let (subsection, variable) = tail.rsplit_once('.')?;
+            if (section == "branch" && matches!(variable, "remote" | "merge"))
+                || (section == "remote" && variable == "fetch")
+            {
+                Some((section, Some(subsection), variable))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn quote_git_config(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+            .replace('\u{0008}', "\\b")
+    )
+}
+
+/// Resolve before changing cwd; Windows must never prefer workspace/git.exe.
+fn git_program() -> FsResult<PathBuf> {
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path).filter(|dir| dir.is_absolute()) {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return crate::dunce_canonicalize(&candidate).map_err(|source| FsError::Io {
+                    path: Some(candidate),
+                    source,
+                });
+            }
+        }
+    }
+    Err(FsError::InvalidPath(
+        "Git executable requires an absolute PATH entry".into(),
+    ))
 }
 
 fn resolve_repo_context(ws: &WorkspaceRoot, rel: &Path) -> FsResult<RepoContext> {
@@ -535,29 +796,42 @@ fn resolve_repo_context(ws: &WorkspaceRoot, rel: &Path) -> FsResult<RepoContext>
     // Re-validate response metadata against the workspace boundary.  The
     // original caller path was custody-checked above in restricted mode, and
     // its discovered git-dir remains bound to subsequent commands.
-    if ws.enforce {
+    let checked = if ws.enforce {
         // Git toplevel is absolute; require it to sit under the workspace root.
         let checked = ws.resolve(&root)?;
         let _ = crate::custody::resolve_dir_enforced(ws, &checked)?;
-        return Ok(RepoContext {
-            cwd: path,
-            root: checked,
-            git_dir,
-        });
-    }
-    let checked = ws.resolve(&root)?;
-    // A relative Git request is workspace-relative even in Full Access mode.
-    // Do not let repository-local `core.worktree` configuration silently
-    // retarget that request to a different registered (or arbitrary) tree.
-    // Absolute Full Access requests retain their existing explicit escape hatch.
-    if !rel.is_absolute() && !checked.starts_with(ws.root()) {
-        return Err(FsError::GitWorktreeOutsideWorkspace);
-    }
-    Ok(RepoContext {
+        checked
+    } else {
+        let checked = ws.resolve(&root)?;
+        // A relative Git request is workspace-relative even in Full Access mode.
+        // Do not let repository-local `core.worktree` configuration silently
+        // retarget that request to a different registered (or arbitrary) tree.
+        // Absolute Full Access requests retain their existing explicit escape hatch.
+        if !rel.is_absolute() && !checked.starts_with(ws.root()) {
+            return Err(FsError::GitWorktreeOutsideWorkspace);
+        }
+        checked
+    };
+    let view = SafeGitView::new(&path, &git_dir)?;
+    let repo = RepoContext {
         cwd: path,
         root: checked,
         git_dir,
-    })
+        view,
+    };
+    // Native submodule dirty checks spawn another Git outside this private
+    // view. Refuse them explicitly, rather than hide dirtiness or execute
+    // child filters under filesystem.read authority. Captures also disable
+    // recursion in case another writer changes the index after this check.
+    let (index, truncated) =
+        run_git_capped_in_context(&repo, &["ls-files", "--stage", "-z"], GIT_STDOUT_HARD_CAP)?;
+    if truncated || index.split('\0').any(|entry| entry.starts_with("160000 ")) {
+        return Err(FsError::InvalidPath(
+            "read-only Git capture cannot safely inspect submodule worktrees or an oversized index"
+                .into(),
+        ));
+    }
+    Ok(repo)
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> FsResult<String> {
@@ -584,7 +858,7 @@ fn run_git_capped_in_context(
     args: &[&str],
     max_stdout: usize,
 ) -> FsResult<(String, bool)> {
-    let git_dir = repo.git_dir.to_string_lossy();
+    let git_dir = repo.view.common.path().to_string_lossy();
     let work_tree = repo.root.to_string_lossy();
     let mut context_args = Vec::with_capacity(args.len() + 4);
     context_args.extend([
@@ -594,7 +868,7 @@ fn run_git_capped_in_context(
         work_tree.as_ref(),
     ]);
     context_args.extend_from_slice(args);
-    run_git_capped(&repo.root, &context_args, max_stdout)
+    run_git_capped_with_view(&repo.root, &context_args, max_stdout, Some(&repo.view))
 }
 
 /// Spawn git with piped stdout/stderr, concurrent capped drains, and a hard timeout.
@@ -604,6 +878,15 @@ fn run_git_capped_in_context(
 /// Drains stdout and stderr on separate threads so a process that fills stderr before
 /// stdout cannot deadlock the pipes. On timeout the child process tree is killed.
 fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> FsResult<(String, bool)> {
+    run_git_capped_with_view(cwd, args, max_stdout, None)
+}
+
+fn run_git_capped_with_view(
+    cwd: &Path,
+    args: &[&str],
+    max_stdout: usize,
+    view: Option<&SafeGitView>,
+) -> FsResult<(String, bool)> {
     let max_stdout = max_stdout.clamp(1, GIT_STDOUT_HARD_CAP);
     // Point global/system config at a guaranteed-empty path so untrusted
     // includeIf/fsmonitor/hooks from the operator home directory cannot run.
@@ -625,7 +908,23 @@ fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> FsResult<(Str
         "core.useBuiltinFSMonitor=false",
     ];
     git_argv.extend_from_slice(args);
-    let mut child = Command::new("git")
+    let mut command = Command::new(git_program()?);
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    if let Some(view) = view {
+        command
+            .env("GIT_COMMON_DIR", view.common.path())
+            .env("GIT_OBJECT_DIRECTORY", &view.objects)
+            .env("GIT_INDEX_FILE", &view.index);
+    }
+    let mut child = command
         .args(&git_argv)
         .current_dir(cwd)
         // Reduce untrusted-repo execution surface for read-only captures.
@@ -844,6 +1143,20 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        seed_repo(dir);
+    }
+
+    // Seed an already initialized repository without changing its ref or
+    // object format. Fixtures must not inherit host line-ending conversion.
+    fn seed_repo(dir: &Path) {
+        // Standalone Git builds may omit installed repository templates.
+        fs::create_dir_all(dir.join(".git/info")).unwrap();
+        assert!(Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
             .args(["config", "user.email", "ownmesh@test.local"])
             .current_dir(dir)
@@ -928,6 +1241,326 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn security_readonly_git_never_executes_repository_helpers() {
+        for mechanism in [
+            "textconv", "clean", "process", "include", "worktree", "info",
+        ] {
+            let dir = tempdir().unwrap();
+            init_repo(dir.path());
+            let marker = dir.path().join("helper-ran");
+            let helper = dir.path().join("helper.sh");
+            fs::write(
+                &helper,
+                format!(
+                    "echo invoked > '{}'\nif [ $# -gt 0 ]; then cat \"$1\"; else cat; fi\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            let command = format!("sh '{}'", helper.display());
+            let config = |key: &str, value: &str| {
+                assert!(Command::new("git")
+                    .args(["config", key, value])
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success());
+            };
+            match mechanism {
+                "textconv" | "info" => config("diff.probe.textconv", &command),
+                "clean" => config("filter.probe.clean", &command),
+                "process" => config("filter.probe.process", &command),
+                "include" => {
+                    let include = dir.path().join("extra.config");
+                    fs::write(
+                        &include,
+                        format!("[filter \"probe\"]\nclean = {command:?}\n"),
+                    )
+                    .unwrap();
+                    config("include.path", include.to_str().unwrap());
+                }
+                "worktree" => {
+                    config("extensions.worktreeConfig", "true");
+                    fs::write(
+                        dir.path().join(".git/config.worktree"),
+                        format!("[filter \"probe\"]\nclean = {command:?}\n"),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let attributes = if mechanism == "info" {
+                ".git/info/attributes"
+            } else {
+                ".gitattributes"
+            };
+            fs::write(
+                dir.path().join(attributes),
+                "README.md filter=probe diff=probe\n",
+            )
+            .unwrap();
+            // Stage before the mutation, keeping stage-control behavior available
+            // without letting fixture setup itself invoke the configured helper.
+            fs::write(dir.path().join("README.md"), "raw change\n").unwrap();
+            let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+            let status = git_status(
+                &ws,
+                &GitStatusOpts {
+                    limit: 100,
+                    ..Default::default()
+                },
+            );
+            assert!(!marker.exists(), "{mechanism} executed during status");
+            let status = status.unwrap();
+            assert!(!status.clean);
+            assert!(status.entries.iter().any(|entry| entry.path == "README.md"));
+            let diff = git_diff(
+                &ws,
+                &GitDiffOpts {
+                    pathspec: Some("README.md".into()),
+                    limit: 100,
+                    ..Default::default()
+                },
+            );
+            assert!(!marker.exists(), "{mechanism} executed during diff");
+            assert!(diff.unwrap().lines.iter().any(|line| line == "+raw change"));
+        }
+    }
+
+    #[test]
+    fn security_readonly_git_refuses_unsafe_submodule_recursion() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        let oid = git_head_oid(
+            &WorkspaceRoot::new(dir.path(), true).unwrap(),
+            Path::new(""),
+        )
+        .unwrap();
+        assert!(Command::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{oid},nested")
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        for error in [
+            git_status(&ws, &GitStatusOpts::default()).unwrap_err(),
+            git_diff(&ws, &GitDiffOpts::default()).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("submodule worktrees"));
+        }
+    }
+
+    #[test]
+    fn readonly_git_preserves_upstream_and_staged_patch() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        for args in [
+            vec!["remote", "add", "origin", "https://example.invalid/repo"],
+            vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+            vec!["branch", "--set-upstream-to=origin/main"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(dir.path().join("README.md"), "staged raw\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        let status = git_status(&ws, &GitStatusOpts::default()).unwrap();
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        let diff = git_diff(
+            &ws,
+            &GitDiffOpts {
+                staged: true,
+                pathspec: Some("README.md".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(diff.lines.iter().any(|line| line == "+staged raw"));
+    }
+
+    #[test]
+    fn readonly_git_preserves_shallow_upstream_boundaries() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let shallow = dir.path().join("shallow");
+        fs::create_dir(&source).unwrap();
+        init_repo(&source);
+        fs::write(source.join("README.md"), "second commit\n").unwrap();
+        for args in [vec!["add", "README.md"], vec!["commit", "-m", "second"]] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&source)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(Command::new("git")
+            .args([
+                "clone",
+                "-c",
+                "core.autocrlf=false",
+                "--no-local",
+                "--depth=1"
+            ])
+            .arg(&source)
+            .arg(&shallow)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(source.join("README.md"), "source advances\n").unwrap();
+        for args in [vec!["add", "README.md"], vec!["commit", "-m", "advance"]] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&source)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(Command::new("git")
+            .args(["fetch", "--depth=1", "origin"])
+            .current_dir(&shallow)
+            .status()
+            .unwrap()
+            .success());
+        let native = Command::new("git")
+            .args(["status", "--porcelain=v1", "-b"])
+            .current_dir(&shallow)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        let ws = WorkspaceRoot::new(&shallow, true).unwrap();
+        let status = git_status(&ws, &GitStatusOpts::default()).unwrap();
+        assert!(status.clean);
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        fs::write(shallow.join("README.md"), "local raw change\n").unwrap();
+        let diff = git_diff(&ws, &GitDiffOpts::default()).unwrap();
+        assert!(diff.lines.iter().any(|line| line == "+local raw change"));
+    }
+
+    #[test]
+    fn readonly_git_preserves_local_exclusions() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join(".git/info/exclude"), "local-secret.env\n").unwrap();
+        fs::write(dir.path().join("local-secret.env"), "ignored fixture\n").unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        let status = git_status(&ws, &GitStatusOpts::default()).unwrap();
+        assert!(status.clean);
+        assert!(status.entries.is_empty());
+    }
+
+    #[test]
+    fn readonly_git_preserves_reftable_head_and_staged_diff() {
+        let dir = tempdir().unwrap();
+        let init = Command::new("git")
+            .args(["init", "--ref-format=reftable"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        if !init.status.success()
+            && String::from_utf8_lossy(&init.stderr).contains("unknown option")
+        {
+            eprintln!("reftable fixture needs Git >= 2.45; run with newer Git in PATH");
+            return;
+        }
+        assert!(init.status.success(), "{init:?}");
+        seed_repo(dir.path());
+        let expected = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(expected.status.success());
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        assert_eq!(
+            git_head_oid(&ws, Path::new("")).unwrap(),
+            String::from_utf8(expected.stdout).unwrap().trim()
+        );
+        let status = git_status(&ws, &GitStatusOpts::default()).unwrap();
+        assert!(status.clean);
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        let opts = GitDiffOpts {
+            staged: true,
+            ..Default::default()
+        };
+        assert!(git_diff(&ws, &opts).unwrap().lines.is_empty());
+        fs::write(dir.path().join("README.md"), "reftable staged change\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        // A new capture must not reuse the earlier empty diff spool.
+        let opts = GitDiffOpts {
+            staged: true,
+            max_bytes: 128 * 1024,
+            ..Default::default()
+        };
+        let diff = git_diff(&ws, &opts).unwrap();
+        assert!(diff
+            .lines
+            .iter()
+            .any(|line| line == "+reftable staged change"));
+    }
+
+    #[test]
+    fn readonly_git_preserves_sha256_object_format() {
+        let dir = tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--object-format=sha256"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        seed_repo(dir.path());
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        assert_eq!(git_head_oid(&ws, Path::new("")).unwrap().len(), 64);
+        fs::write(dir.path().join("README.md"), "sha256 change\n").unwrap();
+        assert!(!git_status(&ws, &GitStatusOpts::default()).unwrap().clean);
+        assert!(git_diff(&ws, &GitDiffOpts::default())
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line == "+sha256 change"));
+    }
+
+    #[test]
+    fn readonly_git_ignores_workspace_executable_shadow() {
+        let dir = tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(
+            dir.path()
+                .join(if cfg!(windows) { "git.exe" } else { "git" }),
+            "not a trusted Git executable",
+        )
+        .unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        let status = git_status(&ws, &GitStatusOpts::default()).unwrap();
+        assert!(status
+            .entries
+            .iter()
+            .any(|entry| entry.path.starts_with("git")));
+    }
+
+    #[test]
     fn linked_worktree_keeps_the_requested_git_context() {
         let dir = tempdir().unwrap();
         let primary = dir.path().join("primary");
@@ -948,6 +1581,12 @@ mod tests {
         // `--show-toplevel` and reruns from `linked`, Git instead selects the
         // linked worktree's .git file/index and falsely reports clean.
         fs::write(linked.join("README.md"), b"linked branch\n").unwrap();
+        assert!(Command::new("git")
+            .args(["update-index", "--split-index"])
+            .current_dir(&linked)
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
             .args(["add", "README.md"])
             .current_dir(&linked)

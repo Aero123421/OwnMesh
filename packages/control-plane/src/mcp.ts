@@ -43,6 +43,7 @@ import {
   json,
   MAX_REQUEST_BODY_BYTES,
   randomToken,
+  readRequestFormDataLimited,
   readRequestJsonLimited,
   requireScope,
   sha256Hex,
@@ -5758,7 +5759,9 @@ export async function handleMcp(
   if (req.method === "POST") {
     let body: JsonRpc;
     try {
-      body = await readRequestJsonLimited<JsonRpc>(req.clone(), MAX_REQUEST_BODY_BYTES);
+      // The parsed body is passed to the core. An unread clone would keep
+      // tee cancellation pending when the byte budget is exceeded.
+      body = await readRequestJsonLimited<JsonRpc>(req, MAX_REQUEST_BODY_BYTES);
     } catch (error) {
       const modernHint = req.headers.has("mcp-protocol-version")
         || req.headers.has("mcp-method")
@@ -9009,7 +9012,18 @@ export async function handleApprove(
     let operationId = url.searchParams.get("operation_id") || "";
     let transactionIds: string[] = [];
     if (ct.includes("application/json")) {
-      const body = await readRequestJsonLimited<Record<string, unknown>>(req);
+      let body: Record<string, unknown>;
+      try {
+        const parsed = await readRequestJsonLimited<unknown>(req);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return json({ error: "invalid_request" }, { status: 400, noStore: true });
+        }
+        body = parsed as Record<string, unknown>;
+      } catch (error) {
+        return json({ error: error instanceof BodyTooLargeError ? "request_too_large" : "invalid_request" }, {
+          status: error instanceof BodyTooLargeError ? 413 : 400, noStore: true,
+        });
+      }
       decision = String(body.decision || "");
       transactionId = String(body.transaction_id || "");
       csrfToken = String(body.csrf_token || "");
@@ -9029,7 +9043,14 @@ export async function handleApprove(
       void body.approver_id;
       void body.principal_id;
     } else {
-      const form = await req.formData();
+      let form: FormData;
+      try {
+        form = await readRequestFormDataLimited(req);
+      } catch (error) {
+        return json({ error: error instanceof BodyTooLargeError ? "request_too_large" : "invalid_request" }, {
+          status: error instanceof BodyTooLargeError ? 413 : 400, noStore: true,
+        });
+      }
       decision = String(form.get("decision") || "");
       transactionId = String(form.get("transaction_id") || "");
       csrfToken = String(form.get("csrf_token") || "");

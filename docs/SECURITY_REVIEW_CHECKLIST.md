@@ -34,6 +34,8 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
   **Tests:** `ownmesh-exec` idempotency; `ownmeshd` `idempotency_key_prevents_operation_rerun`; `security_command_injection` replay section
 - [x] frame/message/payload/output の上限がある  
   **Tests:** `ownmesh-protocol` max envelope; `ownmesh-ipc` `MAX_FRAME_BYTES`; exec `max_output_bytes`
+- [x] device REST、connector、approval の JSON / form 本文は実バイト上限を検証してから解析し、超過時は副作用なく 413 を返す
+  **Tests:** `security-body-budget.test.ts`, `batch-approval.test.ts` (repeated transaction IDs)
 - [x] parser と state machine を fuzz test する  
   **Tests:** `crates/ownmesh-protocol/tests/fuzz_harness_build.rs`, `ws_parser_fuzz.rs`
 - [x] version downgrade と unsupported feature を安全に扱う  
@@ -98,6 +100,8 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 
 ## 6. Filesystem
 
+- [x] 読み取り Git 操作は repository helper / filter / textconv を実行しない。submodule の未対応 capture は明示的に拒否する
+  **Tests:** `ownmesh-fs` `security_readonly_git_*`, upstream / staged / SHA-256 / linked-worktree fixtures; **Docs:** ADR 0023
 - [x] path normalization の前後で authorization boundary を検証する  
   **Tests:** `ownmesh-fs/tests/security_path.rs`
 - [x] symlink、junction、mount、reparse point、case folding を OS ごとに test する  
