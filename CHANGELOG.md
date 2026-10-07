@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v1.2.34 — Git and HTTP security hardening
+
+- Isolated read-only Git captures from repository clean/process filters,
+  textconv, external diff drivers, and inherited Git configuration.
+- Preserved linked worktrees, split indexes, shallow boundaries, local excludes,
+  SHA-256 repositories, and reftable HEAD in bounded private metadata views.
+- Made submodule/oversized-index captures fail explicitly; diffs show raw content.
+- Enforced actual HTTP byte budgets before device, connector, and approval parsing,
+  preserving multipart and repeated batch transaction fields.
+- Removed unread Request clones that stalled MCP/OAuth overflow cancellation.
+- Updated rustls and Wrangler/miniflare dependencies to resolve known advisories;
+  replaced the yanked chacha20 release with its compatible CPU-backend fix.
+
 ## v1.2.33 — D1 write-amplification resolution (Issue #224 plan F)
 
 - Narrow status-transition CAS, seeded OAuth bootstrap, single receipt

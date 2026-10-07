@@ -765,7 +765,9 @@ async function handleFetch(
       if (request.method === "POST") {
         let form: Record<string, string>;
         try {
-          form = await readBody(request.clone());
+          // The downstream request is rebuilt from these fields. Reading a
+          // clone would stall cancellation on its unread original sibling.
+          form = await readBody(request);
         } catch (error) {
           if (error instanceof BodyTooLargeError) {
             return json({ error: "invalid_request" }, { status: 413, noStore: true });

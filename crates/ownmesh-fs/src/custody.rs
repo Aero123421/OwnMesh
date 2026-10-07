@@ -1914,7 +1914,13 @@ mod tests {
         assert!(
             matches!(
                 err,
-                FsError::CrossBoundaryHardlink(_) | FsError::CrossMount(_)
+                FsError::CrossBoundaryHardlink(_)
+                    | FsError::CrossMount(_)
+                    // macOS `F_GETPATH` may resolve a hardlinked inode through
+                    // either directory entry, so the workspace-boundary check
+                    // can reject the open as an escape before the link-count
+                    // check runs. Every listed outcome is fail-closed.
+                    | FsError::EscapesWorkspace(_)
             ),
             "outside hardlink must fail closed: {err:?}"
         );
