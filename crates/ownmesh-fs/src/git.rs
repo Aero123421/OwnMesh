@@ -1143,8 +1143,20 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        seed_repo(dir);
+    }
+
+    // Seed an already initialized repository without changing its ref or
+    // object format. Fixtures must not inherit host line-ending conversion.
+    fn seed_repo(dir: &Path) {
         // Standalone Git builds may omit installed repository templates.
         fs::create_dir_all(dir.join(".git/info")).unwrap();
+        assert!(Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
             .args(["config", "user.email", "ownmesh@test.local"])
             .current_dir(dir)
@@ -1400,7 +1412,13 @@ mod tests {
                 .success());
         }
         assert!(Command::new("git")
-            .args(["clone", "--no-local", "--depth=1"])
+            .args([
+                "clone",
+                "-c",
+                "core.autocrlf=false",
+                "--no-local",
+                "--depth=1"
+            ])
             .arg(&source)
             .arg(&shallow)
             .status()
@@ -1463,7 +1481,7 @@ mod tests {
             return;
         }
         assert!(init.status.success(), "{init:?}");
-        init_repo(dir.path());
+        seed_repo(dir.path());
         let expected = Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())
@@ -1512,7 +1530,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        init_repo(dir.path());
+        seed_repo(dir.path());
         let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
         assert_eq!(git_head_oid(&ws, Path::new("")).unwrap().len(), 64);
         fs::write(dir.path().join("README.md"), "sha256 change\n").unwrap();
