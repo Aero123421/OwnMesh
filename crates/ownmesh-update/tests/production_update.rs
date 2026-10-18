@@ -394,6 +394,72 @@ fn homebrew_path_refuses_self_update() {
 }
 
 #[test]
+fn valid_windows_zip_preserves_required_binary_bytes() {
+    let mut files = fixture_binaries("windows");
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        for (name, data) in &files {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let extracted =
+        extract_required_binaries(&cursor.into_inner(), ArchiveKind::Zip, "windows").unwrap();
+    files.remove("LICENSE");
+    assert_eq!(extracted, files);
+}
+
+#[test]
+fn zip_invalid_utf8_member_name_fails_closed() {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        zip.start_file("ownmesh.exe", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"bin").unwrap();
+        zip.finish().unwrap();
+    }
+    let mut archive = cursor.into_inner();
+    // Both headers claim UTF-8 but contain an invalid first filename byte.
+    for (signature, flags_offset, name_offset) in [
+        ([0x50, 0x4b, 0x03, 0x04], 6, 30),
+        ([0x50, 0x4b, 0x01, 0x02], 8, 46),
+    ] {
+        let offset = archive.windows(4).position(|s| s == signature).unwrap();
+        archive[offset + flags_offset + 1] |= 0x08;
+        archive[offset + name_offset] = 0xff;
+    }
+    let err = extract_required_binaries(&archive, ArchiveKind::Zip, "windows").unwrap_err();
+    assert!(matches!(err, UpdateError::UnsafeArchive(_)), "{err}");
+    assert!(
+        err.to_string().contains("zip member name")
+            || err.to_string().contains("unexpected archive member"),
+        "{err}"
+    );
+}
+
+#[test]
+fn zip_symlink_member_is_rejected() {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        zip.add_symlink(
+            "ownmesh.exe",
+            "/tmp/outside-ownmesh",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+    }
+    let err =
+        extract_required_binaries(&cursor.into_inner(), ArchiveKind::Zip, "windows").unwrap_err();
+    assert!(err.to_string().contains("symlink"), "{err}");
+}
+
+#[test]
 fn traversal_member_rejected() {
     let mut cursor = Cursor::new(Vec::new());
     {

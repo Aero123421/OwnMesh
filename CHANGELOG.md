@@ -12,7 +12,7 @@
 - Enforced actual HTTP byte budgets before device, connector, and approval parsing,
   preserving multipart and repeated batch transaction fields.
 - Removed unread Request clones that stalled MCP/OAuth overflow cancellation.
-- Updated rustls and Wrangler/miniflare dependencies to resolve known advisories;
+- Updated rustls, quinn-proto, ZIP, and Wrangler/miniflare dependencies to resolve known advisories;
   replaced the yanked chacha20 release with its compatible CPU-backend fix.
 
 ## v1.2.33 — D1 write-amplification resolution (Issue #224 plan F)

@@ -224,7 +224,10 @@ fn read_zip(bytes: &[u8], os: &str) -> UpdateResult<BTreeMap<String, Vec<u8>>> {
             continue;
         }
 
-        let raw_name = file.name().to_owned();
+        let raw_name = file
+            .name()
+            .map_err(|err| UpdateError::UnsafeArchive(format!("zip member name: {err}")))?
+            .into_owned();
         // Zip slip: enclosed_name is None for absolute / traversal names.
         if file.enclosed_name().is_none() {
             return Err(UpdateError::UnsafeArchive(format!(
