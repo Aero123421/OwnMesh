@@ -2918,17 +2918,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn registry_lock_is_not_inherited_across_exec() {
+        use std::io::Read;
+
         let dir = tempdir().unwrap();
         let registry = CredentialRegistry::open(dir.path()).unwrap();
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("5")
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ready; exec /bin/sleep 5"])
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        // A successful spawn can return before the kernel has finished closing
+        // CLOEXEC descriptors. Wait for code in the exec'd image to run before
+        // checking lock release, while keeping that image alive for the check.
+        let mut ready = [0; 5];
+        let exec_started = child.stdout.take().unwrap().read_exact(&mut ready);
         drop(registry);
 
         let reopened = CredentialRegistry::open(dir.path());
         let _ = child.kill();
         let _ = child.wait();
+        exec_started.expect("exec child must signal readiness");
+        assert_eq!(&ready, b"ready");
         reopened.expect("an exec child must not keep the daemon registry lock alive");
     }
 

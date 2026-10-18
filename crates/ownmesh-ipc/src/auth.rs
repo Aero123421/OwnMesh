@@ -1345,6 +1345,7 @@ mod tests {
             methods::GRANTS_LIST,
             methods::GRANTS_SHOW,
             methods::GRANTS_REVOKE,
+            methods::AGENT_RELOAD,
             "session.open",
             "session.write",
             "session.claim",

@@ -9,7 +9,7 @@ use crate::runtime::{
 };
 use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
 use futures_util::stream::FuturesUnordered;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use ownmesh_config::{atomic_write, OwnMeshConfig, OwnMeshPaths};
 use ownmesh_domain::{DeviceId, ErrorCode, MessageId, Timestamp};
 use ownmesh_identity::{
@@ -1455,6 +1455,22 @@ fn compact_completed_reply(reply: CompletedReply) -> CompletedReply {
 }
 
 impl AgentTransportConfig {
+    /// Non-secret identity used by the Issue #248 supervisor to decide whether
+    /// a reload must restart the transport. The credential is represented only
+    /// by a one-way fingerprint so no secret is retained or logged.
+    #[must_use]
+    pub fn identity(&self) -> AgentTransportIdentity {
+        let fingerprint = ring::digest::digest(&ring::digest::SHA256, self.credential.as_bytes());
+        let mut credential_fingerprint = [0_u8; 32];
+        credential_fingerprint.copy_from_slice(fingerprint.as_ref());
+        AgentTransportIdentity {
+            issuer: self.issuer.clone(),
+            device_id: self.device_id.as_str().to_owned(),
+            key_fingerprint: self.key.public_identity().fingerprint,
+            credential_fingerprint,
+        }
+    }
+
     fn remember_orphan_completion(&self, completed: CompletedReply) {
         let compact = compact_completed_reply(completed);
         if let Ok(mut orphans) = self.orphan_completions.lock() {
@@ -1472,6 +1488,57 @@ impl AgentTransportConfig {
             .lock()
             .map(|mut orphans| orphans.drain(..).collect())
             .unwrap_or_default()
+    }
+}
+
+/// Non-secret identity of one configured transport (Issue #248).
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentTransportIdentity {
+    pub issuer: String,
+    pub device_id: String,
+    /// Public-key fingerprint only; a rotated signing key must restart.
+    pub key_fingerprint: String,
+    credential_fingerprint: [u8; 32],
+}
+
+impl std::fmt::Debug for AgentTransportIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Fingerprints are stable correlators; never print them either.
+        f.debug_struct("AgentTransportIdentity")
+            .field("issuer", &self.issuer)
+            .field("device_id", &self.device_id)
+            .field("key_fingerprint", &"[redacted]")
+            .field("credential_fingerprint", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Desired supervisor action for the current vs configured transport identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportReloadAction {
+    /// The running transport already matches the configured identity.
+    Keep,
+    /// No transport is running and a credential is available.
+    Start,
+    /// Stop the current transport and start the newly configured one.
+    Restart,
+    /// Credentials disappeared: stop and disable.
+    Stop,
+}
+
+/// Pure supervisor decision (unit-tested): never restarts an unchanged live
+/// route, but always picks up a credential/issuer/device change.
+#[must_use]
+pub fn reload_action(
+    current: Option<&AgentTransportIdentity>,
+    next: Option<&AgentTransportIdentity>,
+) -> TransportReloadAction {
+    match (current, next) {
+        (None, None) => TransportReloadAction::Keep,
+        (None, Some(_)) => TransportReloadAction::Start,
+        (Some(_), None) => TransportReloadAction::Stop,
+        (Some(current), Some(next)) if current == next => TransportReloadAction::Keep,
+        (Some(_), Some(_)) => TransportReloadAction::Restart,
     }
 }
 
@@ -1628,6 +1695,203 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+/// One running transport owned by the supervisor.
+struct RunningTransport {
+    identity: AgentTransportIdentity,
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Issue #248: keep the remote Agent transport reconciled with the enrolled
+/// device credential. The daemon commonly starts before `device enroll`, so a
+/// one-shot configuration at boot left the route disabled until a manual
+/// restart; this supervisor re-reads config + credential on an authenticated
+/// reload request and (re)starts the transport, while an unchanged live route
+/// is left untouched.
+pub async fn supervise(
+    paths: OwnMeshPaths,
+    runtime: Arc<Mutex<DaemonRuntime>>,
+    workspace_registry_notify: Arc<tokio::sync::Notify>,
+    presence: watch::Sender<AgentRoutePresence>,
+    shutdown: watch::Receiver<bool>,
+    reload: Arc<tokio::sync::Notify>,
+) {
+    supervise_with(
+        paths,
+        runtime,
+        workspace_registry_notify,
+        presence,
+        shutdown,
+        reload,
+        |paths, notify| {
+            // Issue #248: the active instance and instance list can be written
+            // after daemon start (`setup`, `instance use`, `login --device`),
+            // so config must be re-read on every pass, not frozen at boot.
+            let cfg = ownmesh_config::load_config(paths).map_err(|err| err.to_string())?;
+            configured_transport(paths, &cfg, notify)
+        },
+    )
+    .await;
+}
+
+/// Wait for a reload request or shutdown. Returns `true` when the caller must
+/// stop (shutdown requested or the channel closed).
+async fn wait_for_reload_or_shutdown(
+    shutdown: &mut watch::Receiver<bool>,
+    reload: &Arc<tokio::sync::Notify>,
+) -> bool {
+    tokio::select! {
+        () = reload.notified() => false,
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+    }
+}
+
+/// Testable supervisor core: `load` isolates the on-disk read (real config +
+/// keychain in production, in-memory configs in tests).
+async fn supervise_with<F>(
+    paths: OwnMeshPaths,
+    runtime: Arc<Mutex<DaemonRuntime>>,
+    workspace_registry_notify: Arc<tokio::sync::Notify>,
+    presence: watch::Sender<AgentRoutePresence>,
+    mut shutdown: watch::Receiver<bool>,
+    reload: Arc<tokio::sync::Notify>,
+    mut load: F,
+) where
+    F: FnMut(
+        &OwnMeshPaths,
+        Option<Arc<tokio::sync::Notify>>,
+    ) -> Result<Option<AgentTransportConfig>, String>,
+{
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut running: Option<RunningTransport> = None;
+    loop {
+        if *shutdown.borrow() {
+            stop_transport(&mut running).await;
+            return;
+        }
+        // A transport that exited on its own (for example a rejected state
+        // file) must not hot-loop through the keychain: disable and wait for
+        // the next reload or service restart.
+        if running
+            .as_ref()
+            .is_some_and(|current| current.task.is_finished())
+        {
+            running = None;
+            let _ = presence.send_replace(AgentRoutePresence::Disabled);
+            tracing::warn!(
+                "remote Agent transport exited; waiting for the next credential reload or service restart"
+            );
+            if wait_for_reload_or_shutdown(&mut shutdown, &reload).await {
+                stop_transport(&mut running).await;
+                return;
+            }
+            continue;
+        }
+        let configured = load(&paths, Some(Arc::clone(&workspace_registry_notify)));
+        let (next_identity, next_config) = match configured {
+            Ok(Some(config)) => (Some(config.identity()), Some(config)),
+            Ok(None) => (None, None),
+            Err(error) => {
+                // Keep a healthy live route on a transient local read failure;
+                // only an explicit "no credential" reconciles to disabled.
+                tracing::error!(
+                    error = %error,
+                    "remote Agent transport reload failed; keeping the current route"
+                );
+                if wait_for_reload_or_shutdown(&mut shutdown, &reload).await {
+                    stop_transport(&mut running).await;
+                    return;
+                }
+                continue;
+            }
+        };
+        match reload_action(
+            running.as_ref().map(|current| &current.identity),
+            next_identity.as_ref(),
+        ) {
+            TransportReloadAction::Keep => {}
+            TransportReloadAction::Start => {
+                if let Some(config) = next_config {
+                    start_transport(&mut running, config, &runtime, &presence, &reload);
+                }
+            }
+            TransportReloadAction::Restart => {
+                stop_transport(&mut running).await;
+                if let Some(config) = next_config {
+                    start_transport(&mut running, config, &runtime, &presence, &reload);
+                }
+            }
+            TransportReloadAction::Stop => {
+                stop_transport(&mut running).await;
+                let _ = presence.send_replace(AgentRoutePresence::Disabled);
+                tracing::info!(
+                    "enrolled device credential removed; remote Agent transport disabled"
+                );
+            }
+        }
+        if running.is_none() {
+            let _ = presence.send_replace(AgentRoutePresence::Disabled);
+            tracing::info!("no active enrolled device credential; remote Agent transport disabled");
+        }
+        if wait_for_reload_or_shutdown(&mut shutdown, &reload).await {
+            stop_transport(&mut running).await;
+            return;
+        }
+    }
+}
+
+fn start_transport(
+    running: &mut Option<RunningTransport>,
+    config: AgentTransportConfig,
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    presence: &watch::Sender<AgentRoutePresence>,
+    reload: &Arc<tokio::sync::Notify>,
+) {
+    let identity = config.identity();
+    let (stop, stop_rx) = watch::channel(false);
+    // A wrapper notifies the supervisor if the transport returns on its own so
+    // the loop can observe task exit even while parked in `select!`. A
+    // supervisor-requested stop must not produce that wake-up.
+    let reload_on_exit = Arc::clone(reload);
+    let stop_probe = stop_rx.clone();
+    let runtime = Arc::clone(runtime);
+    let presence = presence.clone();
+    let task = tokio::spawn(async move {
+        // A panic inside the transport must still wake the supervisor, or the
+        // route would silently stay in its last presence state forever.
+        let outcome =
+            std::panic::AssertUnwindSafe(run(config, Some(runtime), stop_rx, Some(presence)))
+                .catch_unwind()
+                .await;
+        if outcome.is_err() {
+            tracing::error!("remote Agent transport panicked; awaiting the next credential reload");
+        }
+        if !*stop_probe.borrow() {
+            reload_on_exit.notify_one();
+        }
+    });
+    *running = Some(RunningTransport {
+        identity,
+        stop,
+        task,
+    });
+    tracing::info!("remote Agent transport configured from the enrolled device credential");
+}
+
+async fn stop_transport(running: &mut Option<RunningTransport>) {
+    let Some(mut current) = running.take() else {
+        return;
+    };
+    let _ = current.stop.send(true);
+    if tokio::time::timeout(Duration::from_secs(2), &mut current.task)
+        .await
+        .is_err()
+    {
+        current.task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut current.task).await;
     }
 }
 
@@ -4553,6 +4817,248 @@ mod tests {
             maximum.next_delay_from_sample(2_000),
             Duration::from_secs(2)
         );
+    }
+
+    /// Issue #248: transport config fixture for supervisor tests.
+    fn test_transport_config(dir: &Path, device: &str, credential: &str) -> AgentTransportConfig {
+        let device_id = DeviceId::parse(device).unwrap();
+        AgentTransportConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            ws_url: agent_connect_url("http://127.0.0.1:1", device_id.as_str()).unwrap(),
+            origin: "http://127.0.0.1:1".into(),
+            device_id,
+            credential: SecretString::new(credential),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
+            state_path: dir.join(format!("transport-reload-{device}.json")),
+        }
+    }
+
+    #[test]
+    fn reload_action_keeps_unchanged_routes_and_restarts_changes() {
+        let base = AgentTransportIdentity {
+            issuer: "https://cp.example".into(),
+            device_id: "dev_a".into(),
+            key_fingerprint: "fp_key_a".into(),
+            credential_fingerprint: [1; 32],
+        };
+        let same = base.clone();
+        let rotated = AgentTransportIdentity {
+            credential_fingerprint: [2; 32],
+            ..base.clone()
+        };
+        let other_device = AgentTransportIdentity {
+            device_id: "dev_b".into(),
+            ..base.clone()
+        };
+        let other_key = AgentTransportIdentity {
+            key_fingerprint: "fp_key_b".into(),
+            ..base.clone()
+        };
+
+        assert_eq!(reload_action(None, None), TransportReloadAction::Keep);
+        assert_eq!(
+            reload_action(None, Some(&base)),
+            TransportReloadAction::Start
+        );
+        assert_eq!(
+            reload_action(Some(&base), Some(&same)),
+            TransportReloadAction::Keep
+        );
+        assert_eq!(
+            reload_action(Some(&base), Some(&rotated)),
+            TransportReloadAction::Restart
+        );
+        assert_eq!(
+            reload_action(Some(&base), Some(&other_device)),
+            TransportReloadAction::Restart
+        );
+        assert_eq!(
+            reload_action(Some(&base), Some(&other_key)),
+            TransportReloadAction::Restart
+        );
+        assert_eq!(
+            reload_action(Some(&base), None),
+            TransportReloadAction::Stop
+        );
+    }
+
+    #[test]
+    fn transport_identity_is_credential_sensitive_and_never_logs_the_secret() {
+        let dir = tempdir().unwrap();
+        let mut config = test_transport_config(dir.path(), "dev_identity", "credential-one");
+        let first = config.identity();
+        config.credential = SecretString::new("credential-two");
+        let second = config.identity();
+
+        assert_ne!(first, second);
+        assert_eq!(first.issuer, "http://127.0.0.1:1");
+        assert_eq!(first.device_id, "dev_identity");
+        let debug = format!("{first:?}");
+        assert!(!debug.contains("credential-one"));
+        assert!(!debug.contains("credential-two"));
+        assert!(!debug.contains(&first.key_fingerprint));
+    }
+
+    /// Issue #248 regression: the daemon starts before enrollment (no
+    /// credential), a reload makes the supervisor start the transport
+    /// (route becomes offline/connecting, not disabled), a changed credential
+    /// restarts it, and losing the credential disables it again.
+    #[tokio::test]
+    async fn supervisor_picks_up_a_credential_after_reload_without_restart() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let runtime = Arc::new(Mutex::new(DaemonRuntime::open(&paths).unwrap()));
+        let (presence_tx, presence_rx) = watch::channel(AgentRoutePresence::Disabled);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let reload = Arc::new(tokio::sync::Notify::new());
+        let state_dir = dir.path().to_path_buf();
+        let state_dir_for_load = state_dir.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_load = Arc::clone(&calls);
+
+        let supervisor = tokio::spawn(supervise_with(
+            paths,
+            runtime,
+            Arc::new(tokio::sync::Notify::new()),
+            presence_tx,
+            shutdown_rx,
+            Arc::clone(&reload),
+            move |_paths, _notify| {
+                let stage = calls_for_load.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if stage == 1 {
+                    // Enrollment announced: start from the new credential.
+                    return Ok(Some(test_transport_config(
+                        &state_dir_for_load,
+                        "dev_reload",
+                        "credential-loaded",
+                    )));
+                }
+                if stage == 2 {
+                    // Same device, rotated credential: must restart, not Keep.
+                    return Ok(Some(test_transport_config(
+                        &state_dir_for_load,
+                        "dev_reload",
+                        "credential-rotated",
+                    )));
+                }
+                if stage == 3 {
+                    // Transient local read failure: must keep the live route.
+                    return Err("injected transient load failure".into());
+                }
+                if stage == 4 {
+                    // Transport whose state file is corrupt: `run` exits on its
+                    // own, and the supervisor must observe that and disable.
+                    return Ok(Some(test_transport_config(
+                        &state_dir_for_load,
+                        "dev_exit",
+                        "credential-exit",
+                    )));
+                }
+                if stage == 5 {
+                    // Recovery after the self-exit.
+                    return Ok(Some(test_transport_config(
+                        &state_dir_for_load,
+                        "dev_reload",
+                        "credential-loaded",
+                    )));
+                }
+                // Stage 0 (booted before enrollment) and stage >= 6 (removed).
+                Ok(None)
+            },
+        ));
+
+        let wait_for = |mut rx: watch::Receiver<AgentRoutePresence>, expected: &'static str| async move {
+            loop {
+                if rx.borrow().as_str() == expected {
+                    return;
+                }
+                rx.changed().await.expect("presence channel stays open");
+            }
+        };
+        let wait_for_calls = |target: usize| {
+            let calls = Arc::clone(&calls);
+            async move {
+                while calls.load(std::sync::atomic::Ordering::SeqCst) < target {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        // No credential yet: route stays disabled; the loader is re-read on
+        // every pass (config is not frozen at boot).
+        assert_eq!(presence_rx.borrow().as_str(), "disabled");
+        reload.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(presence_rx.clone(), "offline"),
+        )
+        .await
+        .expect("reload must start the transport from the new credential");
+
+        // Rotated credential for the same device: reload must reconcile.
+        reload.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), wait_for_calls(3))
+            .await
+            .expect("rotated credential must trigger another reconcile pass");
+
+        // Transient load error: the healthy live route must survive.
+        reload.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), wait_for_calls(4))
+            .await
+            .expect("failed load must still count as a reconcile pass");
+        assert_eq!(
+            presence_rx.borrow().as_str(),
+            "offline",
+            "transient load error must not tear down a running transport"
+        );
+
+        // Self-exiting transport (corrupt state file): the supervisor must
+        // notice without another reload and report disabled.
+        std::fs::write(
+            state_dir.join("transport-reload-dev_exit.json"),
+            b"{not-json",
+        )
+        .unwrap();
+        reload.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), wait_for_calls(5))
+            .await
+            .expect("self-exiting transport must be configured once");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(presence_rx.clone(), "disabled"),
+        )
+        .await
+        .expect("supervisor must observe the transport self-exit");
+
+        // Recovery after self-exit.
+        reload.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(presence_rx.clone(), "offline"),
+        )
+        .await
+        .expect("reload must restart the transport after a self-exit");
+
+        // Credential disappears: route returns to disabled.
+        reload.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for(presence_rx.clone(), "disabled"),
+        )
+        .await
+        .expect("removed credential must disable the transport");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("supervisor must stop on shutdown")
+            .expect("supervisor task must not panic");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 7);
     }
 
     async fn paused_sleep_completes_after(delay: Duration) {

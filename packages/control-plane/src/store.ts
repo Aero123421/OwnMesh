@@ -46,6 +46,15 @@ export const REFRESH_TOKEN_IDLE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 export const REFRESH_ROTATION_RECEIPT_TTL_MS = 60_000;
 /** Bounded cleanup batch for expired refresh-rotation receipts. */
 export const REFRESH_ROTATION_RECEIPT_CLEANUP_BATCH = 64;
+/**
+ * Issue #247: bounded convergence window for device-code exchange retries.
+ * The approved->consumed transition and token issuance commit together; a
+ * response-loss retry inside this window replays the same token pair instead
+ * of forcing a fresh device authorization.
+ */
+export const DEVICE_CODE_EXCHANGE_RECEIPT_TTL_MS = 5 * 60 * 1000;
+/** Bounded cleanup batch for expired device-code exchange receipts. */
+export const DEVICE_CODE_EXCHANGE_RECEIPT_CLEANUP_BATCH = 64;
 /** Do not turn reconnect churn into a D1 write stream when metadata is unchanged. */
 export const DEVICE_READY_WRITE_INTERVAL_MS = 60_000;
 
@@ -202,6 +211,16 @@ export type AuthCodeRecord = {
 
 export type AuthCodeRedemption =
   | { status: "redeemed"; record: AuthCodeRecord; token: TokenRecord }
+  | { status: "invalid_grant" };
+
+/**
+ * Issue #247: device-code exchange outcome. The grant consume and token
+ * issuance commit atomically; `replayed` converges a post-commit retry onto
+ * the same token pair from the bounded encrypted receipt.
+ */
+export type DeviceCodeExchange =
+  | { status: "redeemed"; record: DeviceCodeRecord; token: TokenRecord }
+  | { status: "replayed"; token: TokenRecord }
   | { status: "invalid_grant" };
 
 export type PutDeviceCodeResult = "created" | "user_code_collision";
@@ -686,6 +705,66 @@ async function decryptRefreshReceipt(
   }
 }
 
+/**
+ * Issue #247: device-code exchange receipts are encrypted under a key derived
+ * from the device code (the client's own bearer secret), mirroring refresh
+ * rotation receipts. D1 never stores a plaintext token, and a party without
+ * the device code cannot decrypt the receipt.
+ */
+async function deriveDeviceCodeReceiptKey(deviceCode: string): Promise<CryptoKey> {
+  const data = new TextEncoder().encode(`ownmesh.device-receipt.v1:${deviceCode}`);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return crypto.subtle.importKey(
+    "raw",
+    digest,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+async function encryptDeviceCodeReceipt(
+  successor: { access_token: string; refresh_token: string },
+  deviceCode: string,
+): Promise<EncryptedRefreshReceipt> {
+  const key = await deriveDeviceCodeReceiptKey(deviceCode);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(successor));
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  return {
+    ciphertext: bytesToBase64Url(new Uint8Array(ciphertext)),
+    iv: bytesToBase64Url(iv),
+  };
+}
+
+async function decryptDeviceCodeReceipt(
+  receipt: EncryptedRefreshReceipt,
+  deviceCode: string,
+): Promise<{ access_token: string; refresh_token: string } | null> {
+  const key = await deriveDeviceCodeReceiptKey(deviceCode);
+  const iv = base64UrlToBytes(receipt.iv);
+  const ciphertext = base64UrlToBytes(receipt.ciphertext);
+  if (!iv || !ciphertext) return null;
+  try {
+    const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+    const decoded = JSON.parse(new TextDecoder().decode(plaintext));
+    if (
+      typeof decoded === "object" &&
+      decoded !== null &&
+      typeof (decoded as Record<string, unknown>).access_token === "string" &&
+      typeof (decoded as Record<string, unknown>).refresh_token === "string"
+    ) {
+      return {
+        access_token: (decoded as Record<string, unknown>).access_token as string,
+        refresh_token: (decoded as Record<string, unknown>).refresh_token as string,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
@@ -940,7 +1019,18 @@ export interface ControlPlaneStore {
   getDeviceCode(deviceCode: string): Promise<DeviceCodeRecord | null>;
   getDeviceCodeByUserCode(userCode: string): Promise<DeviceCodeRecord | null>;
   approveDeviceCode(userCode: string, principalId: string): Promise<boolean>;
-  consumeApprovedDeviceCode(deviceCode: string, clientId: string): Promise<DeviceCodeRecord | null>;
+  /**
+   * Issue #247: atomic approved-device-code exchange. Consumes the grant and
+   * persists the token pair in one D1 batch (never a consumed grant without a
+   * token), and replays the bounded encrypted receipt for a post-commit retry.
+   * `resource` is the normalized effective audience; a bound device code only
+   * exchanges when it matches.
+   */
+  exchangeApprovedDeviceCode(input: {
+    deviceCode: string;
+    clientId: string;
+    resource?: string;
+  }): Promise<DeviceCodeExchange>;
   /**
    * Record a pending device-code poll. `minIntervalMs` bounds write frequency:
    * polls arriving sooner than that after the previous recorded poll are
@@ -1332,6 +1422,8 @@ export type SchemaReadiness = {
     /** 0022 write probe + operation-store cutover (Issue #224 plan F) */
     quota_probe: boolean;
     operation_store_cutover: boolean;
+    /** 0024 atomic device-code exchange + bounded replay receipt (Issue #247) */
+    device_code_exchange_receipts: boolean;
   };
 };
 
@@ -1614,6 +1706,26 @@ const SCHEMA_READINESS_OBJECTS: Record<
     table: "operation_store_cutover",
     columns: ["tenant_id", "cutover_at"],
   },
+  /** 0024 atomic device-code exchange receipt (Issue #247). */
+  device_code_exchange_receipts: {
+    table: "device_code_exchange_receipts",
+    columns: [
+      "device_code_hash",
+      "client_id",
+      "principal_id",
+      "tenant_id",
+      "scope",
+      "resource",
+      "access_token_hash",
+      "refresh_token_hash",
+      "refresh_family",
+      "encrypted_successor",
+      "iv",
+      "created_at",
+      "expires_at",
+    ],
+    indexes: ["idx_device_code_receipts_expiry"],
+  },
 };
 
 const DEFAULT_TENANT = "ten_default";
@@ -1635,6 +1747,8 @@ export class MemoryStore implements ControlPlaneStore {
   accessByRefresh = new Map<string, string>();
   usedRefresh = new Map<string, string>(); // refresh -> family
   rotationReceipts = new Map<string, { token: TokenRecord; expiresAt: number }>();
+  /** Issue #247: device_code_hash -> bounded exchange receipt (same tokens). */
+  deviceCodeReceipts = new Map<string, { token: TokenRecord; expiresAt: number }>();
   compromisedRefreshFamilies = new Set<string>();
   authCodes = new Map<string, AuthCodeRecord>();
   deviceCodes = new Map<string, DeviceCodeRecord>();
@@ -2154,12 +2268,98 @@ export class MemoryStore implements ControlPlaneStore {
     this.deviceCodes.set(rec.device_code, rec);
     return true;
   }
-  async consumeApprovedDeviceCode(deviceCode: string, clientId: string): Promise<DeviceCodeRecord | null> {
-    const rec = this.deviceCodes.get(deviceCode);
-    if (!rec || rec.status !== "approved" || rec.client_id !== clientId || Date.now() > rec.expires_at) return null;
+  async exchangeApprovedDeviceCode(input: {
+    deviceCode: string;
+    clientId: string;
+    resource?: string;
+  }): Promise<DeviceCodeExchange> {
+    const now = Date.now();
+    for (const [key, receipt] of this.deviceCodeReceipts) {
+      if (now > receipt.expiresAt) this.deviceCodeReceipts.delete(key);
+    }
+    const rec = this.deviceCodes.get(input.deviceCode);
+    const approved =
+      rec &&
+      rec.status === "approved" &&
+      rec.client_id === input.clientId &&
+      now <= rec.expires_at;
+    if (!approved) {
+      const receipt = this.deviceCodeReceipts.get(input.deviceCode);
+      if (receipt && now <= receipt.expiresAt && receipt.token.client_id === input.clientId) {
+        const live = this.tokensByAccess.get(receipt.token.access_token);
+        // Exact-retry convergence: omitted resource preserves the stored
+        // audience, but a retry cannot add or change one; revoked/used/expired
+        // or compromised-family successors are never replayed.
+        const audienceMatches =
+          input.resource === undefined ||
+          (receipt.token.resource !== undefined && input.resource === receipt.token.resource);
+        if (
+          live &&
+          !live.revoked &&
+          !live.refresh_used &&
+          now <= live.expires_at &&
+          now <= live.refresh_expires_at &&
+          !this.compromisedRefreshFamilies.has(live.refresh_family) &&
+          audienceMatches
+        ) {
+          return { status: "replayed", token: { ...live } };
+        }
+      }
+      return { status: "invalid_grant" };
+    }
+    const principalId = rec.principal_id;
+    if (!principalId) return { status: "invalid_grant" };
+    if (rec.resource !== undefined && input.resource !== rec.resource) {
+      return { status: "invalid_grant" };
+    }
+    // Claim the code synchronously before any await so concurrent exchanges
+    // observe a single winner (parity with the SQL atomic batch). The seeded
+    // principal path publishes the receipt without yielding; a missing
+    // principal yields once, and a concurrent loser may then get
+    // invalid_grant instead of a replay (single winner is preserved).
     rec.status = "consumed";
-    this.deviceCodes.set(deviceCode, rec);
-    return { ...rec };
+    this.deviceCodes.set(input.deviceCode, rec);
+    try {
+      const principalRecord = this.principals.get(principalId) ??
+        await this.ensurePrincipal(principalId, principalId);
+      const client = this.clients.get(rec.client_id);
+      if (!client || client.tenant_id !== principalRecord.tenant_id) {
+        rec.status = "approved";
+        this.deviceCodes.set(input.deviceCode, rec);
+        return { status: "invalid_grant" };
+      }
+      const access = randomToken("atk_");
+      const refresh = randomToken("rtk_");
+      const token: TokenRecord = {
+        access_token: access,
+        refresh_token: refresh,
+        client_id: rec.client_id,
+        scope: rec.scope,
+        principal: principalId,
+        expires_at: now + ACCESS_TOKEN_TTL_MS,
+        refresh_expires_at: now + REFRESH_TOKEN_IDLE_TTL_MS,
+        revoked: false,
+        refresh_family: randomToken("fam_"),
+        refresh_used: false,
+        tenant_id: principalRecord.tenant_id,
+        ...(rec.resource !== undefined
+          ? { resource: rec.resource }
+          : input.resource !== undefined
+            ? { resource: input.resource }
+            : {}),
+      };
+      this.tokensByAccess.set(access, token);
+      this.accessByRefresh.set(refresh, access);
+      this.deviceCodeReceipts.set(input.deviceCode, {
+        token,
+        expiresAt: now + DEVICE_CODE_EXCHANGE_RECEIPT_TTL_MS,
+      });
+      return { status: "redeemed", record: { ...rec }, token: { ...token } };
+    } catch (error) {
+      rec.status = "approved";
+      this.deviceCodes.set(input.deviceCode, rec);
+      throw error;
+    }
   }
   async markDeviceCodePolled(deviceCode: string, minIntervalMs = 0): Promise<void> {
     const rec = this.deviceCodes.get(deviceCode);
@@ -2346,6 +2546,11 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async appendAudit(event: AuditEvent): Promise<void> {
+    // Issue #247: deterministic audit ids must dedupe, not duplicate
+    // (parity with SqlStore's INSERT ... ON CONFLICT DO NOTHING).
+    if (this.audits.some((entry) => entry.id === event.id)) {
+      throw new Error(`audit_event_exists:${event.id}`);
+    }
     const cutoff = Date.now() - this.auditRetentionMs;
     this.audits = this.audits.filter((entry) => {
       if (entry.tenant_id !== event.tenant_id) return true;
@@ -3218,6 +3423,12 @@ export class MemoryStore implements ControlPlaneStore {
     for (const [key, receipt] of [...this.rotationReceipts]) {
       if (now > receipt.expiresAt) {
         this.rotationReceipts.delete(key);
+        stats.receiptsCleaned += 1;
+      }
+    }
+    for (const [key, receipt] of [...this.deviceCodeReceipts]) {
+      if (now > receipt.expiresAt) {
+        this.deviceCodeReceipts.delete(key);
         stats.receiptsCleaned += 1;
       }
     }
@@ -4503,22 +4714,232 @@ export class SqlStore implements ControlPlaneStore {
     return Boolean(row);
   }
 
-  async consumeApprovedDeviceCode(deviceCode: string, clientId: string): Promise<DeviceCodeRecord | null> {
-    const hash = await sha256Hex(deviceCode);
-    const row = await this.db.prepare(
-      `UPDATE device_codes SET status = 'consumed'
-       WHERE device_code_hash = ? AND client_id = ? AND status = 'approved' AND expires_at > ?
-       RETURNING user_code, client_id, scope, verification_uri, interval_sec, expires_at, principal_id, last_polled_at, resource`,
-    ).bind(hash, clientId, nowIso()).first<{
-      user_code: string; client_id: string; scope: string; verification_uri: string;
-      interval_sec: number; expires_at: string; principal_id: string | null; last_polled_at: string | null; resource: string | null;
+  /**
+   * Issue #247: atomic device-code exchange. One D1 batch consumes the
+   * approved grant and inserts the token pair (each statement self-gated via
+   * WHERE/EXISTS, no SQL cross-statement `changes()` dependency), then stores
+   * a bounded encrypted receipt keyed by the device code. A failure before
+   * commit rolls everything back; a post-commit retry converges on the
+   * receipt's token pair instead of forcing a fresh authorization.
+   */
+  async exchangeApprovedDeviceCode(input: {
+    deviceCode: string;
+    clientId: string;
+    resource?: string;
+  }): Promise<DeviceCodeExchange> {
+    if (!this.db.batch) {
+      throw new Error("SqlStore.exchangeApprovedDeviceCode requires db.batch");
+    }
+    const hash = await sha256Hex(input.deviceCode);
+    const nowMs = Date.now();
+    const now = nowIso(nowMs);
+    const row = await this.prepare("oauth.device.read",
+      `SELECT dc.client_id, dc.principal_id, dc.scope, dc.verification_uri, dc.interval_sec,
+              dc.expires_at, dc.resource AS resource, dc.user_code, p.tenant_id
+       FROM device_codes dc
+       JOIN principals p ON p.id = dc.principal_id
+       JOIN oauth_clients c ON c.client_id = dc.client_id AND c.tenant_id = p.tenant_id
+       WHERE dc.device_code_hash = ? AND dc.client_id = ? AND dc.status = 'approved' AND dc.expires_at > ?`,
+    ).bind(hash, input.clientId, now).first<{
+      client_id: string; principal_id: string; scope: string; verification_uri: string;
+      interval_sec: number; expires_at: string; resource: string | null; user_code: string;
+      tenant_id: string;
+    }>();
+    if (!row) {
+      return (await this.#replayDeviceCodeExchange(input, hash, nowMs)) ?? { status: "invalid_grant" };
+    }
+    // Fail closed before consuming when a bound device code requests a
+    // different audience (defense in depth; the handler also rejects earlier).
+    if (row.resource !== null && row.resource !== undefined && input.resource !== row.resource) {
+      return { status: "invalid_grant" };
+    }
+
+    const access = randomToken("atk_");
+    const refresh = randomToken("rtk_");
+    const family = randomToken("fam_");
+    const expiresAt = nowMs + ACCESS_TOKEN_TTL_MS;
+    const refreshExpiresAt = nowMs + REFRESH_TOKEN_IDLE_TTL_MS;
+    const accessHash = await sha256Hex(access);
+    const refreshHash = await sha256Hex(refresh);
+    const effectiveResource = row.resource ?? input.resource ?? null;
+    const encrypted = await encryptDeviceCodeReceipt(
+      { access_token: access, refresh_token: refresh },
+      input.deviceCode,
+    );
+    const receiptExpiresAt = nowIso(nowMs + DEVICE_CODE_EXCHANGE_RECEIPT_TTL_MS);
+    type BatchResult = { meta?: { changes?: number }; success?: boolean };
+
+    const results = await this.batchStatements<BatchResult>("oauth.device.exchange", [
+      this.db.prepare(
+        `DELETE FROM device_code_exchange_receipts
+         WHERE rowid IN (
+           SELECT rowid FROM device_code_exchange_receipts
+           WHERE expires_at <= ?
+           ORDER BY expires_at ASC
+           LIMIT ?
+         )`,
+      ).bind(now, DEVICE_CODE_EXCHANGE_RECEIPT_CLEANUP_BATCH),
+      this.db.prepare(
+        `INSERT INTO oauth_tokens
+         (access_token_hash, refresh_token_hash, client_id, principal_id, scope,
+          refresh_family, refresh_used, revoked, expires_at, refresh_expires_at,
+          created_at, resource)
+         SELECT ?, ?, dc.client_id, dc.principal_id, dc.scope, ?, 0,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM revoked_refresh_families r WHERE r.refresh_family = ?
+           ) THEN 1 ELSE 0 END,
+           ?, ?, ?, COALESCE(dc.resource, ?)
+         FROM device_codes dc
+         JOIN principals p ON p.id = dc.principal_id
+         JOIN oauth_clients c ON c.client_id = dc.client_id AND c.tenant_id = p.tenant_id
+         WHERE dc.device_code_hash = ? AND dc.client_id = ? AND dc.status = 'approved' AND dc.expires_at > ?
+           AND (dc.resource IS NULL OR dc.resource = ?)`,
+      ).bind(
+        accessHash, refreshHash, family, family,
+        nowIso(expiresAt), nowIso(refreshExpiresAt), now, effectiveResource,
+        hash, input.clientId, now, input.resource ?? "",
+      ),
+      this.db.prepare(
+        `UPDATE device_codes SET status = 'consumed'
+         WHERE device_code_hash = ? AND client_id = ? AND status = 'approved' AND expires_at > ?
+           AND EXISTS (SELECT 1 FROM oauth_tokens WHERE access_token_hash = ?)`,
+      ).bind(hash, input.clientId, now, accessHash),
+      this.db.prepare(
+        `INSERT OR IGNORE INTO device_code_exchange_receipts
+         (device_code_hash, client_id, principal_id, tenant_id, scope, resource,
+          access_token_hash, refresh_token_hash, refresh_family, encrypted_successor,
+          iv, created_at, expires_at)
+         SELECT ?, dc.client_id, dc.principal_id, p.tenant_id, dc.scope, COALESCE(dc.resource, ?),
+                ?, ?, ?, ?, ?, ?, ?
+         FROM device_codes dc
+         JOIN principals p ON p.id = dc.principal_id
+         WHERE dc.device_code_hash = ? AND dc.status = 'consumed'
+           AND EXISTS (SELECT 1 FROM oauth_tokens WHERE access_token_hash = ?)`,
+      ).bind(
+        hash, effectiveResource, accessHash, refreshHash, family,
+        encrypted.ciphertext, encrypted.iv, now, receiptExpiresAt,
+        hash, accessHash,
+      ),
+    ]);
+
+    const tokenInserted = Number(results[1]?.meta?.changes ?? 0) === 1;
+    const codeConsumed = Number(results[2]?.meta?.changes ?? 0) === 1;
+    const receiptInserted = Number(results[3]?.meta?.changes ?? 0) > 0;
+    if (!tokenInserted || !codeConsumed) {
+      return (await this.#replayDeviceCodeExchange(input, hash, nowMs)) ?? { status: "invalid_grant" };
+    }
+    if (!receiptInserted) {
+      // The batch is atomic, so this only happens if another winner's receipt
+      // already owns the code: converge on it rather than issuing a second pair.
+      return (await this.#replayDeviceCodeExchange(input, hash, nowMs)) ?? { status: "invalid_grant" };
+    }
+    const token: TokenRecord = {
+      access_token: access,
+      refresh_token: refresh,
+      client_id: row.client_id,
+      scope: row.scope,
+      principal: row.principal_id,
+      expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAt,
+      revoked: false,
+      refresh_family: family,
+      refresh_used: false,
+      tenant_id: row.tenant_id,
+      ...(effectiveResource ? { resource: effectiveResource } : {}),
+    };
+    const record: DeviceCodeRecord = {
+      device_code: input.deviceCode,
+      user_code: row.user_code,
+      client_id: row.client_id,
+      scope: row.scope,
+      verification_uri: row.verification_uri,
+      interval_sec: row.interval_sec,
+      expires_at: Date.parse(row.expires_at),
+      status: "consumed",
+      principal_id: row.principal_id,
+      ...(row.resource ? { resource: row.resource } : {}),
+    };
+    return { status: "redeemed", record, token };
+  }
+
+  /** Replay a committed device-code exchange receipt (Issue #247). */
+  async #replayDeviceCodeExchange(
+    input: { deviceCode: string; clientId: string; resource?: string },
+    deviceCodeHash: string,
+    nowMs: number,
+  ): Promise<DeviceCodeExchange | null> {
+    // The receipt is only a convergence hint: the token row remains the
+    // authority. Join it so a revoked/used/expired successor is never
+    // re-served (parity with #lookupRefreshReceipt), and a replay can never
+    // self-inflict a reuse revocation or hand back dead credentials.
+    const row = await this.prepare("oauth.device.receipt",
+      `SELECT r.client_id, r.principal_id, r.tenant_id, r.scope, r.resource,
+              r.access_token_hash, r.refresh_token_hash, r.refresh_family,
+              r.encrypted_successor, r.iv, r.expires_at,
+              t.expires_at AS token_expires_at,
+              t.refresh_expires_at AS token_refresh_expires_at
+       FROM device_code_exchange_receipts r
+       JOIN oauth_tokens t ON t.access_token_hash = r.access_token_hash
+       WHERE r.device_code_hash = ? AND r.client_id = ? AND r.expires_at > ?
+         AND t.refresh_token_hash = r.refresh_token_hash
+         AND t.revoked = 0 AND t.refresh_used = 0
+         AND t.refresh_expires_at > ?
+         AND NOT EXISTS (
+           SELECT 1 FROM revoked_refresh_families rf
+           WHERE rf.refresh_family = r.refresh_family
+         )`,
+    ).bind(
+      deviceCodeHash,
+      input.clientId,
+      nowIso(nowMs),
+      nowIso(nowMs),
+    ).first<{
+      client_id: string; principal_id: string; tenant_id: string; scope: string;
+      resource: string | null; access_token_hash: string; refresh_token_hash: string;
+      refresh_family: string; encrypted_successor: string; iv: string; expires_at: string;
+      token_expires_at: string; token_refresh_expires_at: string;
     }>();
     if (!row) return null;
-    return { device_code: deviceCode, user_code: row.user_code, client_id: row.client_id,
-      scope: row.scope, verification_uri: row.verification_uri, interval_sec: row.interval_sec,
-      expires_at: Date.parse(row.expires_at), status: "consumed", principal_id: row.principal_id || undefined,
-      last_polled_at: row.last_polled_at ? Date.parse(row.last_polled_at) : undefined,
-      ...(row.resource ? { resource: row.resource } : {}) };
+    // Exact-retry convergence only: a bound receipt cannot change audience,
+    // and an unbound receipt cannot be upgraded to one on retry.
+    if (
+      input.resource !== undefined &&
+      (row.resource === null || row.resource === undefined || input.resource !== row.resource)
+    ) {
+      return null;
+    }
+    const decrypted = await decryptDeviceCodeReceipt(
+      { ciphertext: row.encrypted_successor, iv: row.iv },
+      input.deviceCode,
+    );
+    if (!decrypted) return null;
+    // The receipt must decrypt to exactly the persisted token row hashes.
+    if (
+      (await sha256Hex(decrypted.access_token)) !== row.access_token_hash ||
+      (await sha256Hex(decrypted.refresh_token)) !== row.refresh_token_hash
+    ) {
+      return null;
+    }
+    const expiresAt = Date.parse(row.token_expires_at);
+    const refreshExpiresAt = Date.parse(row.token_refresh_expires_at);
+    if (!Number.isFinite(expiresAt) || !Number.isFinite(refreshExpiresAt)) return null;
+    return {
+      status: "replayed",
+      token: {
+        access_token: decrypted.access_token,
+        refresh_token: decrypted.refresh_token,
+        client_id: row.client_id,
+        scope: row.scope,
+        principal: row.principal_id,
+        expires_at: expiresAt,
+        refresh_expires_at: refreshExpiresAt,
+        revoked: false,
+        refresh_family: row.refresh_family,
+        refresh_used: false,
+        tenant_id: row.tenant_id,
+        ...(row.resource ? { resource: row.resource } : {}),
+      },
+    };
   }
 
   async markDeviceCodePolled(deviceCode: string, minIntervalMs = 0): Promise<void> {
@@ -6534,6 +6955,25 @@ export class SqlStore implements ControlPlaneStore {
     } catch {
       // Bounded retry on the next sweep.
     }
+    try {
+      // Issue #247: expired device-code exchange receipts must not outlive
+      // their bounded window even when no new exchange runs.
+      const deviceReceipts = await this.prepare(
+        "retention.sweep.device_receipts",
+        `DELETE FROM device_code_exchange_receipts
+         WHERE rowid IN (
+           SELECT rowid FROM device_code_exchange_receipts
+           WHERE expires_at <= ?
+           ORDER BY expires_at ASC
+           LIMIT ?
+         )`,
+      )
+        .bind(new Date(Date.now()).toISOString(), DEVICE_CODE_EXCHANGE_RECEIPT_CLEANUP_BATCH)
+        .run();
+      stats.receiptsCleaned += sqlChanges(deviceReceipts);
+    } catch {
+      // Bounded retry on the next sweep.
+    }
     return stats;
   }
 
@@ -6561,9 +7001,18 @@ export class SqlStore implements ControlPlaneStore {
         .bind(tenantId)
         .first<{ cutover_at: string }>();
       return row ? String(row.cutover_at) : null;
-    } catch {
-      // Pre-0022 schema: no cutover table means D1 authority.
-      return null;
+    } catch (error) {
+      // Issue #243: only a missing pre-0022 table means "no cursor". A
+      // transient failure, or a partially migrated table (missing column),
+      // must propagate so authority resolution fails closed.
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        classifyD1Error(error) === "schema_missing" &&
+        /no such table|missing table/i.test(message)
+      ) {
+        return null;
+      }
+      throw error;
     }
   }
 

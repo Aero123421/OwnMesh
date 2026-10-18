@@ -144,6 +144,7 @@ const ALL_SCHEMA_KEYS = [
   ...MCP_SCHEMA_KEYS,
   ...WORKSPACE_SCHEMA_KEYS,
   ...PLAN_F_SCHEMA_KEYS,
+  "device_code_exchange_receipts",
 ] as const;
 
 test("RFC 9728 protected-resource metadata is served at origin and /mcp path", async () => {

@@ -47,3 +47,15 @@ test("classifyD1Error is fail-closed on unknown input", () => {
   assert.equal(classifyD1Error(null), "unknown");
   assert.equal(classifyD1Error(42), "unknown");
 });
+
+test("operation authority errors keep retryable and conflict states distinct", () => {
+  // Issue #243: unknown authority is retryable; dual ownership is not.
+  assert.equal(
+    classifyD1Error("operation_authority_temporarily_unavailable:cutover_unreadable"),
+    "transient_unavailable",
+  );
+  assert.equal(
+    classifyD1Error("operation_authority_conflict:claim:idem_key"),
+    "constraint_conflict",
+  );
+});

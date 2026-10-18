@@ -27,6 +27,9 @@ export const D1_FINGERPRINTS = [
   "oauth.code.insert",
   "oauth.code.read",
   "oauth.code.redeem",
+  "oauth.device.read",
+  "oauth.device.exchange",
+  "oauth.device.receipt",
   "oauth.token.issue",
   "oauth.token.read",
   "oauth.token.rotate_batch",
@@ -64,6 +67,7 @@ export const D1_FINGERPRINTS = [
   "approval.outbox.deliver",
   "quota.probe",
   "retention.sweep.receipts",
+  "retention.sweep.device_receipts",
   "store.cutover.get",
   "store.cutover.set",
 ] as const;

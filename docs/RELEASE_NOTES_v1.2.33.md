@@ -30,6 +30,10 @@ The machine-checked shipped contract remains
   and a tenant-sharded `OperationRoom` Durable Object behind
   `OWNMESH_OPERATION_STORE=device_do` plus a per-tenant cutover cursor
   (`operation_store_cutover`; value `d1` escapes back).
+  (Superseded by the Issue #243 amendment in
+  [ADR 0021](./adr/0021-d1-write-amplification-resolution.md): rollback is a
+  drain, authority resolution fails closed, and the v1.2.33 "escape back"
+  description above no longer applies.)
 - Hybrid fallback keeps pre-cutover rows and in-flight transitions visible
   across the cutover; same-key retries converge without double execution.
 - Room receipts double as the audit trail for device-routed calls;

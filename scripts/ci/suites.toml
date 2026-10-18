@@ -73,11 +73,12 @@ commands = [
 timeout_minutes = 10
 
 [release-policy]
-description = "Release graph checker + mutation + installer (each once)"
+description = "Release graph checker + mutation + planner unit + installer (each once)"
 commands = [
   "python3 scripts/tests/test_installers.py",
   "python3 scripts/check_release_quality.py",
   "python3 scripts/tests/run_release_quality_tests.py",
+  "python3 -m unittest discover -s scripts/ci/tests -p test_plan.py",
 ]
 timeout_minutes = 10
 

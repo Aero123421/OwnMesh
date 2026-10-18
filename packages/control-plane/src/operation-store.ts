@@ -23,6 +23,48 @@ import type {
   McpOperationTransition,
 } from "./store.ts";
 
+/**
+ * Issue #243: authority resolution fails closed. A cursor read failure, a
+ * missing binding, or an authority flip between store resolution and a claim
+ * is retryable unavailability, never a silent switch to the other authority.
+ * The message classifies as a transient storage error so OAuth/MCP already
+ * map it to the shared 503 + Retry-After contract.
+ */
+export class OperationAuthorityUnavailableError extends Error {
+  readonly retryable = true;
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(`operation_authority_temporarily_unavailable:${reason}`);
+    this.name = "OperationAuthorityUnavailableError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Issue #243: two authorities own the same idempotency key or correlation.
+ * Fail closed (`stop`, per the issue) instead of picking a winner whose side
+ * effects may already be in flight; the runbook covers reconciliation.
+ */
+export class OperationAuthorityConflictError extends Error {
+  readonly retryable = false;
+
+  constructor(scope: string) {
+    super(`operation_authority_conflict:${scope}`);
+    this.name = "OperationAuthorityConflictError";
+  }
+}
+
+function assertSingleOwner(
+  primary: McpOperationRecord | null,
+  fallback: McpOperationRecord | null,
+  scope: string,
+): void {
+  if (primary && fallback && primary.operation_id !== fallback.operation_id) {
+    throw new OperationAuthorityConflictError(scope);
+  }
+}
+
 export interface OperationStore {
   readonly backend: "d1" | "operation-room";
   claim(op: McpOperationRecord): Promise<
@@ -232,6 +274,16 @@ export class OperationRoomStore implements OperationStore {
     return res.op ? OperationRoomStore.op(res.op) : null;
   }
 
+  /**
+   * Issue #243: bounded occupancy probe. Rollback (`cutover_at = 'd1'`) may
+   * only become D1-authoritative once the room is drained, so resolution
+   * needs a cheap "does this tenant still own rows?" answer.
+   */
+  async hasRows(): Promise<boolean> {
+    const res = await this.call("has_rows", {});
+    return res.has_rows === true;
+  }
+
   async put(op: McpOperationRecord): Promise<void> {
     await this.call("put", { op });
   }
@@ -266,6 +318,10 @@ export class OperationRoomStore implements OperationStore {
  * miss, claim consults D1 for an idempotency owner before creating, and a
  * transition miss retries once against D1 (in-flight ops at cutover time).
  * Writes never fan out to both authorities.
+ *
+ * Issue #243: ownership is verified against both authorities after a create
+ * and whenever an ownership key is looked up, so a concurrent claim on the
+ * other side of a cutover fails closed instead of leaving two owners.
  */
 export class HybridOperationStore implements OperationStore {
   readonly backend = "operation-room" as const;
@@ -290,7 +346,28 @@ export class HybridOperationStore implements OperationStore {
       const byId = await this.fallback.get(op.operation_id);
       if (byId) return { outcome: "existing" as const, op: byId };
     }
-    return this.primary.claim(op);
+    const created = await this.primary.claim(op);
+    if (created.outcome !== "created") return created;
+    // Post-create fence: if the D1 side claimed the same key concurrently
+    // (cutover propagation), stop before dispatch rather than dual-owning it.
+    const [byId, byIdempotency] = await Promise.all([
+      this.fallback.get(op.operation_id),
+      op.idempotency_key
+        ? this.fallback.getByIdempotency({
+            principalId: op.principal_id,
+            tenantId: op.tenant_id,
+            deviceId: op.device_id || "",
+            idempotencyKey: op.idempotency_key,
+          })
+        : Promise.resolve(null),
+    ]);
+    const foreign = byId ?? byIdempotency;
+    if (foreign && foreign.operation_id !== created.op.operation_id) {
+      throw new OperationAuthorityConflictError(
+        `claim:${op.idempotency_key || op.operation_id}`,
+      );
+    }
+    return created;
   }
 
   async get(operationId: string) {
@@ -307,15 +384,17 @@ export class HybridOperationStore implements OperationStore {
     idempotencyKey: string;
   }) {
     const primary = await this.primary.getByIdempotency(opts);
-    if (primary) return primary;
-    return this.fallback.getByIdempotency(opts);
+    const fallback = await this.fallback.getByIdempotency(opts);
+    assertSingleOwner(primary, fallback, "idempotency");
+    return primary ?? fallback;
   }
 
   async getByCorrelation(correlationId: string) {
     // Post-cutover rows live only in the room; pre-cutover rows only in D1.
     const primary = await this.primary.getByCorrelation(correlationId);
-    if (primary) return primary;
-    return this.fallback.getByCorrelation(correlationId);
+    const fallback = await this.fallback.getByCorrelation(correlationId);
+    assertSingleOwner(primary, fallback, "correlation");
+    return primary ?? fallback;
   }
 
   async put(op: McpOperationRecord) {
@@ -345,6 +424,145 @@ export class HybridOperationStore implements OperationStore {
   }
 }
 
+/**
+ * Issue #243: rollback (`cutover_at = 'd1'`) while the room still owns rows.
+ * New ownership is refused until the operator drains/reconciles the room, but
+ * reads and terminal transitions fall through both authorities so DO-only
+ * operations stay visible and in-flight work converges. `auditCovered` is
+ * false in this state, so the D1 audit row is always written.
+ */
+export class RollbackPendingOperationStore implements OperationStore {
+  readonly backend = "d1" as const;
+  private readonly d1: OperationStore;
+  private readonly room: OperationStore;
+
+  constructor(d1: OperationStore, room: OperationStore) {
+    this.d1 = d1;
+    this.room = room;
+  }
+
+  claim(_op: McpOperationRecord): Promise<never> {
+    return Promise.reject(new OperationAuthorityUnavailableError("rollback_pending"));
+  }
+
+  put(_op: McpOperationRecord): Promise<void> {
+    return Promise.reject(new OperationAuthorityUnavailableError("rollback_pending"));
+  }
+
+  async get(operationId: string) {
+    const d1 = await this.d1.get(operationId);
+    if (d1) return d1;
+    return this.room.get(operationId);
+  }
+
+  async getByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }) {
+    const d1 = await this.d1.getByIdempotency(opts);
+    const room = await this.room.getByIdempotency(opts);
+    assertSingleOwner(d1, room, "rollback:idempotency");
+    return d1 ?? room;
+  }
+
+  async getByCorrelation(correlationId: string) {
+    const d1 = await this.d1.getByCorrelation(correlationId);
+    const room = await this.room.getByCorrelation(correlationId);
+    assertSingleOwner(d1, room, "rollback:correlation");
+    return d1 ?? room;
+  }
+
+  async transition(operationId: string, transition: McpOperationTransition, fromStatuses?: string[]) {
+    const d1 = await this.d1.transition(operationId, transition, fromStatuses);
+    if (d1) return d1;
+    return this.room.transition(operationId, transition, fromStatuses);
+  }
+
+  async update(
+    operationId: string,
+    patch: Partial<McpOperationRecord>,
+    fromStatuses?: string[],
+    expectedData?: Record<string, unknown>,
+  ) {
+    const d1 = await this.d1.update(operationId, patch, fromStatuses, expectedData);
+    if (d1) return d1;
+    return this.room.update(operationId, patch, fromStatuses, expectedData);
+  }
+}
+
+/**
+ * Issue #243: fresh authority fence around ownership writes. A store resolved
+ * from a cached read must re-check the live cursor (and room occupancy) before
+ * creating anything, so a cutover or rollback that lands in between surfaces
+ * as a retryable error instead of a split authority. `afterClaim` runs after a
+ * successful create and lets the D1 authority detect a concurrent room owner.
+ */
+export class ClaimFencedOperationStore implements OperationStore {
+  private readonly inner: OperationStore;
+  private readonly fence: () => Promise<void>;
+  private readonly afterClaim: ((op: McpOperationRecord) => Promise<void>) | null;
+
+  constructor(
+    inner: OperationStore,
+    fence: () => Promise<void>,
+    afterClaim?: (op: McpOperationRecord) => Promise<void>,
+  ) {
+    this.inner = inner;
+    this.fence = fence;
+    this.afterClaim = afterClaim ?? null;
+  }
+
+  get backend() {
+    return this.inner.backend;
+  }
+
+  async claim(op: McpOperationRecord) {
+    await this.fence();
+    const result = await this.inner.claim(op);
+    // Run on both outcomes: a retry that returns an existing D1 owner can
+    // still be racing a concurrent room owner (Issue #243).
+    if (this.afterClaim) await this.afterClaim(result.op);
+    return result;
+  }
+
+  async put(op: McpOperationRecord): Promise<void> {
+    await this.fence();
+    await this.inner.put(op);
+  }
+
+  get(operationId: string) {
+    return this.inner.get(operationId);
+  }
+
+  getByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }) {
+    return this.inner.getByIdempotency(opts);
+  }
+
+  getByCorrelation(correlationId: string) {
+    return this.inner.getByCorrelation(correlationId);
+  }
+
+  transition(operationId: string, transition: McpOperationTransition, fromStatuses?: string[]) {
+    return this.inner.transition(operationId, transition, fromStatuses);
+  }
+
+  update(
+    operationId: string,
+    patch: Partial<McpOperationRecord>,
+    fromStatuses?: string[],
+    expectedData?: Record<string, unknown>,
+  ) {
+    return this.inner.update(operationId, patch, fromStatuses, expectedData);
+  }
+}
+
 export type OperationStoreMode = "d1" | "device_do";
 
 /** Env flag only; unknown values fail safe to D1 authority. */
@@ -359,11 +577,38 @@ export type ResolvedOperationStores = {
    * store; otherwise the D1 adapter. The room store doubles as the audit
    * trail for device-routed calls (auditCovered), so per-call D1 audit rows
    * are skipped only then.
+   *
+   * Issue #243: unknown authority (cursor read failure, missing bindings),
+   * rollback-pending tenants, and authority flips between resolution and a
+   * claim throw `OperationAuthorityUnavailableError` instead of silently
+   * switching stores.
    */
   forTenant(tenantId: string, principalId: string): Promise<{ ops: OperationStore; auditCovered: boolean }>;
 };
 
-const CUTOVER_CACHE_TTL_MS = 60_000;
+/** Bounded retry for the one row that decides authority. */
+const CUTOVER_READ_ATTEMPTS = 2;
+
+async function readCutoverBounded(
+  base: ControlPlaneStore,
+  tenantId: string,
+): Promise<string | null> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < CUTOVER_READ_ATTEMPTS; attempt += 1) {
+    try {
+      return await base.getOperationStoreCutover(tenantId);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new OperationAuthorityUnavailableError(
+    `cutover_unreadable:${lastError instanceof Error ? lastError.name : "error"}`,
+  );
+}
+
+function isRoomAuthority(cutover: string | null): boolean {
+  return typeof cutover === "string" && cutover.length > 0 && cutover !== "d1";
+}
 
 export function createOperationStoreResolver(
   env: OperationRoomEnv & { OWNMESH_OPERATION_STORE?: string },
@@ -371,30 +616,109 @@ export function createOperationStoreResolver(
 ): ResolvedOperationStores {
   const mode = resolveOperationStoreMode(env);
   const d1 = new D1OperationStore(base);
-  const cutoverCache = new Map<string, { at: number; value: string | null }>();
+
+  const roomStore = (tenantId: string, principalId: string) =>
+    new OperationRoomStore(env, tenantId, principalId);
+
+  const roomHasRows = async (tenantId: string, principalId: string): Promise<boolean> => {
+    try {
+      return await roomStore(tenantId, principalId).hasRows();
+    } catch {
+      // Occupancy is unknown: never assume the room is empty (that would hand
+      // ownership to D1 while DO-only rows exist).
+      throw new OperationAuthorityUnavailableError("room_probe_failed");
+    }
+  };
+
+  // Post-create fence for the D1 authority: if the room claimed the same
+  // operation/idempotency concurrently (cutover propagation), stop before
+  // dispatch rather than silently dual-owning the key.
+  const assertRoomOwnsNothing = async (
+    room: OperationStore,
+    op: McpOperationRecord,
+  ): Promise<void> => {
+    let byId: McpOperationRecord | null = null;
+    let byIdempotency: McpOperationRecord | null = null;
+    try {
+      [byId, byIdempotency] = await Promise.all([
+        room.get(op.operation_id),
+        op.idempotency_key
+          ? room.getByIdempotency({
+              principalId: op.principal_id,
+              tenantId: op.tenant_id,
+              deviceId: op.device_id || "",
+              idempotencyKey: op.idempotency_key,
+            })
+          : Promise.resolve(null),
+      ]);
+    } catch {
+      throw new OperationAuthorityUnavailableError("room_unreadable");
+    }
+    const owner = byId ?? byIdempotency;
+    if (owner && owner.operation_id !== op.operation_id) {
+      throw new OperationAuthorityConflictError(
+        `claim:${op.idempotency_key || op.operation_id}`,
+      );
+    }
+  };
+
+  const fenceClaim = async (
+    expected: "d1" | "room",
+    tenantId: string,
+    principalId: string,
+  ): Promise<void> => {
+    const cutover = await readCutoverBounded(base, tenantId);
+    if (isRoomAuthority(cutover)) {
+      if (expected !== "room") {
+        throw new OperationAuthorityUnavailableError("authority_changed");
+      }
+      return;
+    }
+    if (expected === "room") {
+      throw new OperationAuthorityUnavailableError("authority_changed");
+    }
+    if (await roomHasRows(tenantId, principalId)) {
+      throw new OperationAuthorityUnavailableError("rollback_pending");
+    }
+  };
+
   return {
     mode,
     async forTenant(tenantId: string, principalId: string) {
-      if (mode !== "device_do" || !env.OPERATION_ROOM || !env.SESSION_SECRET) {
+      if (mode !== "device_do") {
         return { ops: d1, auditCovered: false };
       }
-      const now = Date.now();
-      const cached = cutoverCache.get(tenantId);
-      let cutover: string | null | undefined = cached && now - cached.at < CUTOVER_CACHE_TTL_MS
-        ? cached.value
-        : undefined;
-      if (cutover === undefined) {
-        try {
-          cutover = await base.getOperationStoreCutover(tenantId);
-        } catch {
-          return { ops: d1, auditCovered: false };
-        }
-        cutoverCache.set(tenantId, { at: now, value: cutover });
+      if (!env.OPERATION_ROOM || !env.SESSION_SECRET) {
+        // device_do was requested but the room cannot be consulted, so the
+        // tenant's authority is unknowable. Never degrade to D1.
+        throw new OperationAuthorityUnavailableError("binding_missing");
       }
-      // Explicit per-tenant escape hatch back to D1.
-      if (!cutover || cutover === "d1") return { ops: d1, auditCovered: false };
-      const room = new OperationRoomStore(env, tenantId, principalId);
-      return { ops: new HybridOperationStore(room, d1), auditCovered: true };
+      const cutover = await readCutoverBounded(base, tenantId);
+      const room = roomStore(tenantId, principalId);
+      if (isRoomAuthority(cutover)) {
+        const hybrid = new HybridOperationStore(room, d1);
+        return {
+          ops: new ClaimFencedOperationStore(
+            hybrid,
+            () => fenceClaim("room", tenantId, principalId),
+          ),
+          auditCovered: true,
+        };
+      }
+      if (await roomHasRows(tenantId, principalId)) {
+        return {
+          ops: new RollbackPendingOperationStore(d1, room),
+          auditCovered: false,
+        };
+      }
+      return {
+        ops: new ClaimFencedOperationStore(
+          d1,
+          () => fenceClaim("d1", tenantId, principalId),
+          (op) => assertRoomOwnsNothing(room, op),
+        ),
+        auditCovered: false,
+      };
     },
   };
 }

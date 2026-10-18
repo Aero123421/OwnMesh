@@ -742,7 +742,9 @@ test("production-path: device-code flow via worker + SqlStore (GET consent → P
     const tok = (await done.json()) as { access_token: string };
     assert.ok(await store.getAccess(tok.access_token));
 
-    // Second poll must fail closed (code consumed)
+    // Issue #247: a post-commit retry within the bounded receipt window
+    // converges on the same token pair; it never mints a second family and
+    // never strands a consumed grant without a token.
     const reuse = await worker.fetch(
       new Request(`${ISSUER}/oauth/token`, {
         method: "POST",
@@ -756,7 +758,15 @@ test("production-path: device-code flow via worker + SqlStore (GET consent → P
       e,
       ctx,
     );
-    assert.equal(reuse.status, 400);
+    assert.equal(reuse.status, 200);
+    assert.equal(
+      ((await reuse.json()) as { access_token: string }).access_token,
+      tok.access_token,
+    );
+    // The convergent retry must not duplicate the exchange audit event.
+    const exchangeAudits = (await store.listAudit(TENANT_ID))
+      .filter((event) => event.kind === "oauth.device_code_token");
+    assert.equal(exchangeAudits.length, 1);
   });
 });
 

@@ -264,6 +264,20 @@ Paths are canonicalized; unsafe links, writable locations, and descriptor
 injection are rejected. Descriptor writes are atomic and success is reported
 only after an OS probe confirms the state.
 
+`ownmesh device enroll` notifies an already-running `ownmeshd` to re-read the
+new device credential, so the Agent route connects without
+`ownmesh service restart`. `ownmesh service status --json` reports
+`agent_route`, and `ownmesh doctor` reports `daemon.agent_route`:
+`disabled` means no credential is loaded (not yet enrolled), `offline` means
+the transport is configured but not connected, `online` means the
+authenticated Agent route is live, and `unknown` means the daemon has no
+transport presence wired (for example an older daemon). When the daemon cannot
+be reached, `ownmesh service status --json` reports `"agent_route": null` and
+`ownmesh doctor` omits the `daemon.agent_route` check line rather than
+guessing. Revoking the local device drops the stored device credential and
+disables the route (best-effort: a stopped daemon is corrected on its next
+start).
+
 ### Linux session lifetime (lingering)
 
 The systemd `--user` service runs inside your login session. OwnMesh never

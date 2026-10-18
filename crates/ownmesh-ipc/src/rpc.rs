@@ -103,6 +103,11 @@ pub mod methods {
     pub const CREDENTIAL_ROTATE: &str = "credential.rotate";
     /// Revoke a per-client credential (denied for uncredentialed IPC).
     pub const CREDENTIAL_REVOKE: &str = "credential.revoke";
+    /// Ask the running daemon to re-read the enrolled device credential and
+    /// (re)connect the remote Agent route. Sent best-effort by `ownmesh device
+    /// enroll` so a daemon started before enrollment picks up the credential
+    /// without a manual service restart. Never returns secrets.
+    pub const AGENT_RELOAD: &str = "daemon.agent_reload";
 }
 
 /// Correlation identifier for a single request/response pair.

@@ -15,6 +15,7 @@ pub use platform::{
 pub use security::{canonicalize_executable, validate_service_path};
 
 use crate::cli::{Cli, ServiceActionArgs, ServiceCmd};
+use crate::commands::ipc_util::observe_agent_route;
 use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
@@ -692,6 +693,14 @@ fn run_status(
         ExitCode::Internal
     })?;
     let record = read_service_record(paths);
+    // Issue #248: surface the daemon's live Agent route so a "running" service
+    // with no loaded credential is visibly `disabled` instead of implied
+    // online. Bounded and best-effort; `None` when the daemon is unreachable.
+    let agent_route = if snap.running == Some(true) {
+        observe_agent_route(Duration::from_millis(800))
+    } else {
+        None
+    };
     let value = json!({
         "schema_version": 1,
         "ok": true,
@@ -700,6 +709,7 @@ fn run_status(
         "supported": snap.supported,
         "installed": snap.installed,
         "running": snap.running,
+        "agent_route": agent_route,
         "unit_path": snap.unit_path,
         "record": record,
         "message": snap.message,
@@ -713,6 +723,11 @@ fn run_status(
             Some(true) => println!("  running:   true"),
             Some(false) => println!("  running:   false"),
             None => println!("  running:   unknown"),
+        }
+        if let Some(route) = &agent_route {
+            println!("  route:     {route}");
+        } else if snap.running == Some(true) {
+            println!("  route:     unavailable");
         }
         if let Some(u) = &snap.unit_path {
             println!("  unit:      {u}");
