@@ -6,11 +6,13 @@
  * - RFC 8628 Device Authorization Grant
  * - RFC 8414 Authorization Server Metadata
  * - RFC 9728 OAuth Protected Resource Metadata
- * - redirect_uri exact match (OAuth 2.1)
+ * - redirect_uri match: byte-exact except RFC 8252 §7.3 loopback port
+ *   flexibility (Issue #197)
  */
 
 import type { ControlPlaneStore } from "./store.ts";
-import { secondsUntilUtcReset, type BudgetState } from "./quota-guard.ts";
+import { classifyD1Error, isRetryableStorageError, storageUnavailableReason } from "./d1-errors.ts";
+import { retryAfterSecondsForReset, utcResetIso, type BudgetState } from "./quota-guard.ts";
 import {
   AUTH_PAGE_CSP,
   authLocale,
@@ -42,6 +44,7 @@ import {
   readRequestJsonLimited,
   requireScope,
   pkceS256Challenge,
+  SERVICE_VERSION,
   validPkceVerifier,
   sha256Hex,
   UnsupportedMediaTypeError,
@@ -100,7 +103,9 @@ const SCOPE_COPY: Record<string, string> = {
   "ownmesh.exec": "Run commands allowed by the local device policy.",
   "ownmesh.session": "Open and control permitted interactive sessions.",
   "ownmesh.device": "Discover and address devices enrolled in this instance.",
-  offline_access: "Keep ChatGPT connected using rotating refresh tokens.",
+  // Issue #198: consent is shared by all OAuth clients; never name a single
+  // product in the reusable scope copy.
+  offline_access: "Keep this client connected using rotating refresh tokens.",
 };
 function scopeDescription(locale: AuthLocale, value: string): string {
   const fallback = authText(locale, {
@@ -216,6 +221,47 @@ export function protectedResourceMetadata(resource: string, authorizationServer 
   };
 }
 
+/**
+ * Issue #195: canonical MCP resource URI (RFC 8707 audience).
+ * Normally the exact externally visible `https://<issuer-host>/mcp` URL.
+ * Normalization: origin must match the issuer origin (scheme + host + port),
+ * path must be exactly `/mcp`, no trailing slash, no query/fragment/userinfo.
+ */
+export function canonicalMcpResource(issuer: string): string | null {
+  try {
+    const u = new URL(issuer);
+    if (u.username || u.password || u.hash) return null;
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    return `${u.origin}/mcp`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate an RFC 8707 `resource` request parameter against the canonical MCP
+ * resource. Returns the canonical value on success, null on missing/malformed/
+ * mismatched. Path distinctions remain meaningful: only exactly `/mcp` matches.
+ */
+export function normalizeOAuthResource(raw: unknown, issuer: string): string | null {
+  if (typeof raw !== "string" || !raw) return null;
+  const canonical = canonicalMcpResource(issuer);
+  if (!canonical) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (parsed.username || parsed.password || parsed.hash) return null;
+  // Exact match against canonical (scheme + host + port + path). No prefix or
+  // trailing-slash tolerance: `/mcp/` or `/mcp/other` are different resources.
+  if (parsed.href === canonical || parsed.toString() === canonical) return canonical;
+  // URL serializes `https://host/mcp` canonically; reject anything else.
+  if (raw !== canonical) return null;
+  return canonical;
+}
+
 /** Loopback hosts allowed for http:// redirect_uris (RFC 8252 §7.3). */
 function isLoopbackRedirectHost(hostname: string): boolean {
   let h = hostname.toLowerCase();
@@ -238,6 +284,86 @@ export function isAllowedDcrRedirectUri(uri: string): boolean {
   if (parsed.protocol === "https:") return true;
   if (parsed.protocol === "http:" && isLoopbackRedirectHost(parsed.hostname)) return true;
   return false;
+}
+
+/**
+ * Issue #198: consent display label derived from the validated client record.
+ * The stored name is presentation-only (never authority) and is bounded plus
+ * stripped of control characters; missing/empty names fall back to the exact
+ * client identifier host so the page never claims an unknown client is ChatGPT.
+ */
+export function consentDisplayName(clientName: string | undefined, clientId: string): string {
+  const raw = (clientName || "").replace(/[\u0000-\u001F\u007F]/g, "").trim();
+  if (raw) return raw.slice(0, 64);
+  try {
+    const url = new URL(clientId);
+    // For URL-form (CIMD) ids show the host; for opaque ids show a bounded id.
+    if (url.protocol === "https:") return url.host.slice(0, 64) || clientId.slice(0, 64);
+  } catch {
+    // fall through to opaque fallback
+  }
+  return clientId.slice(0, 64) || "this OAuth client";
+}
+
+/** Provenance shown separately from the display name (never conflated). */
+export function consentClientProvenance(clientId: string, redirectUri: string): "chatgpt" | "cimd" | "registered" {
+  if (chatGptOAuthPair(clientId, redirectUri)) return "chatgpt";
+  if (isAllowedCimdClientId(clientId)) return "cimd";
+  return "registered";
+}
+
+/** Explicit loopback warning per MCP localhost-redirect guidance. */
+export function isLoopbackRedirectUri(uri: string): boolean {
+  try {
+    const parsed = new URL(uri);
+    return parsed.protocol === "http:" && isLoopbackRedirectHost(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Issue #197: single redirect-matching rule for CIMD + registered clients.
+ *
+ * - HTTPS/web redirect URIs remain byte-exact.
+ * - For http:// loopback (127.0.0.1 / [::1] / localhost, RFC 8252 §7.3),
+ *   only the port is flexible; scheme, host family, path, query must match
+ *   exactly. userinfo/fragment never match. This lets Claude Code bind an
+ *   ephemeral port per login while `http://127.0.0.1/callback` is registered.
+ * - Port flexibility applies only to validation against registration/CIMD
+ *   metadata. Token redemption still requires the exact runtime URI bound to
+ *   the authorization code (see store.redeemAuthCode).
+ */
+export function redirectMatchesRegistration(registered: string, actual: string): boolean {
+  if (registered === actual) return true;
+  let r: URL;
+  let a: URL;
+  try {
+    r = new URL(registered);
+    a = new URL(actual);
+  } catch {
+    return false;
+  }
+  // Loopback exception never applies to non-http, userinfo, or fragment.
+  if (r.protocol !== "http:" || a.protocol !== "http:") return false;
+  if (r.username || r.password || r.hash || a.username || a.password || a.hash) return false;
+  if (!isLoopbackRedirectHost(r.hostname) || !isLoopbackRedirectHost(a.hostname)) return false;
+  const norm = (h: string) => {
+    let v = h.toLowerCase();
+    if (v.startsWith("[") && v.endsWith("]")) v = v.slice(1, -1);
+    return v;
+  };
+  // Require the same loopback host form (127.0.0.1 vs localhost vs ::1 stay
+  // distinct); only the port is wildcarded. This keeps the rule narrow while
+  // supporting all three registered forms with ephemeral ports.
+  if (norm(r.hostname) !== norm(a.hostname)) return false;
+  if (r.pathname !== a.pathname) return false;
+  if (r.search !== a.search) return false;
+  return true;
+}
+
+export function redirectMatchesAny(registered: string[], actual: string): boolean {
+  return registered.some((r) => redirectMatchesRegistration(r, actual));
 }
 
 const CIMD_MAX_BYTES = 16 * 1024;
@@ -389,24 +515,88 @@ async function fetchClientMetadataDocument(
 }
 
 /**
- * Issue #224 (P4): degraded-mode 503 for OAuth write endpoints.
- * fail fast with temporarily_unavailable + Retry-After (UTC-midnight reset)
- * instead of attempting D1 writes an exhausted budget cannot serve.
- * Returns null when the budget allows the request.
+ * Issue #224 (P4) + #227: degraded-mode 503 for OAuth write endpoints.
+ * Fail fast with protocol-correct `503 temporarily_unavailable` + Retry-After
+ * (UTC-midnight reset) instead of attempting D1 writes an exhausted budget
+ * cannot serve. Never converts transient write failure into invalid_grant,
+ * reuse, or revoke. Returns null when the budget allows the request.
+ *
+ * Bounded public classification (no SQL/token/paths):
+ * - quota_exceeded -> d1_write_quota_exceeded
+ * - transient_unavailable -> d1_unavailable
+ * - schema_missing -> schema_not_ready
+ * - other -> oauth_temporarily_unavailable
+ * Includes retryable:true, retry_after_seconds, reset_at, diagnostic_id,
+ * service_version so ChatGPT can distinguish retryable vs reauth-required.
  */
 export function budgetUnavailable(budget?: BudgetState): Response | null {
   if (!budget || budget.mode !== "auth_only") return null;
+  const reason = storageUnavailableReason(budget.probeCategory ?? "unknown", "oauth");
+  // SHOULD-3: Retry-After is the clamped diff to the budget reset (cap 86400),
+  // not a fixed hint, so the client waits exactly until the D1 budget may lift.
+  const retryAfter = retryAfterSecondsForReset(budget.resetAt);
+  return oauthUnavailableEnvelope(reason, retryAfter, budget.resetAt);
+}
+
+/**
+ * Issue #227 SHOULD-5: single OAuth 503 envelope builder.
+ * `budgetUnavailable` (probe path) and `oauthStorageUnavailable` (throw path)
+ * share reason vocabulary (via `storageUnavailableReason`) and this envelope;
+ * only the reset source differs (budget.resetAt vs UTC-midnight ISO).
+ * MCP keeps its own JSON-RPC envelope (see mcp.ts) because the transports
+ * differ — unifying across REST vs JSON-RPC would leak one protocol's shape
+ * into the other.
+ */
+function oauthUnavailableEnvelope(reason: string, retryAfter: number, resetAt: string): Response {
   return jsonBase(
     {
       error: "temporarily_unavailable",
-      error_description: `authorization service degraded until ${budget.resetAt}`,
+      reason,
+      retryable: true,
+      retry_after_seconds: retryAfter,
+      reset_at: resetAt,
+      diagnostic_id: randomId("diag_"),
+      service_version: SERVICE_VERSION,
     },
     {
       status: 503,
       noStore: true,
-      headers: { "retry-after": String(secondsUntilUtcReset()) },
+      headers: { "retry-after": String(retryAfter) },
     },
   );
+}
+
+/**
+ * Issue #227: unexpected D1/storage throw during OAuth handling must converge
+ * to the same sanitized 503 contract as the budget probe path — never an
+ * uncaught exception, never invalid_grant/reuse/revoke. Uses the centralized
+ * `isRetryableStorageError` (classify != unknown, minus constraint/invalid
+ * caller bugs); anything else rethrows fail-closed so logic bugs stay
+ * visible instead of looking retryable.
+ */
+function oauthStorageUnavailable(error: unknown): Response {
+  const reason = storageUnavailableReason(classifyD1Error(error), "oauth");
+  // SHOULD-3: no budget here, so the reset is the next UTC midnight — the
+  // same instant `checkBudget` would report — with Retry-After as its diff.
+  const resetAt = utcResetIso();
+  return oauthUnavailableEnvelope(reason, retryAfterSecondsForReset(resetAt), resetAt);
+}
+
+/**
+ * Issue #227 SHOULD-2: shared storage convergence for OAuth handlers.
+ * `handleToken` maps only retryable storage throws to the sanitized 503;
+ * non-storage errors rethrow fail-closed. All write-path handlers below
+ * (`handleAuthorize`, `handleRevoke`, `handleDeviceAuthorization`,
+ * `handleDeviceVerification`) share it so a mid-exchange D1 outage never
+ * becomes a 500 or a credential verdict.
+ */
+async function withOAuthStorageConvergence(fn: () => Promise<Response>): Promise<Response> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (isRetryableStorageError(error)) return oauthStorageUnavailable(error);
+    throw error;
+  }
 }
 
 /**
@@ -564,6 +754,22 @@ export async function handleAuthorize(
   // budget on authorize transactions that cannot complete.
   const degraded = budgetUnavailable(opts?.budget);
   if (degraded) return degraded;
+  // SHOULD-2対象外メモ: browser consent flow (GET page/POST redirect/HTML) の
+  // storage throwは index.ts 頂層の isD1UnavailableError→storageUnavailableResponse
+  // に収束させ、human-readable HTML 503 + 安定60sヒントを保つ。ここで token 同様の
+  // JSON oauthStorageUnavailable に寄せると人間向けナビゲーションがJSON化し、
+  // /health/ready系のbrowser契約を壊す。API系の token/revoke/device_authorization
+  // はJSON収束、browser系は頂層HTML収束という意図的分割。非storageは頂層でも
+  // rethrow fail-closed (500可視) のまま。
+  return handleAuthorizeWithStore(req, store, issuer, security);
+}
+
+async function handleAuthorizeWithStore(
+  req: Request,
+  store: ControlPlaneStore,
+  issuer: string,
+  security: OAuthRequestSecurity = {},
+): Promise<Response> {
   // The Worker records GET receipt before form parsing/authentication. Direct
   // internal callers have no forged-clock seam and fall back to handler entry.
   const requestReceivedAt = authorizeRequestReceipts.get(req) ?? Date.now();
@@ -605,13 +811,14 @@ export async function handleAuthorize(
     // during the human review. Re-fetch before either redirect so removal or
     // substitution after GET cannot turn a once-valid destination into an
     // unreviewed callback. The transaction is already consumed fail-closed.
+    // Issue #197: loopback port flexibility applies here too (same rule).
     if (isAllowedCimdClientId(tx.client_id)) {
       try {
         const metadata = await fetchClientMetadataDocument(
           tx.client_id,
           security.fetchClientMetadata || fetch,
         );
-        if (!metadata.redirect_uris.includes(tx.redirect_uri)) {
+        if (!redirectMatchesAny(metadata.redirect_uris, tx.redirect_uri)) {
           return json(
             { error: "invalid_request", error_description: "redirect_uri no longer matches client metadata" },
             { status: 400 },
@@ -644,6 +851,7 @@ export async function handleAuthorize(
       code_challenge_method: tx.code_challenge_method,
       expires_at: Date.now() + 10 * 60 * 1000,
       used: false,
+      ...(tx.resource !== undefined ? { resource: tx.resource } : {}),
     });
     const dest = new URL(tx.redirect_uri);
     dest.searchParams.set("code", code);
@@ -673,11 +881,29 @@ export async function handleAuthorize(
       { status: 400 },
     );
   }
+  // Issue #195: RFC 8707 resource is required for MCP OAuth and must equal the
+  // canonical `https://<issuer>/mcp`. Missing/malformed/mismatched fails with
+  // typed invalid_target (never inferred from the request path).
+  const resourceParams = url.searchParams.getAll("resource");
+  if (resourceParams.length !== 1) {
+    return json(
+      { error: "invalid_target", error_description: "exactly one resource parameter is required" },
+      { status: 400 },
+    );
+  }
+  const resource = normalizeOAuthResource(resourceParams[0], issuer);
+  if (!resource) {
+    return json(
+      { error: "invalid_target", error_description: "resource must be the canonical /mcp URL for this issuer" },
+      { status: 400 },
+    );
+  }
 
   await store.ensureBootstrapSeeded();
   let client = await store.getClient(clientId);
   // For a known client, reject an altered redirect before authentication.
-  if (client && !isAllowedCimdClientId(clientId) && !client.redirect_uris.includes(redirect)) {
+  // Issue #197: loopback ephemeral ports are accepted via the single matcher.
+  if (client && !isAllowedCimdClientId(clientId) && !redirectMatchesAny(client.redirect_uris, redirect)) {
     return json(
       {
         error: "invalid_request",
@@ -705,6 +931,7 @@ export async function handleAuthorize(
   // bounded/no-redirect/no-credential, and must bind its exact URL as client_id.
   // Re-fetch URL clients on authorization so metadata substitution or redirect
   // removal cannot be hidden behind a stale D1 registration.
+  // Issue #197: RFC 8252 §7.3 loopback port flexibility for ephemeral CLI ports.
   if (isAllowedCimdClientId(clientId)) {
     let metadata: ClientMetadataDocument;
     try {
@@ -718,7 +945,7 @@ export async function handleAuthorize(
         { status: 401 },
       );
     }
-    if (!metadata.redirect_uris.includes(redirect)) {
+    if (!redirectMatchesAny(metadata.redirect_uris, redirect)) {
       return json(
         { error: "invalid_request", error_description: "redirect_uri does not exactly match client metadata" },
         { status: 400 },
@@ -754,8 +981,11 @@ export async function handleAuthorize(
     return json({ error: "unauthorized_client", error_description: "unknown client" }, { status: 401 });
   }
 
-  // OAuth 2.1: redirect_uri MUST exactly match a pre-registered URI.
-  if (!client.redirect_uris.includes(redirect)) {
+  // OAuth 2.1: redirect_uri MUST match a pre-registered URI. HTTPS stays
+  // byte-exact; http loopback allows only the port to vary (RFC 8252 §7.3).
+  // The exact runtime URI is then bound into the consent transaction and the
+  // authorization code and must be repeated exactly at token exchange.
+  if (!redirectMatchesAny(client.redirect_uris, redirect)) {
     return json(
       {
         error: "invalid_request",
@@ -782,6 +1012,7 @@ export async function handleAuthorize(
       code_challenge_method: method,
       expires_at: Date.now() + 10 * 60 * 1000,
       used: false,
+      resource,
     });
     const dest = new URL(redirect);
     dest.searchParams.set("code", code);
@@ -810,16 +1041,61 @@ export async function handleAuthorize(
     code_challenge_method: method,
     expires_at: transactionIssuedAt + txTtlMs,
     consumed: false,
+    resource,
   });
+
+  // Issue #198: the consent screen is shared by every OAuth client. Only the
+  // narrow ChatGPT stateless path keeps ChatGPT wording; all other clients get
+  // generic copy naming the validated client. Dynamic values stay escaped and
+  // bounded via consentDisplayName + escapeHtml at render time.
+  const displayName = consentDisplayName(client.client_name, clientId);
+  const provenance = consentClientProvenance(clientId, redirect);
+  const isChatGpt = provenance === "chatgpt";
+  const redirectHost = (() => {
+    try {
+      return new URL(redirect).host.slice(0, 128);
+    } catch {
+      return redirect.slice(0, 128);
+    }
+  })();
+  const clientIdHost = (() => {
+    try {
+      const u = new URL(clientId);
+      if (u.protocol === "https:") return u.host.slice(0, 128);
+    } catch {
+      // opaque client id: fall through
+    }
+    return clientId.slice(0, 128);
+  })();
+  const provenanceLabel = provenance === "chatgpt"
+    ? "ChatGPT stateless"
+    : provenance === "cimd"
+      ? "CIMD"
+      : "registered";
+  const loopbackWarning = isLoopbackRedirectUri(redirect)
+    ? `<p class="note">${escapeHtml(authText(locale, {
+      en: "Loopback redirect: verify the host and port belong to the app you started locally. A different local process could be listening on a nearby port.",
+      ja: "ループバックリダイレクト: ホストとポートが自分が起動したアプリのものであることを確認してください。近傍ポートで別プロセスが待ち受けている可能性があります。",
+      zh: "回环重定向：请确认主机和端口属于您在本地启动的应用。附近端口可能有其他本地进程在监听。",
+      ru: "Петлевой редирект: убедитесь, что хост и порт принадлежат запущенному вами приложению. На соседнем порту может слушать другой процесс.",
+    }))}</p>`
+    : "";
 
   const page = authPage({
     locale,
-    title: authText(locale, {
-      en: "Authorize ChatGPT — OwnMesh",
-      ja: "ChatGPT を認証 — OwnMesh",
-      zh: "授权 ChatGPT — OwnMesh",
-      ru: "Авторизация ChatGPT — OwnMesh",
-    }),
+    title: authText(locale, isChatGpt
+      ? {
+        en: "Authorize ChatGPT — OwnMesh",
+        ja: "ChatGPT を認証 — OwnMesh",
+        zh: "授权 ChatGPT — OwnMesh",
+        ru: "Авторизация ChatGPT — OwnMesh",
+      }
+      : {
+        en: `Authorize ${displayName} — OwnMesh`,
+        ja: `${displayName} を認証 — OwnMesh`,
+        zh: `授权 ${displayName} — OwnMesh`,
+        ru: `Авторизация ${displayName} — OwnMesh`,
+      }),
     eyebrow: authText(locale, {
       en: "OAuth authorization",
       ja: "OAuth 認証",
@@ -827,18 +1103,37 @@ export async function handleAuthorize(
       ru: "Авторизация OAuth",
     }),
     heading: authText(locale, {
-      en: `Connect ${client.client_name || clientId}`,
-      ja: `${client.client_name || clientId} を接続`,
-      zh: `连接 ${client.client_name || clientId}`,
-      ru: `Подключить ${client.client_name || clientId}`,
+      en: `Connect ${displayName}`,
+      ja: `${displayName} を接続`,
+      zh: `连接 ${displayName}`,
+      ru: `Подключить ${displayName}`,
     }),
-    intro: authText(locale, {
-      en: "Review the capabilities ChatGPT is requesting from this self-hosted OwnMesh instance.",
-      ja: "ChatGPT がこのセルフホスト OwnMesh に要求している権限を確認してください。",
-      zh: "请检查 ChatGPT 向此自托管 OwnMesh 实例请求的权限。",
-      ru: "Проверьте права, которые ChatGPT запрашивает у этого экземпляра OwnMesh.",
-    }),
-    body: `<dl class="meta"><dt>${authText(locale, { en: "Client", ja: "クライアント", zh: "客户端", ru: "Клиент" })}</dt><dd>${escapeHtml(client.client_name || clientId)}</dd><dt>${authText(locale, { en: "Returns to", ja: "戻り先", zh: "返回到", ru: "Возврат" })}</dt><dd><code>${escapeHtml(new URL(redirect).host)}</code></dd><dt>${authText(locale, { en: "Protocol", ja: "プロトコル", zh: "协议", ru: "Протокол" })}</dt><dd>OAuth 2.1 / PKCE S256</dd></dl><div class="scope-list">${scopeRows(scope, locale)}</div><p class="note">${authText(locale, { en: "Your device policy remains the final authority. ChatGPT cannot bypass local workspace, command, or approval rules.", ja: "最終権限は常にデバイス側のポリシーです。ChatGPT はローカルのワークスペース、コマンド、承認ルールを迂回できません。", zh: "设备策略始终拥有最终权限。ChatGPT 无法绕过本地工作区、命令或审批规则。", ru: "Политика устройства остаётся окончательным источником прав. ChatGPT не может обойти локальные правила рабочих областей, команд или подтверждений." })}</p><form method="post" action="/oauth/authorize"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">${authText(locale, { en: "Authorize connection", ja: "接続を許可", zh: "授权连接", ru: "Разрешить подключение" })}</button><button class="danger" name="decision" value="deny" type="submit">${authText(locale, { en: "Deny", ja: "拒否", zh: "拒绝", ru: "Отклонить" })}</button></div></form>`,
+    intro: authText(locale, isChatGpt
+      ? {
+        en: "Review the capabilities ChatGPT is requesting from this self-hosted OwnMesh instance.",
+        ja: "ChatGPT がこのセルフホスト OwnMesh に要求している権限を確認してください。",
+        zh: "请检查 ChatGPT 向此自托管 OwnMesh 实例请求的权限。",
+        ru: "Проверьте права, которые ChatGPT запрашивает у этого экземпляра OwnMesh.",
+      }
+      : {
+        en: `Review the capabilities ${displayName} is requesting from this self-hosted OwnMesh instance.`,
+        ja: `${displayName} がこのセルフホスト OwnMesh に要求している権限を確認してください。`,
+        zh: `请检查 ${displayName} 向此自托管 OwnMesh 实例请求的权限。`,
+        ru: `Проверьте права, которые ${displayName} запрашивает у этого экземпляра OwnMesh.`,
+      }),
+    body: `<dl class="meta"><dt>${authText(locale, { en: "Client", ja: "クライアント", zh: "客户端", ru: "Клиент" })}</dt><dd>${escapeHtml(displayName)}</dd><dt>${authText(locale, { en: "Client ID", ja: "クライアントID", zh: "客户端 ID", ru: "ID клиента" })}</dt><dd><code>${escapeHtml(clientIdHost)}</code></dd><dt>${authText(locale, { en: "Returns to", ja: "戻り先", zh: "返回到", ru: "Возврат" })}</dt><dd><code>${escapeHtml(redirectHost)}</code></dd><dt>${authText(locale, { en: "Registration", ja: "登録", zh: "注册", ru: "Регистрация" })}</dt><dd>${escapeHtml(provenanceLabel)}</dd><dt>${authText(locale, { en: "Protocol", ja: "プロトコル", zh: "协议", ru: "Протокол" })}</dt><dd>OAuth 2.1 / PKCE S256</dd></dl>${loopbackWarning}<div class="scope-list">${scopeRows(scope, locale)}</div><p class="note">${escapeHtml(authText(locale, isChatGpt
+      ? {
+        en: "Your device policy remains the final authority. ChatGPT cannot bypass local workspace, command, or approval rules.",
+        ja: "最終権限は常にデバイス側のポリシーです。ChatGPT はローカルのワークスペース、コマンド、承認ルールを迂回できません。",
+        zh: "设备策略始终拥有最终权限。ChatGPT 无法绕过本地工作区、命令或审批规则。",
+        ru: "Политика устройства остаётся окончательным источником прав. ChatGPT не может обойти локальные правила рабочих областей, команд или подтверждений.",
+      }
+      : {
+        en: `Your device policy remains the final authority. ${displayName} cannot bypass local workspace, command, or approval rules.`,
+        ja: `最終権限は常にデバイス側のポリシーです。${displayName} はローカルのワークスペース、コマンド、承認ルールを迂回できません。`,
+        zh: `设备策略始终拥有最终权限。${displayName} 无法绕过本地工作区、命令或审批规则。`,
+        ru: `Политика устройства остаётся окончательным источником прав. ${displayName} не может обойти локальные правила рабочих областей, команд или подтверждений.`,
+      }))}</p><form method="post" action="/oauth/authorize"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">${authText(locale, { en: "Authorize connection", ja: "接続を許可", zh: "授权连接", ru: "Разрешить подключение" })}</button><button class="danger" name="decision" value="deny" type="submit">${authText(locale, { en: "Deny", ja: "拒否", zh: "拒绝", ru: "Отклонить" })}</button></div></form>`,
     footer: authText(locale, {
       en: "One-time consent / 5 minute expiry",
       ja: "一度限りの同意 / 5分で期限切れ",
@@ -864,7 +1159,7 @@ function escapeHtml(s: string): string {
 export async function handleToken(
   req: Request,
   store: ControlPlaneStore,
-  opts?: { budget?: BudgetState },
+  opts?: { budget?: BudgetState; issuer?: string },
 ): Promise<Response> {
   // Issue #224 (P4): RFC 6750-style fail-fast; token issuance (including
   // refresh rotation) needs D1 writes that an exhausted budget cannot serve.
@@ -874,7 +1169,26 @@ export async function handleToken(
   if (parsedBody instanceof Response) return parsedBody;
   const body = parsedBody;
   const grant = body.grant_type;
+  try {
+    return await handleTokenWithStore(body, grant, req, store, opts);
+  } catch (error) {
+    // Issue #227: a D1 outage mid-exchange is transient, not a credential
+    // verdict. Map retryable storage throws to sanitized 503; rethrow anything
+    // else fail-closed and never convert to invalid_grant/reuse.
+    if (isRetryableStorageError(error)) return oauthStorageUnavailable(error);
+    throw error;
+  }
+}
+
+async function handleTokenWithStore(
+  body: Record<string, string>,
+  grant: string,
+  req: Request,
+  store: ControlPlaneStore,
+  opts?: { budget?: BudgetState; issuer?: string },
+): Promise<Response> {
   await store.ensureBootstrapSeeded();
+  const tokenIssuer = opts?.issuer || (() => { try { return new URL(req.url).origin; } catch { return ""; } })();
 
   // Reject confidential-client auth. We only support public clients + PKCE (none).
   // Presence of client_secret (including empty string) is client_secret_post — fail closed.
@@ -922,11 +1236,22 @@ export async function handleToken(
     ) {
       return json({ error: "invalid_grant" }, { status: 400 });
     }
+    // Issue #195: token request must carry the same RFC 8707 resource.
+    // Missing/mismatched fails closed without consuming the code.
+    // Duplicate-`resource` note: form bodies reject repeats via
+    // DuplicateFormFieldError (readBody); JSON duplicates are last-wins by
+    // JSON.parse but the surviving value is still normalized against the
+    // canonical /mcp URL here, so a smuggled second value cannot bypass.
+    const requestResource = normalizeOAuthResource(body.resource, tokenIssuer);
+    if (!requestResource) {
+      return json({ error: "invalid_target", error_description: "resource must be the canonical /mcp URL for this issuer" }, { status: 400 });
+    }
     const redemption = await store.redeemAuthCode({
       code: body.code,
       clientId: body.client_id,
       redirectUri: body.redirect_uri,
       codeChallenge: await pkceS256Challenge(body.code_verifier),
+      resource: requestResource,
     });
     if (redemption.status !== "redeemed") {
       return json({ error: "invalid_grant" }, { status: 400 });
@@ -956,7 +1281,18 @@ export async function handleToken(
   if (grant === "refresh_token") {
     const rt = body.refresh_token;
     if (!rt) return json({ error: "invalid_request" }, { status: 400 });
-    const result = await store.rotateRefresh(rt);
+    // Issue #195: refresh preserves the original audience and rejects attempts
+    // to switch it. An explicit resource must equal the bound one; omitting it
+    // keeps the original (compat for rotation without audience switch).
+    let expectedResource: string | undefined;
+    if (body.resource !== undefined && body.resource !== null && String(body.resource).length > 0) {
+      const normalized = normalizeOAuthResource(body.resource, tokenIssuer);
+      if (!normalized) {
+        return json({ error: "invalid_target", error_description: "resource must be the canonical /mcp URL for this issuer" }, { status: 400 });
+      }
+      expectedResource = normalized;
+    }
+    const result = await store.rotateRefresh(rt, expectedResource);
     if (!result.ok) {
       return json(
         {
@@ -1018,10 +1354,38 @@ export async function handleToken(
     if (!requestedClient || requestedClient !== rec.client_id) {
       return json({ error: "invalid_grant" }, { status: 400 });
     }
+    // Issue #195: a bound device code requires the same resource at exchange
+    // (fail-closed before consuming). An unbound code accepts an optional
+    // valid resource and binds the issued token to it; omission stays unbound.
+    let deviceExchangeResource: string | undefined = rec.resource;
+    const rawExchangeResource = body.resource;
+    if (typeof rawExchangeResource === "string" && rawExchangeResource.length > 0) {
+      const normalized = normalizeOAuthResource(rawExchangeResource, tokenIssuer);
+      if (!normalized) {
+        return json({ error: "invalid_target", error_description: "resource must be the canonical /mcp URL for this issuer" }, { status: 400 });
+      }
+      if (rec.resource !== undefined && normalized !== rec.resource) {
+        return json({ error: "invalid_target", error_description: "resource must match the device code audience" }, { status: 400 });
+      }
+      deviceExchangeResource = normalized;
+    } else if (rec.resource !== undefined) {
+      return json({ error: "invalid_target", error_description: "resource must match the device code audience" }, { status: 400 });
+    }
     const consumed = await store.consumeApprovedDeviceCode(deviceCode, requestedClient);
     if (!consumed) return json({ error: "invalid_grant" }, { status: 400 });
     const principal = consumed.principal_id!;
-    const tok = await store.issueTokens(consumed.client_id, principal, consumed.scope);
+    // Fail closed: unknown client or client/principal tenant mismatch is an
+    // invalid grant (never a 500 with binding detail). Retryable D1 throws
+    // delegate to the centralized isRetryableStorageError predicate (no ad-hoc
+    // timeout/quota substrings); the outer handleToken convergence maps them
+    // to the sanitized 503.
+    let tok;
+    try {
+      tok = await store.issueTokens(consumed.client_id, principal, consumed.scope, undefined, undefined, undefined, deviceExchangeResource ?? consumed.resource);
+    } catch (error) {
+      if (isRetryableStorageError(error)) throw error;
+      return json({ error: "invalid_grant" }, { status: 400 });
+    }
     await store.appendAudit({
       id: randomId("aud_"),
       tenant_id: tok.tenant_id,
@@ -1046,28 +1410,33 @@ export async function handleRevoke(
   req: Request,
   store: ControlPlaneStore,
 ): Promise<Response> {
-  const parsedBody = await readOAuthBody(req);
-  if (parsedBody instanceof Response) return parsedBody;
-  const body = parsedBody;
-  const token = body.token || "";
-  if (token) {
-    // RFC 7009: always 200. Audit only when the token matches a real issued record,
-    // attributed to that token's tenant/principal (never a blanket DEFAULT_TENANT).
-    const meta = await store.lookupRevocableToken(token);
-    await store.revokeToken(token);
-    if (meta) {
-      await store.appendAudit({
-        id: randomId("aud_"),
-        tenant_id: meta.tenant_id,
-        principal_id: meta.principal_id,
-        kind: "oauth.revoke",
-        summary: "token revoked",
-        created_at: nowIso(),
-        meta: { token_prefix: token.slice(0, 8), client_id: meta.client_id },
-      });
+  // SHOULD-2: revoke is a durable write; a mid-revoke D1 outage converges to
+  // the sanitized 503 (never silent 200, never 500). RFC 7009's always-200
+  // still holds for reachable storage (unknown tokens included).
+  return withOAuthStorageConvergence(async () => {
+    const parsedBody = await readOAuthBody(req);
+    if (parsedBody instanceof Response) return parsedBody;
+    const body = parsedBody;
+    const token = body.token || "";
+    if (token) {
+      // RFC 7009: always 200. Audit only when the token matches a real issued record,
+      // attributed to that token's tenant/principal (never a blanket DEFAULT_TENANT).
+      const meta = await store.lookupRevocableToken(token);
+      await store.revokeToken(token);
+      if (meta) {
+        await store.appendAudit({
+          id: randomId("aud_"),
+          tenant_id: meta.tenant_id,
+          principal_id: meta.principal_id,
+          kind: "oauth.revoke",
+          summary: "token revoked",
+          created_at: nowIso(),
+          meta: { token_prefix: token.slice(0, 8), client_id: meta.client_id },
+        });
+      }
     }
-  }
-  return new Response(null, { status: 200, headers: applyNoStore() });
+    return new Response(null, { status: 200, headers: applyNoStore() });
+  });
 }
 
 /** RFC 8628 device authorization endpoint. */
@@ -1083,6 +1452,18 @@ export async function handleDeviceAuthorization(
   // which answers 503 + Retry-After in the same mode.)
   const degraded = budgetUnavailable(opts?.budget);
   if (degraded) return degraded;
+  // SHOULD-2: storage throws converge to the sanitized 503 (same as token).
+  return withOAuthStorageConvergence(() =>
+    handleDeviceAuthorizationWithStore(req, store, issuer, userCodeGenerator),
+  );
+}
+
+async function handleDeviceAuthorizationWithStore(
+  req: Request,
+  store: ControlPlaneStore,
+  issuer: string,
+  userCodeGenerator: () => string = generateUserCode,
+): Promise<Response> {
   const parsedBody = await readOAuthBody(req);
   if (parsedBody instanceof Response) return parsedBody;
   const body = parsedBody;
@@ -1093,6 +1474,20 @@ export async function handleDeviceAuthorization(
     return json({ error: "unauthorized_client" }, { status: 401 });
   }
   if (!validScope(scope)) return json({ error: "invalid_scope" }, { status: 400 });
+  // Issue #195: optional RFC 8707 binding for device flow. A supplied resource
+  // must equal the canonical `/mcp` URL; omission leaves the code unbound
+  // (migration compat). A bound code propagates its audience to issued tokens.
+  let deviceResource: string | undefined;
+  const rawDeviceResource = body.resource;
+  if (typeof rawDeviceResource === "string" && rawDeviceResource.length > 0) {
+    const normalized = normalizeOAuthResource(rawDeviceResource, issuer);
+    if (!normalized) {
+      return json({ error: "invalid_target", error_description: "resource must be the canonical /mcp URL for this issuer" }, { status: 400 });
+    }
+    deviceResource = normalized;
+  } else if (rawDeviceResource !== undefined && rawDeviceResource !== null && String(rawDeviceResource).length > 0) {
+    return json({ error: "invalid_target", error_description: "resource must be the canonical /mcp URL for this issuer" }, { status: 400 });
+  }
 
   const deviceCode = randomToken("dcode_");
   const verificationUri = `${issuer}/oauth/device`;
@@ -1111,6 +1506,7 @@ export async function handleDeviceAuthorization(
       interval_sec: 5,
       expires_at: Date.now() + expiresIn * 1000,
       status: "pending",
+      ...(deviceResource !== undefined ? { resource: deviceResource } : {}),
     });
     if (result === "created") {
       userCode = candidate;
@@ -1134,6 +1530,18 @@ export async function handleDeviceAuthorization(
 
 /** Browser verification page + approve POST for device flow. */
 export async function handleDeviceVerification(
+  req: Request,
+  store: ControlPlaneStore,
+  security: OAuthRequestSecurity = {},
+  opts?: { budget?: BudgetState },
+): Promise<Response> {
+  // SHOULD-2対象外メモ: handleAuthorize と同理由で browser HTML flow は頂層収束に
+  // 任せる (index.ts が HTML 503 + 60s を返す)。POST decision の budget 503 のみ
+  // 内側でJSON収束し、storage throw自体は頂層HTMLを保つ。非storageはrethrow。
+  return handleDeviceVerificationWithStore(req, store, security, opts);
+}
+
+async function handleDeviceVerificationWithStore(
   req: Request,
   store: ControlPlaneStore,
   security: OAuthRequestSecurity = {},
@@ -1184,6 +1592,11 @@ export async function handleDeviceVerification(
     }
     const transactionId = randomId("dvt_");
     const csrf = randomToken("csrf_");
+    // Defense-in-depth note: the verification Tx binds user_code/client_id/scope
+    // and the device_code row keeps the RFC 8707 resource, enforced at token
+    // exchange. Omitting resource here is currently not exploitable (an attacker
+    // cannot swap audience without the bound code values); persisting resource
+    // in the Tx would need a schema migration, so it stays a future hardening.
     await store.putDeviceVerificationTransaction({
       id: transactionId, csrf_hash: await sha256Hex(csrf), user_code: userCode,
       principal_id: principal.id, client_id: dc.client_id, scope: dc.scope,

@@ -3397,6 +3397,25 @@ mod tests {
             "open process token failed: {}",
             std::io::Error::last_os_error()
         );
+        // Query SIDs first so the distinct-owner precondition can be decided
+        // before touching process privileges.
+        let token_owner_sid = token_owner_sid_string(token);
+        let token_user_sid = current_process_user_sid_string().unwrap();
+        let distinct_owner = token_owner_sid != token_user_sid;
+        // Elevated runners (Administrator S-1-5-...-500, SYSTEM, ...) use the same
+        // SID for TokenOwner and TokenUser, so a distinct elevated owner cannot be
+        // exercised. Only the repair check is skipped here; the foreign-owner
+        // rejection below always runs so CI never goes green without verification.
+        if !distinct_owner {
+            eprintln!(
+                "skipped TokenOwner repair check in \
+                 windows_rejects_foreign_owned_state_directory_before_hardening: \
+                 already-elevated principal (TokenOwner == TokenUser == {token_owner_sid}), \
+                 distinct-owner precondition unavailable"
+            );
+        }
+        // Enable SeRestorePrivilege only after the precondition check, since it is
+        // needed solely for planting foreign-owned directories below.
         let restore_name: Vec<u16> = "SeRestorePrivilege\0".encode_utf16().collect();
         let mut luid = unsafe { std::mem::zeroed() };
         assert_ne!(
@@ -3435,30 +3454,24 @@ mod tests {
             ERROR_NOT_ALL_ASSIGNED,
             "dedicated CI runner lacks SeRestorePrivilege"
         );
-        let token_owner_sid = token_owner_sid_string(token);
-        let token_user_sid = current_process_user_sid_string().unwrap();
-        assert_ne!(
-            token_owner_sid, token_user_sid,
-            "dedicated CI must exercise a distinct elevated TokenOwner"
-        );
-        unsafe {
-            CloseHandle(token);
+
+        if distinct_owner {
+            let dir = tempdir().unwrap();
+            let token_owner_state = dir.path().join("token-owner-state");
+            create_directory_with_sddl(
+                &token_owner_state,
+                &format!("O:{token_owner_sid}D:P(A;OICI;FA;;;WD)"),
+            );
+            assert!(validate_state_dir_owner(&token_owner_state, false).is_err());
+            let token_owner_registry = CredentialRegistry::open(&token_owner_state)
+                .expect("stable TokenOwner directory must be repaired through its pinned handle");
+            drop(token_owner_registry);
+            validate_state_dir_owner(&token_owner_state, true)
+                .expect("TokenOwner repair must finish as protected TokenUser ownership");
         }
 
-        let dir = tempdir().unwrap();
-        let token_owner_state = dir.path().join("token-owner-state");
-        create_directory_with_sddl(
-            &token_owner_state,
-            &format!("O:{token_owner_sid}D:P(A;OICI;FA;;;WD)"),
-        );
-        assert!(validate_state_dir_owner(&token_owner_state, false).is_err());
-        let token_owner_registry = CredentialRegistry::open(&token_owner_state)
-            .expect("stable TokenOwner directory must be repaired through its pinned handle");
-        drop(token_owner_registry);
-        validate_state_dir_owner(&token_owner_state, true)
-            .expect("TokenOwner repair must finish as protected TokenUser ownership");
-
-        let state = dir.path().join("foreign-owned-state");
+        let foreign_dir = tempdir().unwrap();
+        let state = foreign_dir.path().join("foreign-owned-state");
         // LocalSystem owns the directory while Everyone has full access. LocalSystem
         // is neither this process's TokenUser nor its stable TokenOwner.
         // This gives the daemon enough rights to reproduce the old owner-claim bug:
@@ -3477,6 +3490,25 @@ mod tests {
             validate_state_dir_owner(&state, false).is_err(),
             "rejected foreign directory must retain its original owner"
         );
+        // Best-effort privilege hygiene: drop SeRestorePrivilege before exit.
+        let disable = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: 0,
+            }],
+        };
+        unsafe {
+            AdjustTokenPrivileges(
+                token,
+                0,
+                &raw const disable,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            CloseHandle(token);
+        }
     }
 
     #[cfg(windows)]

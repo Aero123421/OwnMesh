@@ -203,6 +203,39 @@ function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
   return { db, store: new SqlStore(adapter, "sqlite") };
 }
 
+test("instrumentStatement threads immutable bind returns (production D1)", async () => {
+  // Production D1 bind() returns the bound statement instead of mutating;
+  // running the unbound original fails with "Wrong number of parameter
+  // bindings". The wrapper must work with both styles (regression test for
+  // the v1.2.33 release-blocker where every instrumented write broke).
+  const recorder = new D1TelemetryRecorder();
+  const immutable = {
+    bound: null as null | unknown[],
+    bind(...values: unknown[]) {
+      return { ...this, bound: values };
+    },
+    async run() {
+      if (!this.bound || this.bound.length !== 1) {
+        throw new Error("D1_ERROR: Wrong number of parameter bindings for SQL query.");
+      }
+      return { success: true, meta: { rows_read: 0, rows_written: 2, changes: 1 }, results: [] };
+    },
+    async first<T>(): Promise<T | null> {
+      return null;
+    },
+    async all<T>() {
+      return { results: [] as T[] };
+    },
+  };
+  const wrapped = instrumentStatement(immutable, "quota.probe", recorder);
+  const result = await wrapped.bind("2026-09-06T00:00:00.000Z").run();
+  assert.equal((result.meta as { changes: number }).changes, 1);
+  const summary = recorder.snapshot().fingerprints.find((s) => s.fingerprint === "quota.probe");
+  assert.ok(summary);
+  assert.equal(summary.statements, 1);
+  assert.equal(summary.rowsWritten, 2);
+});
+
 test("SqlStore hot paths emit fixed fingerprints without behavior change", async () => {
   const { db, store } = openSqliteStore();
   try {

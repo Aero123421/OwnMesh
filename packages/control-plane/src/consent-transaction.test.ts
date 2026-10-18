@@ -87,6 +87,7 @@ function authzUrl(extra: Record<string, string> = {}): string {
     code_challenge_method: "S256",
     scope: "ownmesh.read",
     state: "st_1",
+    resource: "https://cp.test/mcp",
     ...extra,
   });
   return `https://cp.test/oauth/authorize?${p}`;
@@ -160,7 +161,9 @@ test("GET consent issues one-time tx bound to full snapshot", async () => {
   const html = await page.text();
   assert.match(html, /transaction_id/);
   assert.match(html, /csrf_token/);
-  assert.match(html, /Authorize ChatGPT — OwnMesh/);
+  // Issue #198: generic client (consent-test) must not be labeled ChatGPT.
+  assert.match(html, /Authorize consent-test — OwnMesh/);
+  assert.doesNotMatch(html, /ChatGPT/);
   assert.match(html, /OAuth 2\.1 \/ PKCE S256/);
   // Form must NOT re-submit raw OAuth params as hidden fields.
   assert.doesNotMatch(html, /name="redirect_uri"/);
@@ -381,6 +384,7 @@ test("consent + PKCE exchange end-to-end", async () => {
         redirect_uri: REDIRECT,
         client_id: CLIENT,
         code_verifier: verifier,
+        resource: "https://cp.test/mcp",
       }),
     }),
     store,

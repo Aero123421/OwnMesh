@@ -121,9 +121,20 @@ test("degraded modes gate MCP calls by risk class", async () => {
   assert.equal(writeErr.reset_at, future);
   assert.equal(writeErr.mode, "read_only");
 
-  // auth_only without room coverage rejects even reads, without D1 writes.
+  // auth_only without room coverage rejects even reads with transient 503
+  // (retryable, never credential loss). Issue #227.
   const readBlocked = await mcpCall(store, issued.access_token, "ownmesh_list_devices", {}, authOnly);
-  assert.equal(((readBlocked.body.error as { data: { code: string } }).data).code, "OWNMESH_QUOTA_READ_ONLY_DISABLED");
+  assert.equal(readBlocked.status, 503);
+  const blockedErr = readBlocked.body.error as { message: string; data: Record<string, unknown> };
+  assert.equal(blockedErr.message, "temporarily_unavailable");
+  const blockedData = blockedErr.data as {
+    reason: string; retryable: boolean; reset_at: string; mode: string;
+  };
+  assert.equal(blockedData.reason, "d1_write_quota_exceeded");
+  assert.equal(blockedData.retryable, true);
+  assert.equal(blockedData.reset_at, future);
+  assert.equal(blockedData.mode, "auth_only");
+  assert.ok("diagnostic_id" in blockedErr.data);
 
   // Normal mode is unaffected.
   const normal = await mcpCall(store, issued.access_token, "ownmesh_list_devices", {});
@@ -214,6 +225,19 @@ test("/health/ready surfaces a failing write probe with its category", async () 
   } finally {
     __setTestStore(null);
   }
+});
+
+test("degraded admission precedes the D1 audit write (no write on reject)", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const issued = await store.issueTokens("client_ownmesh_cli", "prin_audit_order", "ownmesh.device ownmesh.read ownmesh.write ownmesh.exec");
+  const future = utcResetIso(Date.now() + 1000);
+  const authOnly: BudgetState = { mode: "auth_only", source: "probe", resetAt: future, checkedAt: Date.now(), probeCategory: "quota_exceeded" };
+  const before = await store.listAudit(issued.tenant_id, 50);
+  const blocked = await mcpCall(store, issued.access_token, "ownmesh_list_devices", {}, authOnly);
+  assert.equal(blocked.status, 503);
+  const after = await store.listAudit(issued.tenant_id, 50);
+  assert.equal(after.length, before.length, "degraded reject must not spend a D1 audit write");
 });
 
 test("scheduled() drains retention through the injected store", async () => {

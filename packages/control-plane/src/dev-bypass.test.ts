@@ -15,7 +15,7 @@ const REMOTE_ORIGIN = "https://cp.example.com";
 const REMOTE_ISSUER = "https://issuer.example.com";
 const REDIRECT = "http://127.0.0.1:8750/callback";
 
-function authorizeUrl(origin: string, extra: Record<string, string> = {}): string {
+function authorizeUrl(origin: string, extra: Record<string, string> = {}, issuer?: string): string {
   const u = new URL(`${origin}/oauth/authorize`);
   u.searchParams.set("response_type", "code");
   u.searchParams.set("client_id", "client_bypass");
@@ -24,6 +24,8 @@ function authorizeUrl(origin: string, extra: Record<string, string> = {}): strin
   u.searchParams.set("code_challenge_method", "S256");
   u.searchParams.set("scope", "ownmesh.read");
   u.searchParams.set("auto", "1");
+  // Issue #195: resource must equal the canonical issuer /mcp.
+  u.searchParams.set("resource", `${issuer ?? origin}/mcp`);
   for (const [k, v] of Object.entries(extra)) u.searchParams.set(k, v);
   return u.toString();
 }
@@ -214,7 +216,7 @@ test("flag + remote host falls through to AUTH_PROVIDER when bound", async () =>
         Response.json({ principal_id: "prin_real", tenant_id: "ten_default", display_name: "Real" }),
     } as unknown as Fetcher;
     const res = await worker.fetch(
-      new Request(authorizeUrl(REMOTE_ORIGIN, { auto: "0" })),
+      new Request(authorizeUrl(REMOTE_ORIGIN, { auto: "0" }, REMOTE_ISSUER)),
       {
         OWNMESH_DEV_AUTH_BYPASS: "true",
         OAUTH_ISSUER: REMOTE_ISSUER,
