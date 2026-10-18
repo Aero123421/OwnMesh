@@ -39,7 +39,8 @@ export interface DeviceOpStorage {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put(key: string, value: unknown): Promise<void>;
   delete(key: string): Promise<boolean | void>;
-  list?(prefix: string, limit?: number): Promise<string[]>;
+  /** Return keys after startAfter in the storage's stable lexical order. */
+  list?(prefix: string, limit?: number, startAfter?: string): Promise<string[]>;
 }
 
 const OP_PREFIX = "dxop:v1:";
@@ -49,6 +50,7 @@ const SEP = "\u0000";
 
 const CORR_PREFIX = "dxcorr:v1:";
 const COUNT_PREFIX = "dxcnt:v1:";
+const PRUNE_CURSOR_PREFIX = "dxprune:v1:";
 
 const TERMINAL_STATUSES = new Set([
   "completed",
@@ -72,6 +74,10 @@ function corrKey(tenantId: string, correlationId: string): string {
 
 function countKey(tenantId: string): string {
   return `${COUNT_PREFIX}${tenantId}`;
+}
+
+function pruneCursorKey(tenantId: string): string {
+  return `${PRUNE_CURSOR_PREFIX}${tenantId}`;
 }
 
 function cloneRecord(op: McpOperationRecord): McpOperationRecord {
@@ -286,13 +292,26 @@ export class DeviceOperationLog {
     tenantId: string,
     now = Date.now(),
     limit = MCP_OPS_MAINTENANCE_BATCH,
-  ): Promise<{ deleted: number; compacted: number; indexesReaped: number }> {
-    const stats = { deleted: 0, compacted: 0, indexesReaped: 0 };
+  ): Promise<{ deleted: number; compacted: number; indexesReaped: number; hasMore: boolean; hasRows: boolean }> {
+    const stats = { deleted: 0, compacted: 0, indexesReaped: 0, hasMore: false, hasRows: false };
     if (!this.storage.list) return stats;
-    const keys = await this.storage.list(`${OP_PREFIX}${tenantId}:`, Math.max(1, Math.min(512, limit * 2)));
+    // Durable Object list() is ordered by key. Persisting the last examined
+    // key makes maintenance a bounded scan over the whole tenant rather than
+    // repeatedly rescanning a fresh lexical prefix and starving older rows.
+    const pruneLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : MCP_OPS_MAINTENANCE_BATCH;
+    const scanLimit = Math.max(1, Math.min(512, pruneLimit));
+    const cursor = await this.storage.get<string>(pruneCursorKey(tenantId));
+    const keys = await this.storage.list(
+      `${OP_PREFIX}${tenantId}:`,
+      scanLimit,
+      typeof cursor === "string" && cursor ? cursor : undefined,
+    );
+    // Keep the periodic alarm alive for fresh rows too. A completed cursor
+    // pass can prune nothing today while those rows become eligible later.
+    stats.hasRows = (await this.count(tenantId)) > 0 || keys.length > 0;
     let examined = 0;
     for (const key of keys) {
-      if (examined >= limit) break;
+      if (examined >= pruneLimit) break;
       examined += 1;
       const op = await this.storage.get<McpOperationRecord>(key);
       if (!op || op.tenant_id !== tenantId) continue;
@@ -323,6 +342,12 @@ export class DeviceOperationLog {
         );
         stats.compacted += 1;
       }
+    }
+    stats.hasMore = keys.length >= scanLimit && examined > 0;
+    if (keys.length === 0 || !stats.hasMore) {
+      await this.storage.delete(pruneCursorKey(tenantId));
+    } else {
+      await this.storage.put(pruneCursorKey(tenantId), keys[examined - 1]!);
     }
     // Reap dangling index entries left by interrupted multi-key writes.
     // Bounded: at most 64 index checks per prune pass.
@@ -365,14 +390,15 @@ export class InMemoryDeviceOpStorage implements DeviceOpStorage {
     return this.rows.delete(key);
   }
 
-  async list(prefix: string, limit = 128): Promise<string[]> {
+  async list(prefix: string, limit = 128, startAfter?: string): Promise<string[]> {
     const out: string[] = [];
-    for (const key of this.rows.keys()) {
+    for (const key of [...this.rows.keys()].sort()) {
       if (key.startsWith(prefix)) {
+        if (startAfter && key <= startAfter) continue;
         out.push(key);
         if (out.length >= limit) break;
       }
     }
-    return out.sort();
+    return out;
   }
 }

@@ -355,20 +355,21 @@ jobs:
 
   coderabbit-call:
     name: CodeRabbit auto-call (star-limit bypass)
-    # Fire only on PR opened / synchronize / labeled(review-ready). Bot posts
+    # Fire only on PR opened / synchronize / ready_for_review /
+    # labeled(review-ready). Bot posts
     # never re-trigger: actor/sender guard here plus an idempotent
     # already-called check in the script (no re-post, no loop).
     # Uses only the preinstalled `gh` CLI + bash, so no new action pins and
     # no secrets:inherit. GITHUB_TOKEN is passed via env and never logged.
     # Drafts are excluded: review call is (re-)issued on undraft via
-    # opened/synchronize/labeled(review-ready) after ready_for_review.
+    # ready_for_review (and on later opened/synchronize/labeled events).
     # NOTE: GitHub Actions expressions have no toLower()/toUpper() (that is
     # Azure Pipelines). Use an exact match on the canonical lowercase label
     # name; `github.event.label` is absent on opened/synchronize so the
     # comparison evaluates to null == 'review-ready' (false) without error.
     # Case-insensitive handling of the full label list lives in the bash
     # script below (LABELS_LOWER) and in scripts/ci/plan.py.
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true && (github.event.action == 'opened' || github.event.action == 'synchronize' || (github.event.action == 'labeled' && github.event.label.name == 'review-ready')) && github.actor != 'coderabbitai[bot]' && github.event.sender.login != 'coderabbitai[bot]'
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true && (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && github.event.label.name == 'review-ready')) && github.actor != 'coderabbitai[bot]' && github.event.sender.login != 'coderabbitai[bot]'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write

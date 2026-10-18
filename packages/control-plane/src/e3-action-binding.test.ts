@@ -49,6 +49,7 @@ import {
 import { hashCanonicalAction, nowIso } from "./util.ts";
 import { applyMcpOperationResult } from "./device-room.ts";
 import { D1OperationStore } from "./operation-store.ts";
+import { DeviceOperationLog, InMemoryDeviceOpStorage } from "./device-op-store.ts";
 import { __test } from "./index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1175,6 +1176,101 @@ test("get_operation leases and redelivers dispatch_uncertain without original to
   assert.equal(readDispatchOutbox((await store.getMcpOperation("op_poll_redelivery"))?.data)?.state, "dispatched");
   await poll();
   assert.equal(routeCalls, 1, "dispatched receipt must suppress status-poll amplification");
+});
+
+test("get_operation redelivery patches the selected operation authority", async () => {
+  const store = new MemoryStore();
+  const token = await seedAuthed(store);
+  const deviceId = "dev_poll_room_authority";
+  await putActiveDevice(store, deviceId);
+  const log = new DeviceOperationLog(new InMemoryDeviceOpStorage(), 100);
+  const deviceOp = await buildDeviceOperation({
+    toolName: "ownmesh_fs_write",
+    args: {
+      device_id: deviceId,
+      workspace_id: null,
+      path: "/room-redelivery.txt",
+      content: "room-authority",
+      idempotency_key: "idem_room_authority",
+    },
+    operationId: "op_room_authority",
+    deviceId,
+    principalId: "prin_dev",
+    tenantId: "ten_default",
+    principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+    claimVersion: 1,
+    oauthClientId: "client_mcp",
+  });
+  await log.put({
+    operation_id: "op_room_authority",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "pending",
+    summary: "dispatch_uncertain",
+    data: withDispatchOutbox({ dispatch: "uncertain" }, buildDispatchOutbox(deviceOp)),
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_room_authority",
+    payload_hash: deviceOp.payload_hash,
+    idempotency_key: "idem_room_authority",
+    expires_at: deviceOp.expires_at,
+    claim_version: 1,
+    action: deviceOp.canonical_action,
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  const roomOps = {
+    backend: "operation-room" as const,
+    claim: (op: Parameters<typeof log.put>[0]) => log.claim(op),
+    get: (id: string) => log.get(id, "ten_default"),
+    getByIdempotency: (opts: Parameters<typeof log.getByIdempotency>[0]) => log.getByIdempotency(opts),
+    getByCorrelation: (id: string) => log.getByCorrelation(id, "ten_default"),
+    put: (op: Parameters<typeof log.put>[0]) => log.put(op),
+    transition: (id: string, transition: Parameters<typeof log.transition>[2], from?: string[]) =>
+      log.transition(id, "ten_default", transition, from),
+    update: (id: string, patch: Parameters<typeof log.update>[2], from?: string[], expected?: Record<string, unknown>) =>
+      log.update(id, "ten_default", patch, from, expected),
+  };
+  let routeCalls = 0;
+  const router: OperationRouter = {
+    async routeToDevice(_id, _operation) {
+      routeCalls += 1;
+      return { status: "routed_to_device" };
+    },
+  };
+  const polled = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token.access_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "ownmesh_get_operation", arguments: { operation_id: "op_room_authority" } },
+      }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    router,
+    {
+      issuer: "https://cp.test",
+      operationStores: {
+        mode: "device_do",
+        forTenant: async () => ({ ops: roomOps, auditCovered: true }),
+      },
+    },
+  );
+  assert.equal(polled.status, 200);
+  assert.equal(routeCalls, 1);
+  assert.equal(readDispatchOutbox((await log.get("op_room_authority", "ten_default"))?.data)?.state, "dispatched");
+  assert.equal(await store.getMcpOperation("op_room_authority"), null);
 });
 
 test("dispatch_uncertain: timeout keeps pending outbox; delayed result finalizes; retry does not rerun", async () => {

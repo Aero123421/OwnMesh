@@ -1464,27 +1464,16 @@ pub fn apply_unified_diff(
         }
     }
 
-    let old_lines: Vec<&str> = split_lines_preserve(&current);
+    let old_lines = split_lines_preserve(&current);
     let new_lines = apply_hunks_to_lines(&old_lines, &hunks)?;
     if new_lines.len() > MAX_UNIFIED_DIFF_TARGET_LINES {
         return Err(FsError::Patch(format!(
             "patched file would exceed {MAX_UNIFIED_DIFF_TARGET_LINES} lines"
         )));
     }
-    let mut out = String::new();
-    for (i, line) in new_lines.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    // Preserve a trailing newline when the post-image is non-empty and the
-    // final hunk did not explicitly omit it via `\ No newline` (simplified:
-    // always end text files with newline when non-empty — matches git apply
-    // common case for ChatGPT-authored patches).
-    if !out.is_empty() && !out.ends_with('\n') && current.ends_with('\n') {
-        out.push('\n');
-    }
+    // Each line retains its exact bytes, including LF (and any preceding CR),
+    // so mixed EOL files and CRLF/LF transitions do not get normalized.
+    let out: String = new_lines.into_iter().collect();
     if out.len() > MAX_UNIFIED_DIFF_TARGET_BYTES {
         return Err(FsError::Patch(format!(
             "patched file would exceed {MAX_UNIFIED_DIFF_TARGET_BYTES} byte budget"
@@ -1499,6 +1488,11 @@ struct DiffHunk {
     /// 1-based old start line (0 means empty file).
     old_start: usize,
     old_count: usize,
+    /// 1-based new start line (0 means empty file).
+    new_start: usize,
+    new_count: usize,
+    old_no_newline: bool,
+    new_no_newline: bool,
     lines: Vec<DiffLine>,
 }
 
@@ -1509,16 +1503,28 @@ enum DiffLine {
     Add(String),
 }
 
+fn is_newline_marker(line: &str) -> bool {
+    let without_lf = line.strip_suffix('\n').unwrap_or(line);
+    without_lf == "\\ No newline at end of file"
+        || without_lf
+            .strip_suffix('\r')
+            .is_some_and(|marker| marker == "\\ No newline at end of file")
+}
+
 fn parse_unified_diff_hunks(diff_text: &str) -> FsResult<Vec<DiffHunk>> {
     let mut hunks = Vec::new();
-    let mut lines = diff_text.lines().peekable();
+    // Keep each record's exact bytes, including LF and any preceding CR. The
+    // LF is framing for metadata, but it is part of a hunk line's target bytes.
+    let mut lines = diff_text.split_inclusive('\n').peekable();
     let mut saw_file_header = false;
     let mut file_headers = 0usize;
+    let mut old_file_headers = 0usize;
 
     while let Some(line) = lines.next() {
-        if line.starts_with("diff --git ") {
+        let metadata = line.strip_suffix('\n').unwrap_or(line);
+        if metadata.starts_with("diff --git ") {
             file_headers = file_headers.saturating_add(1);
-            if file_headers > 1 {
+            if file_headers > 1 || old_file_headers > 0 || !hunks.is_empty() {
                 return Err(FsError::Patch(
                     "multi-file unified diffs are not supported; patch one path at a time".into(),
                 ));
@@ -1526,41 +1532,134 @@ fn parse_unified_diff_hunks(diff_text: &str) -> FsResult<Vec<DiffHunk>> {
             saw_file_header = true;
             continue;
         }
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
+        if metadata.starts_with("--- ") {
+            old_file_headers = old_file_headers.saturating_add(1);
+            if old_file_headers > 1 || !hunks.is_empty() {
+                return Err(FsError::Patch(
+                    "multi-file unified diffs are not supported; patch one path at a time".into(),
+                ));
+            }
             saw_file_header = true;
             continue;
         }
-        if line.starts_with("@@") {
-            let (old_start, old_count) = parse_hunk_header(line)?;
+        if metadata.starts_with("+++ ") {
+            saw_file_header = true;
+            continue;
+        }
+        if metadata.starts_with("@@") {
+            let (old_start, old_count, new_start, new_count) = parse_hunk_header(line)?;
             let mut hunk_lines = Vec::new();
+            let mut old_no_newline = false;
+            let mut new_no_newline = false;
+            let mut old_marker_seen = false;
+            let mut new_marker_seen = false;
+            let mut old_seen = 0usize;
+            let mut new_seen = 0usize;
+            let mut previous_tag = None;
             while let Some(&next) = lines.peek() {
-                if next.starts_with("@@")
-                    || next.starts_with("diff --git ")
-                    || next.starts_with("--- ")
-                {
-                    break;
+                if old_seen == old_count && new_seen == new_count && !is_newline_marker(next) {
+                    let metadata = next.strip_suffix('\n').unwrap_or(next);
+                    let is_next_hunk = metadata.starts_with("@@");
+                    let is_next_file = metadata.starts_with("diff --git ");
+                    let is_body_like = next
+                        .chars()
+                        .next()
+                        .is_some_and(|tag| matches!(tag, ' ' | '+' | '-' | '\\'));
+                    if !is_body_like || is_next_hunk || is_next_file {
+                        break;
+                    }
                 }
                 let body = lines.next().unwrap_or(next);
-                if body.starts_with('\\') {
-                    // "\ No newline at end of file" — ignore (handled softly).
+                let body_without_lf = body.strip_suffix('\n').unwrap_or(body);
+                if is_newline_marker(body) {
+                    match previous_tag {
+                        Some('-') => {
+                            old_no_newline = true;
+                            old_marker_seen = true;
+                            remove_line_lf(hunk_lines.last_mut())?;
+                        }
+                        Some('+') => {
+                            new_no_newline = true;
+                            new_marker_seen = true;
+                            remove_line_lf(hunk_lines.last_mut())?;
+                        }
+                        Some(' ') => {
+                            old_no_newline = true;
+                            new_no_newline = true;
+                            old_marker_seen = true;
+                            new_marker_seen = true;
+                            remove_line_lf(hunk_lines.last_mut())?;
+                        }
+                        _ => {
+                            return Err(FsError::Patch(
+                                "newline marker must follow a hunk line".into(),
+                            ));
+                        }
+                    }
+                    previous_tag = None;
                     continue;
                 }
-                if body.is_empty() {
+                if body_without_lf.starts_with('\\') {
+                    return Err(FsError::Patch(format!(
+                        "invalid hunk line (expected newline marker): {body:?}"
+                    )));
+                }
+                if body_without_lf.is_empty() {
+                    if old_marker_seen || new_marker_seen {
+                        return Err(FsError::Patch(
+                            "newline marker must follow the last hunk line for its side".into(),
+                        ));
+                    }
+                    if old_seen == old_count || new_seen == new_count {
+                        return Err(FsError::Patch("hunk line count exceeds header".into()));
+                    }
                     // Some producers emit a blank line as context " ".
-                    hunk_lines.push(DiffLine::Context(String::new()));
+                    hunk_lines.push(DiffLine::Context(body.to_owned()));
+                    old_seen += 1;
+                    new_seen += 1;
+                    previous_tag = Some(' ');
                     continue;
                 }
-                let (tag, rest) = body.split_at(1);
+                let mut chars = body.chars();
+                let tag = chars.next().unwrap_or_default();
+                let rest = chars.as_str();
+                if (old_marker_seen && matches!(tag, '-' | ' '))
+                    || (new_marker_seen && matches!(tag, '+' | ' '))
+                {
+                    return Err(FsError::Patch(
+                        "newline marker must follow the last hunk line for its side".into(),
+                    ));
+                }
                 match tag {
-                    " " => hunk_lines.push(DiffLine::Context(rest.to_owned())),
-                    "-" => hunk_lines.push(DiffLine::Delete(rest.to_owned())),
-                    "+" => hunk_lines.push(DiffLine::Add(rest.to_owned())),
+                    ' ' => {
+                        if old_seen == old_count || new_seen == new_count {
+                            return Err(FsError::Patch("hunk line count exceeds header".into()));
+                        }
+                        hunk_lines.push(DiffLine::Context(rest.to_owned()));
+                        old_seen += 1;
+                        new_seen += 1;
+                    }
+                    '-' => {
+                        if old_seen == old_count {
+                            return Err(FsError::Patch("hunk line count exceeds header".into()));
+                        }
+                        hunk_lines.push(DiffLine::Delete(rest.to_owned()));
+                        old_seen += 1;
+                    }
+                    '+' => {
+                        if new_seen == new_count {
+                            return Err(FsError::Patch("hunk line count exceeds header".into()));
+                        }
+                        hunk_lines.push(DiffLine::Add(rest.to_owned()));
+                        new_seen += 1;
+                    }
                     _ => {
                         return Err(FsError::Patch(format!(
                             "invalid hunk line (expected ' ','-','+'): {body:?}"
                         )));
                     }
                 }
+                previous_tag = Some(tag);
                 if hunk_lines.len() > MAX_UNIFIED_DIFF_TARGET_LINES {
                     return Err(FsError::Patch("hunk line budget exceeded".into()));
                 }
@@ -1568,6 +1667,10 @@ fn parse_unified_diff_hunks(diff_text: &str) -> FsResult<Vec<DiffHunk>> {
             hunks.push(DiffHunk {
                 old_start,
                 old_count,
+                new_start,
+                new_count,
+                old_no_newline,
+                new_no_newline,
                 lines: hunk_lines,
             });
             continue;
@@ -1578,58 +1681,87 @@ fn parse_unified_diff_hunks(diff_text: &str) -> FsResult<Vec<DiffHunk>> {
     Ok(hunks)
 }
 
-fn parse_hunk_header(line: &str) -> FsResult<(usize, usize)> {
+fn parse_hunk_header(line: &str) -> FsResult<(usize, usize, usize, usize)> {
     // @@ -l,s +l,s @@ optional
     let rest = line
         .strip_prefix("@@")
-        .and_then(|s| s.split("@@").next())
+        .and_then(|s| s.split_once("@@").map(|(header, _)| header))
         .ok_or_else(|| FsError::Patch(format!("malformed hunk header: {line}")))?
         .trim();
-    let old = rest
-        .split_whitespace()
+    let mut ranges = rest.split_whitespace();
+    let old = ranges
         .next()
         .ok_or_else(|| FsError::Patch(format!("malformed hunk header: {line}")))?;
-    let old = old
-        .strip_prefix('-')
-        .ok_or_else(|| FsError::Patch(format!("malformed hunk old range: {line}")))?;
-    let mut parts = old.split(',');
-    let start: usize = parts
+    let new = ranges
+        .next()
+        .ok_or_else(|| FsError::Patch(format!("malformed hunk header: {line}")))?;
+    let (old_start, old_count) = parse_hunk_range(old, '-', "old", line)?;
+    let (new_start, new_count) = parse_hunk_range(new, '+', "new", line)?;
+    Ok((old_start, old_count, new_start, new_count))
+}
+
+fn parse_hunk_range(range: &str, prefix: char, name: &str, line: &str) -> FsResult<(usize, usize)> {
+    let range = range
+        .strip_prefix(prefix)
+        .ok_or_else(|| FsError::Patch(format!("malformed hunk {name} range: {line}")))?;
+    let mut parts = range.split(',');
+    let start = parts
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| FsError::Patch(format!("malformed hunk old start: {line}")))?;
-    let count: usize = match parts.next() {
+        .ok_or_else(|| FsError::Patch(format!("malformed hunk {name} start: {line}")))?;
+    let count = match parts.next() {
         Some(s) => s
             .parse()
-            .map_err(|_| FsError::Patch(format!("malformed hunk old count: {line}")))?,
+            .map_err(|_| FsError::Patch(format!("malformed hunk {name} count: {line}")))?,
         None => 1,
     };
+    if parts.next().is_some() {
+        return Err(FsError::Patch(format!(
+            "malformed hunk {name} range: {line}"
+        )));
+    }
     Ok((start, count))
 }
 
-fn split_lines_preserve(text: &str) -> Vec<&str> {
-    if text.is_empty() {
-        return Vec::new();
+fn remove_line_lf(line: Option<&mut DiffLine>) -> FsResult<()> {
+    let line = line.ok_or_else(|| FsError::Patch("newline marker has no preceding line".into()))?;
+    let body = match line {
+        DiffLine::Context(body) | DiffLine::Delete(body) | DiffLine::Add(body) => body,
+    };
+    if body.ends_with('\n') {
+        body.pop();
+        Ok(())
+    } else {
+        Err(FsError::Patch(
+            "newline marker must follow a line ending in LF".into(),
+        ))
     }
-    // Keep line bodies without the newline separator.
-    let mut out: Vec<&str> = text.split('\n').collect();
-    // If text ends with newline, split leaves a trailing empty element representing
-    // the empty line after the final newline — drop it so line counts match git.
-    if text.ends_with('\n') && out.last().is_some_and(|s| s.is_empty()) {
-        out.pop();
-    }
-    out
 }
 
-fn apply_hunks_to_lines(old_lines: &[&str], hunks: &[DiffHunk]) -> FsResult<Vec<String>> {
-    let mut result: Vec<String> = old_lines.iter().map(|s| (*s).to_owned()).collect();
+fn split_lines_preserve(text: &str) -> Vec<String> {
+    // Keep each line's exact bytes, including its LF when present. A trailing
+    // separator does not add a logical line, while a final bare CR remains
+    // part of the unterminated line.
+    text.split_inclusive('\n').map(str::to_owned).collect()
+}
+
+fn apply_hunks_to_lines(old_lines: &[String], hunks: &[DiffHunk]) -> FsResult<Vec<String>> {
+    let mut result = old_lines.to_vec();
     // Apply from bottom to top so earlier line numbers stay stable.
     let mut ordered: Vec<&DiffHunk> = hunks.iter().collect();
     ordered.sort_by(|a, b| b.old_start.cmp(&a.old_start));
 
     for hunk in ordered {
-        let start_idx = if hunk.old_start == 0 {
-            0usize
+        let start_idx = if hunk.old_count == 0 {
+            // A -N,0 hunk inserts after old line N. In particular, -1,0
+            // starts at index 1, while -0,0 creates at index 0.
+            hunk.old_start
         } else {
+            if hunk.old_start == 0 {
+                return Err(FsError::Patch(
+                    "non-empty hunk cannot start at old line 0".into(),
+                ));
+            }
             hunk.old_start.saturating_sub(1)
         };
         if start_idx > result.len() {
@@ -1642,19 +1774,15 @@ fn apply_hunks_to_lines(old_lines: &[&str], hunks: &[DiffHunk]) -> FsResult<Vec<
 
         // Verify context/delete lines match the current file slice.
         let mut cursor = start_idx;
-        let mut delete_count = 0usize;
         for line in &hunk.lines {
             match line {
                 DiffLine::Context(s) | DiffLine::Delete(s) => {
-                    if cursor >= result.len() || result[cursor] != *s {
+                    if cursor >= result.len() || result[cursor].as_str() != s {
                         return Err(FsError::Patch(format!(
                             "hunk context mismatch at line {}: expected {s:?}, got {:?}",
                             cursor + 1,
                             result.get(cursor)
                         )));
-                    }
-                    if matches!(line, DiffLine::Delete(_)) {
-                        delete_count = delete_count.saturating_add(1);
                     }
                     cursor = cursor.saturating_add(1);
                 }
@@ -1662,33 +1790,71 @@ fn apply_hunks_to_lines(old_lines: &[&str], hunks: &[DiffHunk]) -> FsResult<Vec<
             }
         }
         let old_span = cursor.saturating_sub(start_idx);
-        if hunk.old_count > 0 && old_span != hunk.old_count {
+        if old_span != hunk.old_count {
             return Err(FsError::Patch(format!(
                 "hunk old_count mismatch: header {}, matched {old_span}",
                 hunk.old_count
             )));
         }
-        let _ = delete_count;
-
+        let new_span = hunk
+            .lines
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Delete(_)))
+            .count();
+        if new_span != hunk.new_count {
+            return Err(FsError::Patch(format!(
+                "hunk new_count mismatch: header {}, matched {new_span}",
+                hunk.new_count
+            )));
+        }
+        let old_touches_original_eof = start_idx
+            .checked_add(hunk.old_count)
+            .is_some_and(|end| end == old_lines.len());
+        if hunk.old_no_newline && !old_touches_original_eof {
+            return Err(FsError::Patch(
+                "old newline marker does not describe the end of the file".into(),
+            ));
+        }
         // Build replacement slice for [start_idx, cursor).
         let mut replacement = Vec::new();
-        let mut verify_cursor = start_idx;
         for line in &hunk.lines {
             match line {
-                DiffLine::Context(s) => {
-                    replacement.push(s.clone());
-                    verify_cursor = verify_cursor.saturating_add(1);
-                }
-                DiffLine::Delete(_) => {
-                    verify_cursor = verify_cursor.saturating_add(1);
-                }
-                DiffLine::Add(s) => {
-                    replacement.push(s.clone());
-                }
+                DiffLine::Context(s) | DiffLine::Add(s) => replacement.push(s.clone()),
+                DiffLine::Delete(_) => {}
             }
         }
-        let _ = verify_cursor;
         result.splice(start_idx..cursor, replacement);
+    }
+
+    // New ranges are expressed in the post-image coordinate space, so inspect
+    // them after every hunk has been applied. This avoids treating a hunk that
+    // became the last range only because a later hunk deleted its tail as an
+    // EOF marker. The marker has already removed the structural LF from its
+    // preceding side line, so the resulting records can be concatenated as-is.
+    let final_line_count = result.len();
+    if result
+        .iter()
+        .take(final_line_count.saturating_sub(1))
+        .any(|line| !line.ends_with('\n'))
+    {
+        return Err(FsError::Patch(
+            "unterminated line may only appear at the end of the file".into(),
+        ));
+    }
+    for hunk in hunks {
+        let new_touches_eof = if hunk.new_count == 0 {
+            hunk.new_start == final_line_count
+        } else {
+            hunk.new_start
+                .checked_sub(1)
+                .and_then(|start| start.checked_add(hunk.new_count))
+                .is_some_and(|end| end == final_line_count)
+        };
+        if hunk.new_no_newline && (!new_touches_eof || hunk.new_count == 0) {
+            return Err(FsError::Patch(
+                "new newline marker does not describe the end of the file".into(),
+            ));
+        }
     }
     Ok(result)
 }
