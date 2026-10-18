@@ -1661,6 +1661,26 @@ const DEVICE_METADATA_BODY_MAX_BYTES = 4 * 1024;
 const DEVICE_NAME_MAX_BYTES = 128;
 const DEVICE_LABEL_MAX_BYTES = 64;
 const DEVICE_LABELS_MAX = 16;
+
+/** Device REST has the same wire budget as OAuth/MCP, before JSON parsing. */
+async function readDeviceBody<T>(req: Request, allowMalformed = false): Promise<T | Response> {
+  let body: unknown;
+  try {
+    body = await readRequestJsonLimited<unknown>(req);
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      return json({ error: "request_too_large" }, { status: 413 });
+    }
+    // Legacy POST revoke permits an empty/malformed body with a query id.
+    // Overflow must never be reinterpreted as that fallback.
+    if (allowMalformed && error instanceof SyntaxError) return {} as T;
+    return json({ error: "invalid_request", field: "body" }, { status: 400 });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return json({ error: "invalid_request", field: "body" }, { status: 400 });
+  }
+  return body as T;
+}
 const UNICODE_CONTROL = /\p{Cc}/u;
 
 function normalizeDeviceName(value: unknown): string | null {
@@ -1815,7 +1835,7 @@ export async function handleDevices(
     if (!requireScope(rec.scope, "ownmesh.device")) {
       return json({ error: "insufficient_scope" }, { status: 403 });
     }
-    const body = (await req.json()) as {
+    const body = await readDeviceBody<{
       name?: string;
       hostname?: string;
       os?: string;
@@ -1824,7 +1844,8 @@ export async function handleDevices(
       protocol_version?: string;
       public_key?: string;
       labels?: unknown;
-    };
+    }>(req);
+    if (body instanceof Response) return body;
     if (!body.public_key || !/^[0-9a-fA-F]{64}$/.test(body.public_key)) {
       return json({ error: "invalid_request", field: "public_key" }, { status: 400 });
     }
@@ -1923,11 +1944,12 @@ export async function handleDevices(
   }
 
   if (url.pathname === "/v1/devices/enroll/proof" && req.method === "POST") {
-    const body = (await req.json()) as {
+    const body = await readDeviceBody<{
       device_id?: string;
       challenge_id?: string;
       signature?: string;
-    };
+    }>(req);
+    if (body instanceof Response) return body;
     if (!body.device_id || !body.challenge_id || !body.signature) {
       return json({ error: "invalid_request" }, { status: 400 });
     }
@@ -1974,7 +1996,8 @@ export async function handleDevices(
   ) {
     let id = url.searchParams.get("id") || "";
     if (req.method === "POST") {
-      const body = (await req.json().catch(() => ({}))) as { id?: string };
+      const body = await readDeviceBody<{ id?: string }>(req, true);
+      if (body instanceof Response) return body;
       id = body.id || id;
     }
     if (!id) return json({ error: "invalid_request" }, { status: 400 });

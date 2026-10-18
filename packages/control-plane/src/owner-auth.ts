@@ -23,6 +23,7 @@ import {
   nowIso,
   randomToken,
   readRequestJsonLimited,
+  readRequestTextLimited,
   sha256Hex,
 } from "./util.ts";
 
@@ -424,10 +425,7 @@ async function boundedForm(request: Request): Promise<URLSearchParams | null> {
   if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/x-www-form-urlencoded")) {
     return null;
   }
-  const declared = Number(request.headers.get("content-length") || "0");
-  if (Number.isFinite(declared) && declared > MAX_FORM_BYTES) return null;
-  const body = await request.text();
-  if (new TextEncoder().encode(body).byteLength > MAX_FORM_BYTES) return null;
+  const body = await readRequestTextLimited(request, MAX_FORM_BYTES);
   return new URLSearchParams(body);
 }
 
@@ -1147,7 +1145,13 @@ export async function handleChatGptConnector(
   if (!sameOriginBrowserPost(request, issuer)) {
     return json({ error: "origin_not_allowed" }, { status: 403, noStore: true });
   }
-  const form = await boundedForm(request);
+  let form: URLSearchParams | null;
+  try {
+    form = await boundedForm(request);
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) return json({ error: "request_too_large" }, { status: 413, noStore: true });
+    throw error;
+  }
   if (!form) return json({ error: "invalid_request" }, { status: 400, noStore: true });
   const csrf = form.get("csrf_token") || "";
   const csrfCookie = cookieValue(request, CSRF_COOKIE) || "";

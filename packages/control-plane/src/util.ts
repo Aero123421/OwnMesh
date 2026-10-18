@@ -1,7 +1,7 @@
 /** Shared helpers for the OwnMesh control plane. */
 
 export const SERVICE_NAME = "ownmesh-control-plane";
-export const SERVICE_VERSION = "1.2.33";
+export const SERVICE_VERSION = "1.2.34";
 
 /** OAuth/token/device responses must not be stored by shared caches (RFC 9700). */
 export const NO_STORE_CACHE_CONTROL = "no-store, no-cache";
@@ -164,6 +164,19 @@ export async function readRequestJsonLimited<
   const text = await readRequestTextLimited(req, maxBytes);
   if (!text) return {} as T;
   return JSON.parse(text) as T;
+}
+
+/** Bound raw bytes before the runtime buffers/decodes form fields or files.
+ * Native parsing preserves multipart and repeated batch transaction fields.
+ */
+export async function readRequestFormDataLimited(
+  req: Request,
+  maxBytes: number = MAX_REQUEST_BODY_BYTES,
+): Promise<FormData> {
+  const bytes = await readRequestBytesLimited(req, maxBytes);
+  return new Response(new Uint8Array(bytes), {
+    headers: { "content-type": req.headers.get("content-type") || "" },
+  }).formData();
 }
 
 export class UnsupportedMediaTypeError extends Error {

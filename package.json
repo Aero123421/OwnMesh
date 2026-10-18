@@ -1,12 +1,17 @@
 {
   "name": "ownmesh",
   "private": true,
-  "version": "1.2.33",
+  "version": "1.2.34",
   "description": "OwnMesh monorepo — capability runtime for user-owned PCs",
   "license": "Apache-2.0",
   "packageManager": "pnpm@9.15.0",
   "engines": {
     "node": ">=22.6"
+  },
+  "pnpm": {
+    "overrides": {
+      "miniflare>sharp": "0.35.5"
+    }
   },
   "scripts": {
     "typecheck": "pnpm -r typecheck",

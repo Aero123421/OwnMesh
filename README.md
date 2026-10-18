@@ -188,6 +188,7 @@ See [CONTRIBUTING](./CONTRIBUTING.md) for setup and PR expectations.
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [Roadmap](./docs/ROADMAP.md) — what is planned next, and what is not
+- [v1.2.34 release notes](./docs/RELEASE_NOTES_v1.2.34.md)
 - [v1.2.33 release notes](./docs/RELEASE_NOTES_v1.2.33.md)
 - [Target specification](./OWNMESH_SPECIFICATION.ja.md) — roadmap authority,
   not a claim that every optional target is shipped
