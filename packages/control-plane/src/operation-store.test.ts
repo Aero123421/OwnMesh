@@ -703,6 +703,35 @@ test("prune carries the cycle's next expiry across pages", async () => {
   assert.equal(await storage.get("dxnext:v1:ten_ops"), undefined);
 });
 
+test("prune preserves an early-page expiry that becomes due before the scan wraps", async () => {
+  const storage = new InMemoryDeviceOpStorage();
+  const log = new DeviceOperationLog(storage, 100);
+  const now = Date.now();
+  const soon = new Date(now - MCP_OPS_RESULT_TTL_MS + 1_000).toISOString();
+  await log.put({
+    ...makeOp("a_terminal", ""),
+    status: "completed",
+    idempotency_key: null,
+    created_at: soon,
+    updated_at: soon,
+  });
+  await log.put(makeOp("b_live"));
+  await log.put(makeOp("c_live"));
+
+  const first = await log.prune("ten_ops", now, 2);
+  assert.equal(first.hasMore, true);
+  assert.equal(first.nextExpiryMs, null);
+  const last = await log.prune("ten_ops", now + 2_000, 2);
+  assert.equal(last.hasMore, false);
+  assert.equal(last.nextExpiryMs, now + 1_000, "a due expiry must request another alarm pass");
+  assert.notEqual(await log.get("a_terminal", "ten_ops"), null);
+
+  const cleanup = await log.prune("ten_ops", now + 3_000, 10);
+  assert.equal(cleanup.deleted, 1);
+  assert.equal(await log.get("a_terminal", "ten_ops"), null);
+  assert.equal(cleanup.nextExpiryMs, null, "pending-only rows must not keep an idle alarm alive");
+});
+
 test("alarm reschedules at the next expiry after a zero-deletion pass", async () => {
   const state = fakeDoStateWithAlarms();
   const room = new OperationRoom(

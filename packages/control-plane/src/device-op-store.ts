@@ -449,11 +449,11 @@ export class DeviceOperationLog {
     }
     stats.hasMore = !opsComplete;
     if (opsComplete) {
-      // The full keyspace was scanned across this cycle: report the cycle's
-      // earliest future eligibility (a past value means the backing row was
-      // removed elsewhere) and start a fresh cycle.
-      stats.nextExpiryMs =
-        mergedExpiry !== null && mergedExpiry > now ? mergedExpiry : null;
+      // A row scanned on an earlier page can become due before this cycle
+      // wraps. Preserve that expiry: alarm() clamps overdue work to a short
+      // follow-up, whose fresh scan can remove it. A stale carry only costs
+      // one extra pass and must never stop retention for a still-live row.
+      stats.nextExpiryMs = mergedExpiry;
       await this.writeCursor(tenantId, "ops", "");
       await this.writeNextExpiry(tenantId, null);
     } else {
