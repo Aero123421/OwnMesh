@@ -127,7 +127,8 @@ test("sensitive OAuth endpoints set Cache-Control: no-store, no-cache", async ()
         encodeURIComponent(clientId) +
         "&redirect_uri=" +
         encodeURIComponent("http://127.0.0.1:8750/callback") +
-        "&code_challenge=challenge_abc&code_challenge_method=S256&scope=ownmesh.read",
+        "&code_challenge=challenge_abc&code_challenge_method=S256&scope=ownmesh.read&resource=" +
+        encodeURIComponent("https://cp.test/mcp"),
     ),
     store,
     "https://cp.test",

@@ -2,11 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { __test, MCP_TOOLS } from "./index.ts";
 import {
+  canonicalMcpResource,
+  consentClientProvenance,
+  consentDisplayName,
   handleAuthorize,
+  handleDeviceAuthorization,
   handleRegister,
   handleToken,
   isAllowedCimdClientId,
+  isLoopbackRedirectUri,
+  normalizeOAuthResource,
   oauthMetadata,
+  redirectMatchesAny,
+  redirectMatchesRegistration,
 } from "./oauth.ts";
 import { chatGptOAuthPair } from "./owner-auth.ts";
 import { MemoryStore } from "./store.ts";
@@ -121,7 +129,7 @@ test("redirect_uri exact match enforced on authorize", async () => {
 
   const bad = await handleAuthorize(
     new Request(
-      "https://cp.test/oauth/authorize?response_type=code&client_id=client_exact&redirect_uri=http://evil.example/cb&code_challenge=abc&code_challenge_method=S256&scope=ownmesh.read",
+      "https://cp.test/oauth/authorize?response_type=code&client_id=client_exact&redirect_uri=http://evil.example/cb&code_challenge=abc&code_challenge_method=S256&scope=ownmesh.read&resource=https%3A%2F%2Fcp.test%2Fmcp",
     ),
     store,
     "https://cp.test",
@@ -132,7 +140,7 @@ test("redirect_uri exact match enforced on authorize", async () => {
 
   const good = await handleAuthorize(
     new Request(
-      "https://cp.test/oauth/authorize?response_type=code&client_id=client_exact&redirect_uri=http://127.0.0.1:8750/callback&code_challenge=abc&code_challenge_method=S256&scope=ownmesh.read&auto=1",
+      "https://cp.test/oauth/authorize?response_type=code&client_id=client_exact&redirect_uri=http://127.0.0.1:8750/callback&code_challenge=abc&code_challenge_method=S256&scope=ownmesh.read&auto=1&resource=https%3A%2F%2Fcp.test%2Fmcp",
     ),
     store,
     "https://cp.test",
@@ -166,7 +174,7 @@ test("authorization_code + PKCE S256 exchange", async () => {
   });
   const authRes = await handleAuthorize(
     new Request(
-      `https://cp.test/oauth/authorize?response_type=code&client_id=client_pkce&redirect_uri=${encodeURIComponent("http://127.0.0.1:8750/callback")}&code_challenge=${challenge}&code_challenge_method=S256&scope=ownmesh.read offline_access&auto=1`,
+      `https://cp.test/oauth/authorize?response_type=code&client_id=client_pkce&redirect_uri=${encodeURIComponent("http://127.0.0.1:8750/callback")}&code_challenge=${challenge}&code_challenge_method=S256&scope=ownmesh.read offline_access&auto=1&resource=${encodeURIComponent("https://cp.test/mcp")}`,
     ),
     store,
     "https://cp.test",
@@ -183,7 +191,7 @@ test("authorization_code + PKCE S256 exchange", async () => {
         redirect_uri: "http://127.0.0.1:8750/callback",
         client_id: "client_pkce",
         code_verifier: verifier,
-      }),
+        resource: "https://cp.test/mcp",}),
     }),
     store,
   );
@@ -220,7 +228,7 @@ test("authorization code binding mismatch does not burn the code", async () => {
       grant_type: "authorization_code", code: "ac_retry",
       redirect_uri: "http://127.0.0.1:8750/callback", client_id: "client_retry",
       code_verifier: "1123456789012345678901234567890123456789013",
-    }),
+        resource: "https://cp.test/mcp",}),
   }), store);
   assert.equal(wrong.status, 400);
   assert.deepEqual(await wrong.json(), { error: "invalid_grant" });
@@ -232,7 +240,7 @@ test("authorization code binding mismatch does not burn the code", async () => {
       grant_type: "authorization_code", code: "ac_retry",
       redirect_uri: "http://127.0.0.1:8750/callback", client_id: "client_retry",
       code_verifier: verifier,
-    }),
+        resource: "https://cp.test/mcp",}),
   }), store);
   assert.equal(correct.status, 200);
 });
@@ -254,7 +262,8 @@ test("authorization code concurrent valid redemption succeeds exactly once", asy
   const makeRequest = () => new Request("https://cp.test/oauth/token", {
     method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "authorization_code", code: "ac_race",
-      redirect_uri: "http://127.0.0.1:8750/callback", client_id: "client_race", code_verifier: verifier }),
+      redirect_uri: "http://127.0.0.1:8750/callback", client_id: "client_race", code_verifier: verifier,
+        resource: "https://cp.test/mcp",}),
   });
   const responses = await Promise.all([handleToken(makeRequest(), store), handleToken(makeRequest(), store)]);
   assert.deepEqual(responses.map((response) => response.status).sort(), [200, 400]);
@@ -332,7 +341,7 @@ test("ChatGPT DCR and stable CIMD authorization receive refresh tokens without o
           redirect_uri: redirectUri,
           client_id: clientId,
           code_verifier: verifier,
-        }),
+        resource: "https://cp.test/mcp",}),
       }),
       store,
     );
@@ -568,7 +577,7 @@ test("token endpoint rejects body client_secret (client_secret_post)", async () 
         client_id: "client_pkce",
         code_verifier: "0123456789012345678901234567890123456789013",
         client_secret: "super-secret",
-      }),
+        resource: "https://cp.test/mcp",}),
     }),
     store,
   );
@@ -674,7 +683,7 @@ test("CIMD registration is bounded, exact, and rejects metadata substitution", a
       scope: "ownmesh.read",
       code_challenge: "A".repeat(43),
       code_challenge_method: "S256",
-    })}`,
+    })}&resource=${encodeURIComponent("https://cp.test/mcp")}`,
   );
   const response = await handleAuthorize(request, store, "https://cp.test", {
     principal: { id: "prin_owner", tenant_id: "ten_default" },
@@ -691,7 +700,7 @@ test("CIMD registration is bounded, exact, and rejects metadata substitution", a
       decision: "approve",
       transaction_id: transactionId,
       csrf_token: csrfToken,
-    })}`, { method: "POST" }),
+    })}&resource=${encodeURIComponent("https://cp.test/mcp")}`, { method: "POST" }),
     store,
     "https://cp.test",
     {
@@ -756,7 +765,7 @@ test("CIMD negotiates the plural token auth capability list over the legacy pref
       scope: "ownmesh.read offline_access",
       code_challenge: "A".repeat(43),
       code_challenge_method: "S256",
-    })}`,
+    })}&resource=${encodeURIComponent("https://cp.test/mcp")}`,
   );
 
   const currentChatGptMetadata = {
@@ -824,7 +833,7 @@ test("CIMD URL policy rejects local/private identifiers and OAuth responses incl
       code_challenge: "A".repeat(43),
       code_challenge_method: "S256",
       auto: "1",
-    })}`),
+    })}&resource=${encodeURIComponent("https://cp.test/mcp")}`),
     store,
     "https://cp.test",
     { principal: { id: "prin_owner", tenant_id: "ten_default" }, allowDevBypass: true },
@@ -885,4 +894,410 @@ test("AS metadata advertises only token_endpoint_auth_method none", () => {
       `must not advertise ${method}`,
     );
   }
+});
+
+test("Issue #198: generic CIMD client consent never claims ChatGPT", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: "client_claude_like",
+    tenant_id: "ten_default",
+    client_name: "Claude Code",
+    redirect_uris: ["http://127.0.0.1:53127/callback"],
+    created_at: new Date().toISOString(),
+  });
+  const res = await handleAuthorize(
+    new Request(
+      "https://cp.test/oauth/authorize?response_type=code&client_id=client_claude_like&redirect_uri=http://127.0.0.1:53127/callback&code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&code_challenge_method=S256&scope=ownmesh.read&resource=https%3A%2F%2Fcp.test%2Fmcp",
+    ),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" } },
+  );
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.match(page, /Claude Code/);
+  assert.doesNotMatch(page, /ChatGPT/);
+  // Provenance + exact redirect host/port are shown separately, with a
+  // loopback warning per MCP localhost guidance.
+  assert.match(page, /127\.0\.0\.1/);
+  assert.match(page, /53127/);
+  assert.match(page, /registered|CIMD/);
+  assert.match(page, /Loopback redirect/);
+});
+
+test("Issue #198: ChatGPT stateless path keeps accurate ChatGPT copy", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const clientId = "https://chatgpt.com/oauth/client.json";
+  const redirect = "https://chatgpt.com/connector_platform_oauth_redirect";
+  await store.putClient({
+    client_id: clientId,
+    tenant_id: "ten_default",
+    client_name: "ChatGPT",
+    redirect_uris: [redirect],
+    created_at: new Date().toISOString(),
+  });
+  const res = await handleAuthorize(
+    new Request(
+      `https://cp.test/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirect)}&code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&code_challenge_method=S256&scope=ownmesh.read&resource=${encodeURIComponent("https://cp.test/mcp")}`,
+    ),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" } },
+  );
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.match(page, /ChatGPT/);
+});
+
+test("Issue #198: consent helpers bound names and classify provenance", () => {
+  assert.equal(consentDisplayName("Claude Code", "https://claude.ai/oauth/x"), "Claude Code");
+  assert.equal(consentDisplayName("", "https://claude.ai/oauth/x"), "claude.ai");
+  assert.equal(consentDisplayName(undefined, "client_opaque_123"), "client_opaque_123");
+  // Control characters stripped, length bounded.
+  assert.equal(consentDisplayName("a<b>\u0000c".repeat(30), "fallback"), "a<b>c".repeat(30).slice(0, 64));
+  // Untrusted HTML is escaped at render (helper returns raw bounded string).
+  assert.ok(consentDisplayName("<script>", "x").includes("<script>"));
+  assert.equal(consentClientProvenance("https://chatgpt.com/oauth/client.json", "https://chatgpt.com/connector_platform_oauth_redirect"), "chatgpt");
+  assert.equal(consentClientProvenance("https://claude.ai/oauth/claude-code-client-metadata", "http://127.0.0.1:53127/callback"), "cimd");
+  assert.equal(consentClientProvenance("client_opaque_123", "https://client.example/callback"), "registered");
+  assert.equal(isLoopbackRedirectUri("http://127.0.0.1:53127/callback"), true);
+  assert.equal(isLoopbackRedirectUri("http://localhost:8080/callback"), true);
+  assert.equal(isLoopbackRedirectUri("https://client.example/callback"), false);
+});
+
+test("Issue #197: loopback ephemeral ports match, everything else stays exact", () => {
+  // CIMD portless declaration accepts an ephemeral runtime port.
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1/callback", "http://127.0.0.1:53127/callback"), true);
+  assert.equal(redirectMatchesRegistration("http://localhost/callback", "http://localhost:49231/callback"), true);
+  assert.equal(redirectMatchesRegistration("http://[::1]/callback", "http://[::1]:51234/callback"), true);
+  // Same port still matches (byte-exact fast path).
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1:8750/callback", "http://127.0.0.1:8750/callback"), true);
+  // Different path / query / scheme / host are rejected.
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1/callback", "http://127.0.0.1:53127/other"), false);
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1/callback?a=1", "http://127.0.0.1:53127/callback"), false);
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1/callback", "https://127.0.0.1:53127/callback"), false);
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1/callback", "http://localhost:53127/callback"), false);
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1/callback", "http://127.0.0.1:53127/callback#frag"), false);
+  // HTTPS never gets port-wildcard behavior.
+  assert.equal(redirectMatchesRegistration("https://client.example/callback", "https://client.example:8443/callback"), false);
+  assert.equal(redirectMatchesRegistration("https://client.example/callback", "https://evil.example/callback"), false);
+  // userinfo never matches.
+  assert.equal(redirectMatchesRegistration("http://127.0.0.1/callback", "http://user@127.0.0.1:53127/callback"), false);
+  assert.equal(redirectMatchesAny(["https://a.example/cb", "http://127.0.0.1/callback"], "http://127.0.0.1:53127/callback"), true);
+  assert.equal(redirectMatchesAny(["https://a.example/cb"], "http://127.0.0.1:53127/callback"), false);
+});
+
+test("Issue #197: CIMD Claude Code ephemeral port completes authorize without fixed port", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const clientId = "https://claude.ai/oauth/claude-code-client-metadata";
+  const fetchClientMetadata = (async () => new Response(JSON.stringify({
+    client_id: clientId,
+    client_name: "Claude Code",
+    redirect_uris: ["http://127.0.0.1/callback", "http://localhost/callback"],
+    token_endpoint_auth_method: "none",
+  }), { headers: { "content-type": "application/json" } })) as typeof fetch;
+  const res = await handleAuthorize(
+    new Request(
+      `https://cp.test/oauth/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent("http://127.0.0.1:53127/callback")}&code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&code_challenge_method=S256&scope=ownmesh.read&resource=${encodeURIComponent("https://cp.test/mcp")}`,
+    ),
+    store,
+    "https://cp.test",
+    {
+      principal: { id: "prin_owner", tenant_id: "ten_default" },
+      fetchClientMetadata,
+    },
+  );
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.match(page, /Claude Code/);
+  assert.match(page, /53127/);
+  // Token exchange still requires the exact runtime URI bound to the code.
+  const txMatch = /name="transaction_id" value="([^"]+)"/.exec(page);
+  const csrfMatch = /name="csrf_token" value="([^"]+)"/.exec(page);
+  assert.ok(txMatch?.[1] && csrfMatch?.[1]);
+  const approve = await handleAuthorize(
+    new Request(`https://cp.test/oauth/authorize?decision=approve&transaction_id=${txMatch![1]}&csrf_token=${csrfMatch![1]}&resource=${encodeURIComponent("https://cp.test/mcp")}`, { method: "POST" }),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" }, fetchClientMetadata },
+  );
+  assert.equal(approve.status, 302);
+  const code = new URL(approve.headers.get("location")!).searchParams.get("code")!;
+  assert.ok(code);
+  // Wrong port at redemption must fail (exact binding, no wildcard).
+  const badRedeem = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "http://127.0.0.1:9999/callback",
+        client_id: clientId,
+        code_verifier: "0123456789012345678901234567890123456789013",
+        resource: "https://cp.test/mcp",}),
+    }),
+    store,
+  );
+  assert.equal(badRedeem.status, 400);
+});
+
+test("Issue #195: resource binding is required and enforced end to end", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: "client_res",
+    tenant_id: "ten_default",
+    client_name: "res-test",
+    redirect_uris: ["http://127.0.0.1:8750/callback"],
+    created_at: new Date().toISOString(),
+  });
+  const verifierRes = "0123456789012345678901234567890123456789013";
+  const challengeRes = await pkceS256Challenge(verifierRes);
+  const base = `https://cp.test/oauth/authorize?response_type=code&client_id=client_res&redirect_uri=${encodeURIComponent("http://127.0.0.1:8750/callback")}&code_challenge=${challengeRes}&code_challenge_method=S256&scope=${encodeURIComponent("ownmesh.read offline_access")}`;
+  // Missing resource is rejected.
+  const missing = await handleAuthorize(
+    new Request(base),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" } },
+  );
+  assert.equal(missing.status, 400);
+  assert.equal(((await missing.json()) as { error: string }).error, "invalid_target");
+  // Wrong audience is rejected.
+  const wrongAud = await handleAuthorize(
+    new Request(`${base}&resource=${encodeURIComponent("https://cp.test/other")}`),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" } },
+  );
+  assert.equal(wrongAud.status, 400);
+  // Matching canonical succeeds.
+  const ok = await handleAuthorize(
+    new Request(`${base}&resource=${encodeURIComponent("https://cp.test/mcp")}`),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" } },
+  );
+  assert.equal(ok.status, 200);
+  const page = await ok.text();
+  const tx = /name="transaction_id" value="([^"]+)"/.exec(page)?.[1]!;
+  const csrf = /name="csrf_token" value="([^"]+)"/.exec(page)?.[1]!;
+  const approve = await handleAuthorize(
+    new Request(`https://cp.test/oauth/authorize?decision=approve&transaction_id=${tx}&csrf_token=${csrf}`, { method: "POST" }),
+    store,
+    "https://cp.test",
+    { principal: { id: "prin_owner", tenant_id: "ten_default" } },
+  );
+  assert.equal(approve.status, 302);
+  const code = new URL(approve.headers.get("location")!).searchParams.get("code")!;
+  // Token exchange without resource fails.
+  const noRes = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "http://127.0.0.1:8750/callback",
+        client_id: "client_res",
+        code_verifier: "0123456789012345678901234567890123456789013",
+      }),
+    }),
+    store,
+  );
+  assert.equal(noRes.status, 400);
+  // Token exchange with different resource fails without burning the code.
+  const diffRes = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "http://127.0.0.1:8750/callback",
+        client_id: "client_res",
+        code_verifier: "0123456789012345678901234567890123456789013",
+        resource: "https://cp.test/other",
+      }),
+    }),
+    store,
+  );
+  assert.equal(diffRes.status, 400);
+  // Matching resource redeems and binds the token.
+  const good = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "http://127.0.0.1:8750/callback",
+        client_id: "client_res",
+        code_verifier: "0123456789012345678901234567890123456789013",
+        resource: "https://cp.test/mcp",
+      }),
+    }),
+    store,
+  );
+  assert.equal(good.status, 200);
+  const tok = (await good.json()) as { access_token: string; refresh_token?: string; scope: string };
+  const stored = await store.getAccess(tok.access_token);
+  assert.equal(stored?.resource, "https://cp.test/mcp");
+  // Refresh preserves the audience and rejects switching it.
+  const switchAud = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: tok.refresh_token!,
+        resource: "https://cp.test/other",
+      }),
+    }),
+    store,
+  );
+  assert.equal(switchAud.status, 400);
+  const rotated = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: tok.refresh_token!,
+        resource: "https://cp.test/mcp",
+      }),
+    }),
+    store,
+  );
+  assert.equal(rotated.status, 200);
+  const tok2 = (await rotated.json()) as { access_token: string };
+  assert.equal((await store.getAccess(tok2.access_token))?.resource, "https://cp.test/mcp");
+});
+
+test("Issue #195: canonical resource normalization and MCP audience gate", async () => {
+  assert.equal(canonicalMcpResource("https://cp.test"), "https://cp.test/mcp");
+  assert.equal(canonicalMcpResource("https://cp.test/"), "https://cp.test/mcp");
+  assert.equal(normalizeOAuthResource("https://cp.test/mcp", "https://cp.test"), "https://cp.test/mcp");
+  assert.equal(normalizeOAuthResource("https://cp.test/mcp/", "https://cp.test"), null);
+  assert.equal(normalizeOAuthResource("https://cp.test/other", "https://cp.test"), null);
+  assert.equal(normalizeOAuthResource("https://evil.test/mcp", "https://cp.test"), null);
+  assert.equal(normalizeOAuthResource("", "https://cp.test"), null);
+  assert.equal(normalizeOAuthResource(null, "https://cp.test"), null);
+  // Protected Resource Metadata matches the enforced value.
+  const { protectedResourceMetadata } = await import("./oauth.ts");
+  assert.equal(protectedResourceMetadata("https://cp.test/mcp", "https://cp.test").resource, "https://cp.test/mcp");
+  // A token minted for another audience is rejected at /mcp.
+  const { handleMcp, OperationTracker } = await import("./mcp.ts");
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: "client_aud",
+    tenant_id: "ten_default",
+    client_name: "aud",
+    redirect_uris: ["https://client.example/callback"],
+    created_at: new Date().toISOString(),
+  });
+  const bad = await store.issueTokens("client_aud", "prin_dev", "ownmesh.read ownmesh.device", undefined, undefined, undefined, "https://cp.test/other");
+  const res = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${bad.access_token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "ownmesh_list_devices", arguments: {} } }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test", tracker: new OperationTracker() },
+  );
+  assert.equal(res.status, 401);
+  // Unbound legacy tokens stay usable (compat until reauthorization).
+  const legacy = await store.issueTokens("client_aud", "prin_dev", "ownmesh.read ownmesh.device");
+  const legacyRes = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${legacy.access_token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test", tracker: new OperationTracker() },
+  );
+  assert.equal(legacyRes.status, 200);
+});
+
+test("Issue #195: device flow binds resource where supplied, stays compat otherwise", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: "client_devflow",
+    tenant_id: "ten_default",
+    client_name: "devflow",
+    redirect_uris: ["https://client.example/callback"],
+    created_at: new Date().toISOString(),
+  });
+  const form = (params: Record<string, string>) => new Request("https://cp.test/oauth/device_authorization", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(params),
+  });
+  // Invalid resource is rejected without creating a code.
+  const bad = await handleDeviceAuthorization(
+    form({ client_id: "client_devflow", scope: "ownmesh.read", resource: "https://cp.test/other" }),
+    store,
+    "https://cp.test",
+  );
+  assert.equal(bad.status, 400);
+  // Bound device code carries its audience.
+  const ok = await handleDeviceAuthorization(
+    form({ client_id: "client_devflow", scope: "ownmesh.read", resource: "https://cp.test/mcp" }),
+    store,
+    "https://cp.test",
+  );
+  assert.equal(ok.status, 200);
+  const dc = (await ok.json()) as { device_code: string; user_code: string };
+  assert.equal((await store.getDeviceCode(dc.device_code))?.resource, "https://cp.test/mcp");
+  // Unbound device authorization stays usable (migration compat).
+  const plain = await handleDeviceAuthorization(
+    form({ client_id: "client_devflow", scope: "ownmesh.read" }),
+    store,
+    "https://cp.test",
+  );
+  assert.equal(plain.status, 200);
+  const plainDc = (await plain.json()) as { device_code: string };
+  assert.equal(await store.getDeviceCode(plainDc.device_code).then((r) => r?.resource), undefined);
+  // Bound code exchange requires the same resource and binds the token.
+  await store.ensurePrincipal("prin_devflow", "prin_devflow");
+  assert.equal(await store.approveDeviceCode(dc.user_code, "prin_devflow"), true);
+  const tokenForm = (params: Record<string, string>) => new Request("https://cp.test/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(params),
+  });
+  const mismatch = await handleToken(
+    tokenForm({
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      device_code: dc.device_code,
+      client_id: "client_devflow",
+      resource: "https://cp.test/other",
+    }),
+    store,
+  );
+  assert.equal(mismatch.status, 400);
+  const exchanged = await handleToken(
+    tokenForm({
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      device_code: dc.device_code,
+      client_id: "client_devflow",
+      resource: "https://cp.test/mcp",
+    }),
+    store,
+  );
+  assert.equal(exchanged.status, 200);
+  const exchangedBody = (await exchanged.json()) as { access_token: string };
+  assert.equal((await store.getAccess(exchangedBody.access_token))?.resource, "https://cp.test/mcp");
 });

@@ -175,7 +175,7 @@ test("redirect_uri exact match still enforced (auth boundary)", async () => {
   });
   const bad = await handleAuthorize(
     new Request(
-      "https://cp.test/oauth/authorize?response_type=code&client_id=client_harden&redirect_uri=http://evil.example/cb&code_challenge=abc&code_challenge_method=S256&scope=ownmesh.read",
+      "https://cp.test/oauth/authorize?response_type=code&client_id=client_harden&redirect_uri=http://evil.example/cb&code_challenge=abc&code_challenge_method=S256&scope=ownmesh.read&resource=https%3A%2F%2Fcp.test%2Fmcp",
     ),
     store,
     "https://cp.test",
