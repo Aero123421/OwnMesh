@@ -36,7 +36,7 @@ approval binding, idempotency, and replay protection remain enforced.
 - ZIP 9.0.5 removes the vulnerable extraction dependency. OwnMesh continues
   to read bounded, allowlisted entries into memory rather than calling the
   library's filesystem extraction helpers.
-- Wrangler 4.148.0, matching Workers types, undici 7.29.1, and a scoped
+- Wrangler 4.149.0, matching Workers types, undici 7.29.1, and a scoped
   miniflare/sharp 0.35.5 override resolve known toolchain dependency advisories.
 - chacha20 0.10.2 replaces a yanked release with its SSE2-backend compatibility
   fix. No dependency-audit ignore or threshold relaxation is added.
