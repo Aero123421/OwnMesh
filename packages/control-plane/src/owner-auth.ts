@@ -4,7 +4,7 @@ import {
   verifyAuthenticationResponse,
   verifyRegistrationResponse,
   type AuthenticationResponseJSON,
-  type AuthenticatorTransportFuture,
+  type AuthenticatorTransport,
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 import type { ControlPlaneStore, OwnerAuthChallenge } from "./store.ts";
@@ -49,13 +49,11 @@ const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const MAX_FORM_BYTES = 8 * 1024;
 const MAX_PASSKEY_BODY_BYTES = 64 * 1024;
 const REGISTRATION_CHALLENGE_ID = "owner_registration";
-const ALLOWED_TRANSPORTS = new Set<AuthenticatorTransportFuture>([
+const ALLOWED_TRANSPORTS = new Set<AuthenticatorTransport>([
   "ble",
-  "cable",
   "hybrid",
   "internal",
   "nfc",
-  "smart-card",
   "usb",
 ]);
 
@@ -347,16 +345,20 @@ function base64UrlText(value: unknown, max: number): string | null {
   return text && /^[A-Za-z0-9_-]+$/.test(text) ? text : null;
 }
 
-function parseTransports(value: unknown): AuthenticatorTransportFuture[] | undefined {
+function parseTransports(value: unknown): AuthenticatorTransport[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length > 8) return undefined;
-  const transports: AuthenticatorTransportFuture[] = [];
+  const transports: AuthenticatorTransport[] = [];
   for (const item of value) {
-    if (typeof item === "string" && ALLOWED_TRANSPORTS.has(item as AuthenticatorTransportFuture)) {
-      transports.push(item as AuthenticatorTransportFuture);
+    // Older stored credentials used caBLE's former name. Other unsupported
+    // transport hints are omitted; the credential itself remains eligible.
+    const normalized = item === "cable" ? "hybrid" : item;
+    if (typeof normalized === "string" && ALLOWED_TRANSPORTS.has(normalized as AuthenticatorTransport)) {
+      const transport = normalized as AuthenticatorTransport;
+      if (!transports.includes(transport)) transports.push(transport);
     }
   }
-  return transports;
+  return transports.length ? transports : undefined;
 }
 
 function registrationResponse(value: unknown): RegistrationResponseJSON | null {

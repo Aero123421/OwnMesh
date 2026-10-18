@@ -110,7 +110,7 @@ async function ownerSessionCookie(): Promise<string> {
   return `__Host-ownmesh_owner=${body}.${base64Url(signature)}`;
 }
 
-async function seedPasskey(store: MemoryStore): Promise<void> {
+async function seedPasskey(store: MemoryStore, transports = ["internal"]): Promise<void> {
   await store.ensureBootstrap();
   await store.ensurePrincipal("prin_owner", "Owner", "human", "ten_default");
   assert.equal(await store.putInitialOwnerPasskey({
@@ -119,7 +119,7 @@ async function seedPasskey(store: MemoryStore): Promise<void> {
     webauthn_user_id: "d2ViYXV0aG5fb3duZXJfaWQ",
     public_key: new Uint8Array(64).fill(7),
     counter: 0,
-    transports: ["internal"],
+    transports,
     device_type: "multiDevice",
     backed_up: true,
     created_at: new Date().toISOString(),
@@ -180,6 +180,24 @@ test("registered owner signs in with only the stored passkey", async () => {
   const body = await options.json() as { options: { allowCredentials: Array<{ id: string }> } };
   assert.deepEqual(body.options.allowCredentials.map((item) => item.id), [CREDENTIAL_ID]);
   assert.equal(store.ownerAuthChallenges.size, 1);
+});
+
+test("legacy passkey transports remain usable with WebAuthn 14", async () => {
+  for (const [stored, expected] of [
+    [["cable", "hybrid", "usb"], ["hybrid", "usb"]],
+    [["smart-card", "unknown"], undefined],
+  ] as Array<[string[], string[] | undefined]>) {
+    const store = new MemoryStore();
+    await seedPasskey(store, stored);
+    const response = await handleOwnerPasskeyOptions(
+      jsonRequest("/auth/passkey/options", {}), store, ISSUER, await env(),
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json() as { options: { allowCredentials: Array<{ id: string; transports?: string[] }> } };
+    assert.equal(body.options.allowCredentials[0]?.id, CREDENTIAL_ID);
+    assert.deepEqual(body.options.allowCredentials[0]?.transports, expected);
+    assert.deepEqual((await store.getOwnerPasskey(CREDENTIAL_ID))?.transports, stored);
+  }
 });
 
 test("owner login localizes the primary passkey and recovery guidance", async () => {
