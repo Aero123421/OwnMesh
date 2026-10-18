@@ -15,15 +15,23 @@ changes an auth, policy, privilege, or protocol boundary, link the ADR under
 docs/adr/ — CONTRIBUTING.md requires one.
 -->
 
-## Checks
+## Test evidence
 
-- [ ] `cargo fmt --all --check`
-- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- [ ] `cargo test --workspace --all-targets --locked`
-- [ ] `pnpm -r test && pnpm -r typecheck && pnpm -r lint`
-- [ ] `python scripts/check_release_quality.py`
-- [ ] Shipped-surface changes are reflected in `release/SUPPORTED_SURFACES.json`
-- [ ] Behavior changes are covered by a test next to the behavior
+<!--
+Record what actually ran, not a fixed command checklist. CI provides
+cross-platform evidence; local runs provide focused evidence. See
+CONTRIBUTING.md test taxonomy and docs/ci-test-tiers.md.
+CodeRabbit review is requested automatically by CI (open/sync -> review,
+review-ready label -> full review); manual @coderabbitai calls are a
+fallback only. Labels: review-ready (full CI), hotfix (no exemption today),
+do-not-merge (blocks merge).
+-->
+
+- Suite / command:
+- OS / target:
+- Result:
+- Not run / reason:
+- Added test tier: unit | integration | platform | security | scale | e2e | release
 
 ## Commit authorship
 

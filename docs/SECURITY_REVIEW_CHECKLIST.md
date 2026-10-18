@@ -11,12 +11,12 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 
 - [x] Human、ChatGPT/OAuth client、Device、local IPC principal を別 identity として扱う  
   **Tests:** `packages/control-plane/src/oauth.test.ts`, `devices.test.ts`; `crates/ownmesh-ipc/src/auth.rs`; `crates/ownmesh/src/auth/tests/*`
-- [x] access token は短時間で audience/scope/tenant/client に binding される  
-  **Tests:** `packages/control-plane/src/oauth.test.ts`, `security-harden.test.ts`
+- [x] access token は短時間で audience (RFC 8707 `resource` = canonical `/mcp`)/scope/tenant/client に binding される  
+  **Tests:** `packages/control-plane/src/oauth.test.ts` (Issue #195 resource binding), `security-harden.test.ts`
 - [x] refresh token rotation と reuse detection がある  
   **Tests:** `packages/control-plane/src/oauth.test.ts` (`refresh token reuse is detected`)
-- [x] redirect URI exact match、PKCE、state、nonce を検証する  
-  **Tests:** `oauth.test.ts` (redirect exact match); CLI `crates/ownmesh/src/auth/tests/*` (PKCE)
+- [x] redirect URI match (HTTPS exact + loopback port flexibility per RFC 8252 §7.3)、PKCE、state、nonce を検証する  
+  **Tests:** `oauth.test.ts` (redirect matcher + CIMD ephemeral port); CLI `crates/ownmesh/src/auth/tests/*` (PKCE)
 - [x] device key は extract されにくい OS keystore に保存する  
   **Tests:** `crates/ownmesh-identity` store tests; CLI auth tests (refresh not in plaintext session file)
 - [x] device revoke と client token revoke が即時反映される  
@@ -171,7 +171,7 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 - [x] pagination/truncation で access boundary を越えない  
   **Tests:** mcp pagination/truncation unit tests
 - [x] OAuth scope と tool capability mapping を automated test する  
-  **Tests:** oauth scope + mcp tool authz tests
+  **Tests:** oauth scope + mcp tool authz tests (`mcp.test.ts` 403 `insufficient_scope` challenge with `WWW-Authenticate`)
 
 ## 10. Generic external CLI sessions
 
@@ -205,7 +205,7 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 - [x] rollback/freeze/expired metadata を扱う ⏸ **W-§14**
 - [x] update channel switching を認証・監査する ⏸ **W-§14**
 - [x] dependency audit、license review、SBOM を自動化する  
-  **CI:** `.github/workflows/security.yml` (`cargo-audit`, `pnpm audit`, SBOM jobs)
+  **CI:** `.github/workflows/security.yml` weekly deep (`cargo-audit`, `pnpm audit`, `sbom-weekly`) + `release.yml` exact-SHA `sbom-release`; PR fast subset in `ci.yml` `security-fast`
 - [x] CI provenance と release signing key 管理を文書化する  
   **Docs:** ADR-0001; SECURITY.md
 
@@ -227,7 +227,7 @@ Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort �
 ## 14. Release Gate
 
 - [x] Windows、macOS、Linux で threat-driven integration tests が通る  
-  **CI:** `.github/workflows/ci.yml` (Windows/macOS/Linux all required; Rust 1.92 locked gates)
+  **CI:** `.github/workflows/ci.yml` (`rust-linux` full + `platform-windows`/`platform-macos` compat/affected; `required` aggregator; see `docs/ci-test-tiers.md`)
 - [x] protocol、path、broker、session fuzzing の重大 crash がない
   **Tests:** fuzz harness + security_* suites
 - [x] critical/high vulnerability が解消または公開された受容判断を持つ  

@@ -48,6 +48,28 @@ export function secondsUntilUtcReset(nowMs = Date.now()): number {
   return Math.max(0, Math.floor((reset - nowMs) / 1000));
 }
 
+/**
+ * Issue #227 SHOULD-3: single Retry-After source for degraded 503s.
+ *
+ * D1 daily budget resets at UTC midnight (`BudgetState.resetAt`), so every
+ * OAuth/MCP `retry_after_seconds` is the clamped diff to that reset (cap
+ * 86400 so a far-future/malformed reset never pins a client). Callers without
+ * a budget (mid-exchange storage throw) pass the UTC-midnight ISO for the
+ * same instant — numerically identical to `secondsUntilUtcReset()` but
+ * truthful to the `reset_at` they also return. Missing/invalid/expired resets
+ * fall back to `secondsUntilUtcReset()` rather than a fixed 60s hint.
+ */
+export function retryAfterSecondsForReset(resetAt?: string, nowMs = Date.now()): number {
+  if (resetAt) {
+    const parsed = Date.parse(resetAt);
+    if (Number.isFinite(parsed)) {
+      const diff = Math.floor((parsed - nowMs) / 1000);
+      if (diff > 0) return Math.min(86400, diff);
+    }
+  }
+  return Math.min(86400, secondsUntilUtcReset(nowMs));
+}
+
 export function utcResetIso(nowMs = Date.now()): string {
   const now = new Date(nowMs);
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
