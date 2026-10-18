@@ -188,6 +188,7 @@ const SECURITY_SENSITIVE_FORM_FIELDS = new Set([
   "device_code", "user_code", "refresh_token", "token", "token_type_hint",
   "client_assertion", "client_assertion_type", "client_secret", "assertion",
   "username", "password", "transaction_id", "csrf", "csrf_token", "decision",
+  "resource",
 ]);
 
 function assertValidFormEncoding(text: string): void {
@@ -214,6 +215,10 @@ export async function readBody(req: Request): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   if (mediaType === "application/json" || mediaType.endsWith("+json")) {
     const body = await readRequestJsonLimited<Record<string, unknown>>(req);
+    // Note: duplicate JSON keys are last-wins per JSON.parse (unlike form
+    // bodies, which throw DuplicateFormFieldError for security-sensitive
+    // fields including `resource`). Callers re-validate the surviving value
+    // against the canonical audience, so a duplicated `resource` cannot bypass.
     for (const [k, v] of Object.entries(body)) {
       if (v === undefined || v === null) continue;
       out[k] = typeof v === "string" ? v : JSON.stringify(v);

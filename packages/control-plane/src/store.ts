@@ -113,6 +113,13 @@ export type TokenRecord = {
   refresh_family: string;
   refresh_used: boolean;
   tenant_id: string;
+  /**
+   * Issue #195: RFC 8707 resource / MCP audience binding.
+   * Canonical `https://<issuer>/mcp`. Absent only on pre-migration rows;
+   * new issuance always binds. MCP validation rejects a bound token whose
+   * audience differs from the canonical resource.
+   */
+  resource?: string;
 };
 
 /** Metadata for RFC 7009 revoke audit attribution (no token secret). */
@@ -188,6 +195,8 @@ export type AuthCodeRecord = {
   code_challenge_method: string;
   expires_at: number;
   used: boolean;
+  /** Issue #195: RFC 8707 resource preserved from authorize through redemption. */
+  resource?: string;
 };
 
 
@@ -207,6 +216,8 @@ export type DeviceCodeRecord = {
   status: "pending" | "approved" | "denied" | "expired" | "consumed";
   principal_id?: string;
   last_polled_at?: number;
+  /** Issue #195: resource binding for device flow where applicable. */
+  resource?: string;
 };
 
 export type DeviceVerificationTransaction = {
@@ -234,6 +245,8 @@ export type AuthorizeTransaction = {
   code_challenge_method: string;
   expires_at: number;
   consumed: boolean;
+  /** Issue #195: RFC 8707 resource requested at authorize, bound into the code. */
+  resource?: string;
 };
 
 export type DeviceCredentialRecord = {
@@ -897,6 +910,8 @@ export interface ControlPlaneStore {
     clientId: string;
     redirectUri: string;
     codeChallenge: string;
+    /** Issue #195: RFC 8707 resource that must equal the code's bound audience. */
+    resource?: string;
   }): Promise<AuthCodeRedemption>;
 
   issueTokens(
@@ -906,9 +921,10 @@ export interface ControlPlaneStore {
     family?: string,
     ttlMs?: number,
     refreshTtlMs?: number,
+    resource?: string,
   ): Promise<TokenRecord>;
   getAccess(token: string): Promise<TokenRecord | null>;
-  rotateRefresh(refreshToken: string): Promise<
+  rotateRefresh(refreshToken: string, expectedResource?: string): Promise<
     | { ok: true; token: TokenRecord }
     | { ok: false; error: "invalid_grant" | "reuse"; description?: string }
   >;
@@ -1014,6 +1030,20 @@ export interface ControlPlaneStore {
     tenantId: string;
     principalId: string;
     tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]>;
+  /**
+   * Issue #227: bounded recent-operation rediscovery when the client lost
+   * operation_id but remembers principal/tenant/device/idempotency/time.
+   * Tenant+principal isolated, newest first, never returns foreign rows.
+   */
+  listRecentMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    deviceId?: string;
+    tool?: string;
+    idempotencyKey?: string;
+    since?: string;
     limit?: number;
   }): Promise<McpOperationRecord[]>;
   /**
@@ -1332,11 +1362,11 @@ const SCHEMA_READINESS_OBJECTS: Record<
   },
   oauth_tokens_refresh_lifetime: {
     table: "oauth_tokens",
-    columns: ["refresh_expires_at"],
+    columns: ["refresh_expires_at", "resource"],
   },
   oauth_tokens_auth_code_redemption: {
     table: "oauth_tokens",
-    columns: ["auth_code_hash"],
+    columns: ["auth_code_hash", "resource"],
     indexes: ["idx_oauth_tokens_auth_code_hash"],
   },
   oauth_auth_codes: {
@@ -1352,6 +1382,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "expires_at",
       "used",
       "created_at",
+      "resource",
     ],
     indexes: ["idx_auth_codes_client"],
   },
@@ -1369,6 +1400,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "principal_id",
       "last_polled_at",
       "created_at",
+      "resource",
     ],
     indexes: ["idx_device_codes_user"],
   },
@@ -1444,6 +1476,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "expires_at",
       "consumed",
       "created_at",
+      "resource",
     ],
     indexes: ["idx_authorize_tx_principal", "idx_authorize_tx_expires"],
   },
@@ -1817,7 +1850,7 @@ export class MemoryStore implements ControlPlaneStore {
     this.authCodes.set(code.code, { ...code });
   }
   async redeemAuthCode(input: {
-    code: string; clientId: string; redirectUri: string; codeChallenge: string;
+    code: string; clientId: string; redirectUri: string; codeChallenge: string; resource?: string;
   }): Promise<AuthCodeRedemption> {
     // This method intentionally contains no await before its commit point. In
     // the in-memory conformance store, validation, single-use consumption, and
@@ -1830,6 +1863,12 @@ export class MemoryStore implements ControlPlaneStore {
       rec.code_challenge !== input.codeChallenge ||
       rec.code_challenge_method !== "S256"
     ) {
+      return { status: "invalid_grant" };
+    }
+    // Issue #195: a bound code requires the same resource at redemption.
+    // Legacy codes without a binding stay redeemable for migration compat;
+    // new codes always carry one (see handleAuthorize).
+    if (rec.resource !== undefined && input.resource !== rec.resource) {
       return { status: "invalid_grant" };
     }
     const principalRecord = this.principals.get(rec.principal_id);
@@ -1852,6 +1891,7 @@ export class MemoryStore implements ControlPlaneStore {
       refresh_family: randomToken("fam_"),
       refresh_used: false,
       tenant_id: principalRecord.tenant_id,
+      ...(rec.resource !== undefined ? { resource: rec.resource } : {}),
     };
 
     rec.used = true;
@@ -1868,6 +1908,7 @@ export class MemoryStore implements ControlPlaneStore {
     family?: string,
     ttlMs = ACCESS_TOKEN_TTL_MS,
     refreshTtlMs = REFRESH_TOKEN_IDLE_TTL_MS,
+    resource?: string,
   ): Promise<TokenRecord> {
     const principalRecord = (await this.getPrincipal(principal)) || await this.ensurePrincipal(principal, principal);
     const access = randomToken("atk_");
@@ -1884,6 +1925,7 @@ export class MemoryStore implements ControlPlaneStore {
       refresh_family: family || randomToken("fam_"),
       refresh_used: false,
       tenant_id: principalRecord.tenant_id,
+      ...(resource !== undefined ? { resource } : {}),
     };
     this.tokensByAccess.set(access, rec);
     if (!rec.revoked) this.accessByRefresh.set(refresh, access);
@@ -1897,7 +1939,7 @@ export class MemoryStore implements ControlPlaneStore {
     return rec;
   }
 
-  async rotateRefresh(refreshToken: string): Promise<
+  async rotateRefresh(refreshToken: string, expectedResource?: string): Promise<
     | { ok: true; token: TokenRecord }
     | { ok: false; error: "invalid_grant" | "reuse"; description?: string }
   > {
@@ -1965,6 +2007,11 @@ export class MemoryStore implements ControlPlaneStore {
     const old = this.tokensByAccess.get(access);
     if (!old || old.revoked) return { ok: false, error: "invalid_grant" };
     if (now > old.refresh_expires_at) return { ok: false, error: "invalid_grant" };
+    // Issue #195: refresh cannot switch audience. A bound family preserves its
+    // resource; an explicit different resource fails without consuming.
+    if (expectedResource !== undefined && old.resource !== undefined && expectedResource !== old.resource) {
+      return { ok: false, error: "invalid_grant" };
+    }
     if (old.refresh_used) {
       this.compromisedRefreshFamilies.add(old.refresh_family);
       for (const [k, v] of this.tokensByAccess) {
@@ -2007,6 +2054,7 @@ export class MemoryStore implements ControlPlaneStore {
       refresh_family: old.refresh_family,
       refresh_used: false,
       tenant_id: principalRecord?.tenant_id ?? DEFAULT_TENANT,
+      ...(old.resource !== undefined ? { resource: old.resource } : {}),
     };
     this.tokensByAccess.set(nextAccess, next);
     if (!next.revoked) this.accessByRefresh.set(nextRefresh, nextAccess);
@@ -2440,6 +2488,31 @@ export class MemoryStore implements ControlPlaneStore {
     const limit = Math.max(1, Math.min(this.mcpOpsLimit, Math.trunc(opts.limit ?? this.mcpOpsLimit)));
     return [...this.mcpOperations.values()]
       .filter((op) => op.tenant_id === opts.tenantId && op.principal_id === opts.principalId && op.tool === opts.tool)
+      .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id))
+      .slice(0, limit)
+      .map((op) => ({
+        ...op,
+        data: { ...op.data },
+        warnings: [...op.warnings],
+        action: op.action ? { ...op.action } : op.action,
+      }));
+  }
+  async listRecentMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    deviceId?: string;
+    tool?: string;
+    idempotencyKey?: string;
+    since?: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(50, Math.trunc(opts.limit ?? 20)));
+    return [...this.mcpOperations.values()]
+      .filter((op) => op.tenant_id === opts.tenantId && op.principal_id === opts.principalId)
+      .filter((op) => !opts.deviceId || (op.device_id ?? "") === opts.deviceId)
+      .filter((op) => !opts.tool || op.tool === opts.tool)
+      .filter((op) => !opts.idempotencyKey || (op.idempotency_key ?? "") === opts.idempotencyKey)
+      .filter((op) => !opts.since || op.created_at >= opts.since)
       .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id))
       .slice(0, limit)
       .map((op) => ({
@@ -3626,8 +3699,8 @@ export class SqlStore implements ControlPlaneStore {
     const hash = await sha256Hex(code.code);
     await this.prepare("oauth.code.insert",
         `INSERT INTO oauth_auth_codes
-         (code_hash, client_id, principal_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, used, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+         (code_hash, client_id, principal_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, used, created_at, resource)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
       )
       .bind(
         hash,
@@ -3639,12 +3712,13 @@ export class SqlStore implements ControlPlaneStore {
         code.code_challenge_method,
         nowIso(code.expires_at),
         nowIso(),
+        code.resource ?? null,
       )
       .run();
   }
 
   async redeemAuthCode(input: {
-    code: string; clientId: string; redirectUri: string; codeChallenge: string;
+    code: string; clientId: string; redirectUri: string; codeChallenge: string; resource?: string;
   }): Promise<AuthCodeRedemption> {
     if (!this.db.batch) {
       throw new Error("SqlStore.redeemAuthCode requires db.batch");
@@ -3654,7 +3728,7 @@ export class SqlStore implements ControlPlaneStore {
     const row = await this.prepare("oauth.code.read",
       `SELECT ac.client_id, ac.principal_id, ac.redirect_uri, ac.scope,
               ac.code_challenge, ac.code_challenge_method, ac.expires_at,
-              p.tenant_id
+              ac.resource AS resource, p.tenant_id
        FROM oauth_auth_codes ac
        JOIN principals p ON p.id = ac.principal_id
        JOIN oauth_clients c ON c.client_id = ac.client_id AND c.tenant_id = p.tenant_id
@@ -3664,9 +3738,13 @@ export class SqlStore implements ControlPlaneStore {
     ).bind(codeHash, checkedAt, input.clientId, input.redirectUri, input.codeChallenge).first<{
       client_id: string; principal_id: string; redirect_uri: string; scope: string;
       code_challenge: string; code_challenge_method: string; expires_at: string;
-      tenant_id: string;
+      resource: string | null; tenant_id: string;
     }>();
     if (!row) return { status: "invalid_grant" };
+    // Issue #195: a bound code requires the same resource at redemption.
+    if (row.resource !== null && row.resource !== undefined && input.resource !== row.resource) {
+      return { status: "invalid_grant" };
+    }
 
     const access = randomToken("atk_");
     const refresh = randomToken("rtk_");
@@ -3688,8 +3766,8 @@ export class SqlStore implements ControlPlaneStore {
           `INSERT INTO oauth_tokens
            (access_token_hash, refresh_token_hash, client_id, principal_id, scope,
             refresh_family, refresh_used, revoked, expires_at, refresh_expires_at,
-            created_at, auth_code_hash)
-           SELECT ?, ?, ac.client_id, ac.principal_id, ac.scope, ?, 0, 0, ?, ?, ?, ac.code_hash
+            created_at, auth_code_hash, resource)
+           SELECT ?, ?, ac.client_id, ac.principal_id, ac.scope, ?, 0, 0, ?, ?, ?, ac.code_hash, ac.resource
            FROM oauth_auth_codes ac
            JOIN principals p ON p.id = ac.principal_id
            JOIN oauth_clients c ON c.client_id = ac.client_id AND c.tenant_id = p.tenant_id
@@ -3739,6 +3817,7 @@ export class SqlStore implements ControlPlaneStore {
       code_challenge_method: row.code_challenge_method,
       expires_at: Date.parse(row.expires_at),
       used: true,
+      ...(row.resource ? { resource: row.resource } : {}),
     };
     const token: TokenRecord = {
       access_token: access,
@@ -3752,6 +3831,7 @@ export class SqlStore implements ControlPlaneStore {
       refresh_family: family,
       refresh_used: false,
       tenant_id: row.tenant_id,
+      ...(row.resource ? { resource: row.resource } : {}),
     };
     return { status: "redeemed", record, token };
   }
@@ -3763,6 +3843,7 @@ export class SqlStore implements ControlPlaneStore {
     family?: string,
     ttlMs = ACCESS_TOKEN_TTL_MS,
     refreshTtlMs = REFRESH_TOKEN_IDLE_TTL_MS,
+    resource?: string,
   ): Promise<TokenRecord> {
     const principalRecord = (await this.getPrincipal(principal)) || await this.ensurePrincipal(principal, principal);
     // Never turn token issuance into implicit client registration.
@@ -3778,10 +3859,10 @@ export class SqlStore implements ControlPlaneStore {
     const refreshHash = await sha256Hex(refresh);
     await this.prepare("oauth.token.issue",
         `INSERT INTO oauth_tokens
-         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at)
+         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at, resource)
          VALUES (?, ?, ?, ?, ?, ?, 0,
            CASE WHEN EXISTS (SELECT 1 FROM revoked_refresh_families WHERE refresh_family = ?) THEN 1 ELSE 0 END,
-           ?, ?, ?)`,
+           ?, ?, ?, ?)`,
       )
       .bind(
         accessHash,
@@ -3794,6 +3875,7 @@ export class SqlStore implements ControlPlaneStore {
         nowIso(expiresAt),
         nowIso(refreshExpiresAt),
         nowIso(),
+        resource ?? null,
       )
       .run();
     return {
@@ -3810,6 +3892,7 @@ export class SqlStore implements ControlPlaneStore {
       refresh_family: fam,
       refresh_used: false,
       tenant_id: principalRecord.tenant_id,
+      ...(resource !== undefined ? { resource } : {}),
     };
   }
 
@@ -3817,7 +3900,7 @@ export class SqlStore implements ControlPlaneStore {
     const hash = await sha256Hex(token);
     const row = await this.prepare("oauth.token.read",
         `SELECT t.access_token_hash, t.refresh_token_hash, t.client_id, t.principal_id, t.scope,
-                t.refresh_family, t.refresh_used, t.revoked, t.expires_at, t.refresh_expires_at, p.tenant_id
+                t.refresh_family, t.refresh_used, t.revoked, t.expires_at, t.refresh_expires_at, t.resource AS resource, p.tenant_id
          FROM oauth_tokens t JOIN principals p ON p.id = t.principal_id
          WHERE t.access_token_hash = ?`,
       )
@@ -3831,6 +3914,7 @@ export class SqlStore implements ControlPlaneStore {
         revoked: number;
         expires_at: string;
         refresh_expires_at: string;
+        resource: string | null;
         tenant_id: string;
       }>();
     if (!row || row.revoked) return null;
@@ -3848,10 +3932,11 @@ export class SqlStore implements ControlPlaneStore {
       refresh_family: row.refresh_family,
       refresh_used: Boolean(row.refresh_used),
       tenant_id: row.tenant_id,
+      ...(row.resource ? { resource: row.resource } : {}),
     };
   }
 
-  async rotateRefresh(refreshToken: string): Promise<
+  async rotateRefresh(refreshToken: string, expectedResource?: string): Promise<
     | { ok: true; token: TokenRecord }
     | { ok: false; error: "invalid_grant" | "reuse"; description?: string }
   > {
@@ -3869,12 +3954,13 @@ export class SqlStore implements ControlPlaneStore {
 
     // Authoritative pre-read for metadata + expiry + tenant. CAS in the batch is the claim.
     const row = await this.prepare("oauth.token.read",
-      `SELECT t.client_id, t.principal_id, p.tenant_id AS tenant_id, t.scope, t.refresh_family, t.revoked, t.refresh_used, t.refresh_expires_at
+      `SELECT t.client_id, t.principal_id, p.tenant_id AS tenant_id, t.scope, t.refresh_family, t.revoked, t.refresh_used, t.refresh_expires_at, t.resource AS resource
        FROM oauth_tokens t JOIN principals p ON p.id = t.principal_id
        WHERE t.refresh_token_hash = ?`,
     ).bind(refreshHash).first<{
       client_id: string; principal_id: string; tenant_id: string; scope: string;
       refresh_family: string; revoked: number; refresh_used: number; refresh_expires_at: string;
+      resource: string | null;
     }>();
 
     if (!row) {
@@ -3885,6 +3971,10 @@ export class SqlStore implements ControlPlaneStore {
     const exp = Date.parse(row.refresh_expires_at);
     // Expired refresh is always invalid_grant; reuse detection is in-window only.
     if (!Number.isFinite(exp) || nowMs > exp) {
+      return { ok: false, error: "invalid_grant" };
+    }
+    // Issue #195: refresh cannot switch audience.
+    if (expectedResource !== undefined && row.resource !== null && row.resource !== undefined && expectedResource !== row.resource) {
       return { ok: false, error: "invalid_grant" };
     }
 
@@ -3998,12 +4088,12 @@ export class SqlStore implements ControlPlaneStore {
       ).bind(refreshHash, now, refreshHash),
       this.db.prepare(
         `INSERT INTO oauth_tokens
-         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at)
+         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at, resource)
          SELECT ?, ?, ot.client_id, ot.principal_id, ot.scope, ot.refresh_family, 0,
            CASE WHEN EXISTS (
              SELECT 1 FROM revoked_refresh_families r WHERE r.refresh_family = ot.refresh_family
            ) THEN 1 ELSE 0 END,
-           ?, ?, ?
+           ?, ?, ?, ot.resource
          FROM oauth_tokens ot
          WHERE ot.refresh_token_hash = ?
            AND ot.refresh_used = 1 AND ot.revoked = 1
@@ -4177,7 +4267,7 @@ export class SqlStore implements ControlPlaneStore {
     if (!Number.isFinite(receiptExp) || nowMs > receiptExp) return null;
 
     const successor = await this.prepare("oauth.token.read",
-      `SELECT access_token_hash, revoked, refresh_used, refresh_expires_at, expires_at
+      `SELECT access_token_hash, revoked, refresh_used, refresh_expires_at, expires_at, resource AS resource
        FROM oauth_tokens
        WHERE access_token_hash = ?`,
     ).bind(receipt.successor_access_token_hash).first<{
@@ -4186,6 +4276,7 @@ export class SqlStore implements ControlPlaneStore {
       refresh_used: number;
       refresh_expires_at: string;
       expires_at: string;
+      resource: string | null;
     }>();
     if (!successor || successor.revoked || successor.refresh_used) return null;
 
@@ -4224,6 +4315,7 @@ export class SqlStore implements ControlPlaneStore {
       refresh_family: receipt.refresh_family,
       refresh_used: false,
       tenant_id: receipt.tenant_id,
+      ...(successor.resource ? { resource: successor.resource } : {}),
     };
   }
 
@@ -4278,8 +4370,8 @@ export class SqlStore implements ControlPlaneStore {
     const result = await this.db
       .prepare(
         `INSERT INTO device_codes
-         (device_code_hash, user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (device_code_hash, user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at, created_at, resource)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_code) DO NOTHING`,
       )
       .bind(
@@ -4294,6 +4386,7 @@ export class SqlStore implements ControlPlaneStore {
         rec.principal_id ?? null,
         rec.last_polled_at ? nowIso(rec.last_polled_at) : null,
         nowIso(),
+        rec.resource ?? null,
       )
       .run();
     const changes = Number(
@@ -4308,7 +4401,7 @@ export class SqlStore implements ControlPlaneStore {
     const hash = await sha256Hex(deviceCode);
     const row = await this.db
       .prepare(
-        `SELECT device_code_hash, user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at
+        `SELECT device_code_hash, user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at, resource
          FROM device_codes WHERE device_code_hash = ?`,
       )
       .bind(hash)
@@ -4322,6 +4415,7 @@ export class SqlStore implements ControlPlaneStore {
         status: string;
         principal_id: string | null;
         last_polled_at: string | null;
+        resource: string | null;
       }>();
     if (!row) return null;
     let status = row.status as DeviceCodeRecord["status"];
@@ -4345,6 +4439,7 @@ export class SqlStore implements ControlPlaneStore {
       last_polled_at: row.last_polled_at
         ? Date.parse(row.last_polled_at)
         : undefined,
+      ...(row.resource ? { resource: row.resource } : {}),
     };
   }
 
@@ -4363,7 +4458,7 @@ export class SqlStore implements ControlPlaneStore {
     // Return a stub; callers for approve use approveDeviceCode.
     const full = await this.db
       .prepare(
-        `SELECT user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at
+        `SELECT user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at, resource
          FROM device_codes WHERE user_code = ?`,
       )
       .bind(userCode.toUpperCase())
@@ -4377,6 +4472,7 @@ export class SqlStore implements ControlPlaneStore {
         status: string;
         principal_id: string | null;
         last_polled_at: string | null;
+        resource: string | null;
       }>();
     if (!full) return null;
     return {
@@ -4392,6 +4488,7 @@ export class SqlStore implements ControlPlaneStore {
       last_polled_at: full.last_polled_at
         ? Date.parse(full.last_polled_at)
         : undefined,
+      ...(full.resource ? { resource: full.resource } : {}),
     };
   }
 
@@ -4411,16 +4508,17 @@ export class SqlStore implements ControlPlaneStore {
     const row = await this.db.prepare(
       `UPDATE device_codes SET status = 'consumed'
        WHERE device_code_hash = ? AND client_id = ? AND status = 'approved' AND expires_at > ?
-       RETURNING user_code, client_id, scope, verification_uri, interval_sec, expires_at, principal_id, last_polled_at`,
+       RETURNING user_code, client_id, scope, verification_uri, interval_sec, expires_at, principal_id, last_polled_at, resource`,
     ).bind(hash, clientId, nowIso()).first<{
       user_code: string; client_id: string; scope: string; verification_uri: string;
-      interval_sec: number; expires_at: string; principal_id: string | null; last_polled_at: string | null;
+      interval_sec: number; expires_at: string; principal_id: string | null; last_polled_at: string | null; resource: string | null;
     }>();
     if (!row) return null;
     return { device_code: deviceCode, user_code: row.user_code, client_id: row.client_id,
       scope: row.scope, verification_uri: row.verification_uri, interval_sec: row.interval_sec,
       expires_at: Date.parse(row.expires_at), status: "consumed", principal_id: row.principal_id || undefined,
-      last_polled_at: row.last_polled_at ? Date.parse(row.last_polled_at) : undefined };
+      last_polled_at: row.last_polled_at ? Date.parse(row.last_polled_at) : undefined,
+      ...(row.resource ? { resource: row.resource } : {}) };
   }
 
   async markDeviceCodePolled(deviceCode: string, minIntervalMs = 0): Promise<void> {
@@ -4528,12 +4626,12 @@ export class SqlStore implements ControlPlaneStore {
     await this.prepare("oauth.authorize_tx.insert",
       `INSERT INTO authorize_transactions
        (id, csrf_hash, principal_id, tenant_id, client_id, redirect_uri, scope, state,
-        code_challenge, code_challenge_method, expires_at, consumed, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+        code_challenge, code_challenge_method, expires_at, consumed, created_at, resource)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
     ).bind(
       tx.id, tx.csrf_hash, tx.principal_id, tx.tenant_id, tx.client_id, tx.redirect_uri,
       tx.scope, tx.state, tx.code_challenge, tx.code_challenge_method,
-      nowIso(tx.expires_at), nowIso(),
+      nowIso(tx.expires_at), nowIso(), tx.resource ?? null,
     ).run();
   }
 
@@ -4543,10 +4641,10 @@ export class SqlStore implements ControlPlaneStore {
       `UPDATE authorize_transactions SET consumed = 1
        WHERE id = ? AND csrf_hash = ? AND principal_id = ? AND consumed = 0 AND expires_at > ?
        RETURNING tenant_id, client_id, redirect_uri, scope, state,
-                 code_challenge, code_challenge_method, expires_at`,
+                 code_challenge, code_challenge_method, expires_at, resource`,
     ).bind(id, csrfHash, principalId, nowIso()).first<{
       tenant_id: string; client_id: string; redirect_uri: string; scope: string; state: string;
-      code_challenge: string; code_challenge_method: string; expires_at: string;
+      code_challenge: string; code_challenge_method: string; expires_at: string; resource: string | null;
     }>();
     if (!row) return null;
     return {
@@ -4562,6 +4660,7 @@ export class SqlStore implements ControlPlaneStore {
       code_challenge_method: row.code_challenge_method,
       expires_at: Date.parse(row.expires_at),
       consumed: true,
+      ...(row.resource ? { resource: row.resource } : {}),
     };
   }
 
@@ -5221,6 +5320,45 @@ export class SqlStore implements ControlPlaneStore {
          ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
       )
       .bind(opts.tenantId, opts.principalId, opts.tool, limit)
+      .all<Record<string, unknown>>();
+    return (rows.results || []).map(rowToMcpOperation);
+  }
+
+  async listRecentMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    deviceId?: string;
+    tool?: string;
+    idempotencyKey?: string;
+    since?: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(50, Math.trunc(opts.limit ?? 20)));
+    const conds: string[] = ["tenant_id = ?", "principal_id = ?"];
+    const args: unknown[] = [opts.tenantId, opts.principalId];
+    if (opts.deviceId) {
+      conds.push("device_id = ?");
+      args.push(opts.deviceId);
+    }
+    if (opts.tool) {
+      conds.push("tool = ?");
+      args.push(opts.tool);
+    }
+    if (opts.idempotencyKey) {
+      conds.push("idempotency_key = ?");
+      args.push(opts.idempotencyKey);
+    }
+    if (opts.since) {
+      conds.push("created_at >= ?");
+      args.push(opts.since);
+    }
+    const rows = await this.db
+      .prepare(
+        `SELECT * FROM mcp_operations
+         WHERE ${conds.join(" AND ")}
+         ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
+      )
+      .bind(...args, limit)
       .all<Record<string, unknown>>();
     return (rows.results || []).map(rowToMcpOperation);
   }

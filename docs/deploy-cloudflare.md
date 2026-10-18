@@ -210,9 +210,9 @@ or file/command results.
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata (includes `device_authorization_endpoint`) |
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata (origin resource) |
 | `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata for the `/mcp` resource identifier |
-| `POST /oauth/register` | Dynamic Client Registration; exact ChatGPT public callbacks are stateless, all other clients require tenant authentication; `redirect_uri` **exact match** policy |
-| `GET\|POST /oauth/authorize` | Authenticated principal + explicit consent + auth code + PKCE S256 |
-| `POST /oauth/token` | `authorization_code`, `refresh_token` (rotation + reuse detection), `urn:ietf:params:oauth:grant-type:device_code` |
+| `POST /oauth/register` | Dynamic Client Registration; exact ChatGPT public callbacks are stateless, all other clients require tenant authentication; `redirect_uri` match (HTTPS exact; loopback port-flexible) |
+| `GET\|POST /oauth/authorize` | Authenticated principal + explicit consent + auth code + PKCE S256 + RFC 8707 `resource` (must be canonical `/mcp`) |
+| `POST /oauth/token` | `authorization_code`, `refresh_token` (rotation + reuse detection, audience-preserving), `urn:ietf:params:oauth:grant-type:device_code`; token requests carry the same `resource` |
 | `POST /oauth/revoke` | Token revoke |
 | `POST /oauth/device_authorization` | RFC 8628 device code issue |
 | `GET\|POST /oauth/device` | User verification / approve page |
@@ -280,9 +280,12 @@ That failure is worse than it looks:
 python scripts/probe_machine_endpoints.py https://<worker>.workers.dev
 ```
 
-The probe sends the same anonymous `tools/list` from two HTTP stacks (Python
-`urllib` and curl) under several User-Agents, plus one deliberately invalid
-bearer, and reports **which layer answered**. It sends no credentials. `--json`
+The probe sends the same anonymous `initialize` and `tools/list` from two
+required HTTP stacks (Python `urllib` and curl) under several User-Agents,
+plus the deliberately invalid bearer on both stacks, and reports **which
+layer answered**. When installed, Python `requests` and Node `fetch`/undici
+run as extra acceptance stacks; when absent they are skipped without failing,
+so `urllib` + curl remain the portable minimum. It sends no credentials. `--json`
 returns a versioned monitoring object with stable categories for DNS, TLS,
 connect timeout/retry exhaustion, edge 1010/denial/origin failure, Worker auth
 contract, Worker protocol 4xx/5xx, malformed JSON-RPC, and catalog mismatch.
@@ -343,6 +346,23 @@ egress locations on a schedule and alert separately on:
 | Worker `401` on discovery | OAuth/bearer problem | check token issuance |
 | Worker `5xx` | Worker or binding failure | check deploy and D1 bindings |
 | `HTTP 200` with malformed JSON-RPC | protocol regression | check the release |
+
+Example — every five minutes from each of two egress hosts, keeping only the
+bounded machine-readable categories (never tokens, bodies, or user content):
+
+```bash
+python scripts/probe_machine_endpoints.py "https://<worker>.workers.dev" --json > /tmp/ownmesh-edge-probe.json
+# Alert separately on: edge_1010 / edge_denial / edge_origin_failure,
+# worker_5xx, malformed_jsonrpc, catalog_digest_mismatch.
+# worker_auth_contract on the invalid-bearer probe is the healthy refresh
+# contract, not an outage; worker_protocol_4xx on anonymous discovery is an
+# OAuth/bearer problem, not an edge rejection.
+```
+
+When `requests` or Node 22+ is available the same run additionally covers
+those acceptance stacks (`tools/list [requests:*]`, `tools/list [node:*]`);
+otherwise verify them once manually from a second egress path before closing
+out the fix.
 
 The probe prints Cloudflare's `cf-ray` for every non-Worker answer. Include it
 in a Cloudflare support request; it identifies the exact edge decision without
