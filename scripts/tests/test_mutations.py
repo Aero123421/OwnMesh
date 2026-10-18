@@ -185,6 +185,30 @@ class CheckerMutationTests(unittest.TestCase):
             _must_fail("action missing pin")
 
     # --- toolchain / fail-open guards ------------------------------------
+    def test_mutation_provenance_pin_removed_fails(self) -> None:
+        with _Mutation(
+            ".github/workflows/release.yml",
+            lambda s: s.replace(
+                "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
+                "actions/attest-build-provenance@" + "0" * 40,
+            ),
+        ):
+            result = _run_checker()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Release provenance", result.stderr)
+
+    def test_mutation_provenance_old_pin_fails(self) -> None:
+        with _Mutation(
+            ".github/workflows/release.yml",
+            lambda s: s.replace(
+                "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
+                "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
+            ),
+        ):
+            result = _run_checker()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Release provenance", result.stderr)
+
     def test_mutation_rust_185_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace('toolchain: "1.92.0"', 'toolchain: "1.85.0"', 1)
