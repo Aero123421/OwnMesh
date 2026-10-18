@@ -417,8 +417,7 @@ fn edit_config_with(
             "edited configuration contains forbidden secret material",
         ));
     }
-    let value = raw
-        .parse::<toml::Value>()
+    let value: toml::Value = toml::from_str(&raw)
         .map_err(|_| ConfigCommandError::Usage("edited configuration is invalid"))?;
     validate_known_keys(&value)?;
     let edited: OwnMeshConfig = value
