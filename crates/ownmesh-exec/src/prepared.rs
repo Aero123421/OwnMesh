@@ -1108,7 +1108,6 @@ fn linux_descriptor_command(
     args: &[String],
     overlay: &std::collections::HashMap<String, String>,
 ) -> ExecResult<Command> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     let mut exec_argv = Vec::with_capacity(args.len() + 1);
     exec_argv.push(
@@ -1134,7 +1133,10 @@ fn linux_descriptor_command(
             ExecError::Spawn("execution environment contains an interior NUL".into())
         })?);
     }
-    let fd = image.as_raw_fd();
+    // Retain an owned handle in the callback. nix 0.31 accepts AsFd rather
+    // than a raw integer, and the command must keep this verified image alive
+    // until spawn without borrowing the caller's File.
+    let image = image.try_clone()?;
     // `/bin/false` is never executed: a failing pre-exec callback aborts spawn,
     // and successful `fexecve` replaces the child image from the retained fd.
     let mut command = Command::new("/bin/false");
@@ -1142,10 +1144,12 @@ fn linux_descriptor_command(
     // `fexecve` syscall through nix. All CString allocation and environment
     // construction happened in the parent before this callback was installed.
     unsafe {
-        command.pre_exec(move || match nix::unistd::fexecve(fd, &exec_argv, &env) {
-            Ok(never) => match never {},
-            Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
-        });
+        command.pre_exec(
+            move || match nix::unistd::fexecve(&image, &exec_argv, &env) {
+                Ok(never) => match never {},
+                Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+            },
+        );
     }
     Ok(command)
 }
