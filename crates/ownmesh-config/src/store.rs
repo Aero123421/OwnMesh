@@ -45,11 +45,10 @@ fn load_config_after_recovery(paths: &OwnMeshPaths) -> ConfigResult<OwnMeshConfi
         source,
     })?;
     let mut value: toml::Value =
-        raw.parse::<toml::Value>()
-            .map_err(|err: toml::de::Error| ConfigError::Parse {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
+        toml::from_str(&raw).map_err(|err: toml::de::Error| ConfigError::Parse {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
     let migrated = migrate_config_value(&mut value)?;
     let cfg: OwnMeshConfig =
         value
