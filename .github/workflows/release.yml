@@ -68,7 +68,7 @@ jobs:
           python3 scripts/ci/verify_ruleset.py --repo "${GITHUB_REPOSITORY}" --expect-ruleset
 
       - name: Upload eligibility evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-eligibility
           path: release-eligibility.json
@@ -221,7 +221,7 @@ jobs:
           & ./dist/verify/ownmesh.exe --version
           if ($LASTEXITCODE -ne 0) { throw "version smoke failed" }
       - name: Upload platform artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.platform }}
           path: |
@@ -275,7 +275,7 @@ jobs:
               assert isinstance(components, list) and components, f"empty SBOM: {path}"
           PY
       - name: Upload release SBOMs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-release
           path: sbom/*.cdx.json
@@ -380,7 +380,7 @@ jobs:
             done
           )
       - name: Stage installers and package-manager metadata
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-distribution-metadata
           path: release-assets/*
