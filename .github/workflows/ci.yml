@@ -130,7 +130,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Suite commands are single-sourced from scripts/ci/suites.toml via the
       # canonical runner (no direct cargo duplication here).
@@ -188,7 +188,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Compile compat + affected native link/run evidence are single-sourced
       # from scripts/ci/suites.toml [platform-windows] via the canonical runner.
@@ -241,7 +241,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Compile compat + affected native link/run evidence are single-sourced
       # from scripts/ci/suites.toml [platform-macos] via the canonical runner.
@@ -345,7 +345,7 @@ jobs:
           toolchain: "1.92.0"
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Snapshot tests run once in rust-linux workspace test; here only the
       # unique --check-i18n invariant remains (no duplicate test binary run).
